@@ -1,0 +1,338 @@
+# ---------------------------------------------------------------------------
+# consumer.py — Avro-deserializing Kafka consumer for canary messages
+#
+# Design decisions
+# ----------------
+# Long-lived client
+#     The consumer subscribes once at startup and is reused across every
+#     check cycle.  This avoids the cost of group coordinator round-trips,
+#     partition assignment, and offset fetch on every check iteration.
+#
+# seek_to_end() instead of unique group IDs
+#     An earlier design used a fresh group ID (auto.offset.reset=latest) per
+#     check so the consumer would start from the end of the partition.  This
+#     works but forces a new group registration, join, sync, and offset fetch
+#     on every check — significant overhead.
+#
+#     The current approach keeps one long-lived consumer and calls seek_to_end()
+#     before each produce.  seek_to_end() fetches the current high-watermark
+#     offset via get_watermark_offsets() and manually seeks to it, so the next
+#     poll will only return messages produced *after* that point.
+#
+# fetch.max.wait.ms=100
+#     Reduced from the 500 ms default.  The broker normally waits up to
+#     fetch.max.wait.ms before responding to a fetch request if fewer bytes
+#     than fetch.min.bytes are available.  Lowering it reduces the best-case
+#     consume latency at the cost of slightly more fetch requests.
+#
+# enable.auto.commit=true
+#     Offsets are committed automatically.  The canary doesn't need exactly-
+#     once guarantees for its own consumption; committed offsets are never
+#     read back because seek_to_end() bypasses them before each check.
+# ---------------------------------------------------------------------------
+
+import socket
+import time
+import uuid
+
+from confluent_kafka import DeserializingConsumer, KafkaError, KafkaException, TopicPartition
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.serialization import StringDeserializer
+
+from src.schema import (
+    CANARY_SCHEMA_STR,
+    CanaryMessage,
+    dict_to_canary,
+)
+
+# ---------------------------------------------------------------------------
+# Default librdkafka consumer configuration.
+# Merged with connection/auth settings from config.ini in create_consumer().
+# ---------------------------------------------------------------------------
+_CONSUMER_DEFAULTS = {
+    # ---- Identification ----
+    "client.id": socket.gethostname(),
+
+    # ---- Group membership & rebalance ----
+    # session.timeout.ms: how long the broker waits for a heartbeat before
+    # considering the consumer dead and triggering a rebalance.  45 s gives
+    # headroom for transient network hiccups without over-triggering rebalances.
+    "session.timeout.ms": 45000,
+
+    # heartbeat.interval.ms must be < session.timeout.ms / 3 per the Kafka spec.
+    # 3 s is aggressive enough to detect failures promptly.
+    "heartbeat.interval.ms": 3000,
+
+    # max.poll.interval.ms: maximum time between poll() calls before the broker
+    # evicts this consumer from the group.  300 s accommodates the canary's
+    # consumer.timeout.seconds (default 5 s) with ample margin.
+    "max.poll.interval.ms": 300000,
+
+    # ---- Fetch behaviour (optimised for low latency) ----
+    # Return a fetch response as soon as any data is available (1 byte minimum).
+    "fetch.min.bytes": 1,
+
+    # Reduce the broker's max wait time before responding to a fetch request.
+    # The default 500 ms adds unnecessary latency for a canary that polls for
+    # a single known message.
+    "fetch.max.wait.ms": 100,
+
+    # ---- Connection / network reliability ----
+    "client.dns.lookup": "use_all_dns_ips",         # required for Confluent Cloud
+    "api.version.request.timeout.ms": 30000,        # increased from 10 s default
+    "socket.keepalive.enable": True,
+    "socket.nagle.disable": True,                   # flush small packets immediately
+    "socket.connection.setup.timeout.ms": 30000,
+    "reconnect.backoff.ms": 1000,
+    "reconnect.backoff.max.ms": 10000,
+    "metadata.max.age.ms": 300000,
+}
+
+
+def create_consumer(kafka_config: dict, sr_client, group_id: str) -> DeserializingConsumer:
+    """
+    Build and return a long-lived DeserializingConsumer with Avro value deserialization.
+
+    Parameters
+    ----------
+    kafka_config : dict
+        Connection and authentication settings from config.ini [kafka].
+        Merged on top of _CONSUMER_DEFAULTS; overlapping keys override defaults.
+
+    sr_client : SchemaRegistryClient
+        Shared Schema Registry client used by AvroDeserializer to fetch the
+        writer schema when decoding messages.
+
+    group_id : str
+        Consumer group ID, typically "cloud-canary-<uuid4>" generated at
+        startup.  A unique group ID per process run means the consumer never
+        inherits committed offsets from a previous run, which is desirable
+        because seek_to_end() provides the correct starting position anyway.
+
+    Returns
+    -------
+    DeserializingConsumer
+        Ready-to-use consumer.  Caller must call consumer.subscribe([topic])
+        before polling.
+    """
+    avro_deserializer = AvroDeserializer(
+        sr_client,
+        CANARY_SCHEMA_STR,
+        dict_to_canary,   # converts Avro-decoded dict → CanaryMessage dataclass
+    )
+    return DeserializingConsumer({
+        **_CONSUMER_DEFAULTS,
+        **kafka_config,                              # auth/connection settings override defaults
+        "group.id":             group_id,
+        "auto.offset.reset":    "latest",            # start from end if no committed offset
+        "enable.auto.commit":   True,                # auto-commit (offsets aren't used for positioning)
+        "key.deserializer":     StringDeserializer("utf_8"),
+        "value.deserializer":   avro_deserializer,
+    })
+
+
+def create_partition_consumer(
+    kafka_config: dict,
+    sr_client,
+    topic: str,
+    partition: int,
+) -> DeserializingConsumer:
+    """
+    Build a consumer manually assigned to a single partition.
+
+    Uses consumer.assign() instead of subscribe() so no group coordinator
+    round-trip is needed — the partition is available immediately without
+    calling wait_for_assignment().  This is the correct pattern when the
+    caller controls partition assignment explicitly (one consumer per partition).
+
+    Parameters
+    ----------
+    kafka_config : dict
+        Connection and authentication settings from config.ini [kafka].
+
+    sr_client : SchemaRegistryClient
+        Shared Schema Registry client used by AvroDeserializer.
+
+    topic : str
+        Kafka topic to assign (the canary topic, e.g. "cloud-canary").
+
+    partition : int
+        Zero-based partition index to assign exclusively to this consumer.
+
+    Returns
+    -------
+    DeserializingConsumer
+        Consumer with partition immediately assigned.  Ready for seek_to_end()
+        and consume_canary() without any further setup.
+    """
+    avro_deserializer = AvroDeserializer(
+        sr_client,
+        CANARY_SCHEMA_STR,
+        dict_to_canary,
+    )
+    consumer = DeserializingConsumer({
+        **_CONSUMER_DEFAULTS,
+        **kafka_config,
+        # A unique group.id is required by librdkafka even for manually-assigned
+        # consumers (it is used internally for offset commits and heartbeats).
+        # The UUID ensures no two consumers share a group, avoiding committed-offset
+        # inheritance across restarts.
+        "group.id":           f"cloud-canary-{uuid.uuid4()}",
+        "auto.offset.reset":  "latest",
+        "enable.auto.commit": True,
+        "key.deserializer":   StringDeserializer("utf_8"),
+        "value.deserializer": avro_deserializer,
+    })
+    consumer.assign([TopicPartition(topic, partition)])
+    return consumer
+
+
+def wait_for_assignment(consumer: DeserializingConsumer, timeout: float = 10.0) -> None:
+    """
+    Block until the group coordinator assigns at least one partition to this consumer.
+
+    After subscribe(), the Kafka group coordinator runs a join-group /
+    sync-group round-trip to assign partitions.  This takes at least one
+    network round-trip and can take several seconds on a cold start.  Polling
+    drives the librdkafka background thread so that assignment callbacks fire.
+
+    Parameters
+    ----------
+    consumer : DeserializingConsumer
+        Subscribed consumer (subscribe() must have been called already).
+
+    timeout : float
+        Maximum seconds to wait for assignment before raising TimeoutError.
+        Default is 10 s, which is generous for a healthy cluster.
+
+    Raises
+    ------
+    TimeoutError
+        If no partitions are assigned within `timeout` seconds.  This usually
+        indicates a connectivity or authentication problem.
+    """
+    deadline = time.time() + timeout
+    while not consumer.assignment():
+        if time.time() > deadline:
+            raise TimeoutError("Timed out waiting for partition assignment.")
+        # poll(0.1) drives librdkafka's internal event loop so the join-group
+        # response is processed and assignment() is populated.
+        consumer.poll(0.1)
+
+
+def seek_to_end(consumer: DeserializingConsumer) -> None:
+    """
+    Seek all assigned partitions to their current high-watermark offset.
+
+    This is called before every produce so that the subsequent poll() only
+    returns messages produced *after* this seek point.  Without this, the
+    consumer might replay stale canary messages from previous checks,
+    causing the consume phase to return immediately with the wrong message.
+
+    How it works
+    ------------
+    get_watermark_offsets() issues a synchronous OffsetFetch request to the
+    broker to get the current (low, high) watermark pair for each partition.
+    consumer.seek() then repositions the fetch offset to `high`, so the next
+    poll will wait for the *next* message appended to that partition.
+
+    Parameters
+    ----------
+    consumer : DeserializingConsumer
+        Consumer with an active partition assignment.
+
+    Raises
+    ------
+    RuntimeError
+        If the consumer has no assignment (e.g. a rebalance is in progress).
+        The caller should treat this as a SEEK phase failure.
+    """
+    assignment = consumer.assignment()
+    if not assignment:
+        raise RuntimeError("No partition assignment — rebalance may be in progress.")
+
+    for partition in assignment:
+        # get_watermark_offsets returns (low, high).
+        # low  = earliest available offset (oldest retained message)
+        # high = next offset to be written (one past the last message)
+        # Seeking to `high` means: "give me the next message produced after now."
+        _, high = consumer.get_watermark_offsets(partition, timeout=5.0)
+        consumer.seek(TopicPartition(partition.topic, partition.partition, high))
+
+
+def consume_canary(
+    consumer: DeserializingConsumer,
+    target_id: str,
+    timeout: float = 30.0,
+) -> tuple[CanaryMessage, int]:
+    """
+    Poll until the canary message with the given message_id is received.
+
+    The consumer may encounter messages from other concurrent canary instances
+    or from the same instance's previous checks (if seek_to_end failed to
+    advance past them).  It skips all messages whose message_id does not match
+    `target_id`.
+
+    Parameters
+    ----------
+    consumer : DeserializingConsumer
+        Consumer already seeked to the end (via seek_to_end) so that polling
+        starts from after the produce.
+
+    target_id : str
+        UUID of the specific canary message to wait for.  Generated by
+        produce_canary() and passed through by check_kafka().
+
+    timeout : float
+        Maximum seconds to wait before raising TimeoutError.  Should match
+        consumer.timeout.seconds from config.ini (default 5 s).
+
+    Returns
+    -------
+    tuple[CanaryMessage, int]
+        The received CanaryMessage and the receive timestamp in milliseconds
+        (captured immediately when the matching message is found).
+        Latency = receive_timestamp_ms − message.send_timestamp_ms.
+
+    Raises
+    ------
+    TimeoutError
+        If `target_id` is not received within `timeout` seconds.  Because
+        the produce already succeeded (broker acked), this indicates the
+        broker is not serving the message back — possible replication lag,
+        ISR issues, or consume-side connectivity loss.
+
+    KafkaException
+        Propagated from consumer.poll() for non-EOF broker errors.
+    """
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        # poll() with a 1 s timeout drives the librdkafka event loop and
+        # returns as soon as a message (or error) is available, or after 1 s.
+        msg = consumer.poll(timeout=1.0)
+
+        if msg is None:
+            # No message in this poll window; keep waiting.
+            continue
+
+        if msg.error():
+            # _PARTITION_EOF is informational — the consumer has caught up
+            # to the end of a partition.  Not an error; just keep polling.
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            # Any other error is unexpected; propagate to the caller.
+            raise KafkaException(msg.error())
+
+        value: CanaryMessage = msg.value()
+
+        # Record the receive timestamp before any further processing so it
+        # is as close as possible to the actual arrival of the message.
+        receive_ts = int(time.time() * 1000)
+
+        if value and value.message_id == target_id:
+            return value, receive_ts
+        # Otherwise skip — this is a message from a different check cycle
+        # (unlikely with seek_to_end but handled for correctness).
+
+    raise TimeoutError(f"Message '{target_id}' not received within {timeout}s.")

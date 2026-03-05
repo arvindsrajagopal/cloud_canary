@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: cloud-canary
+
+scrape_configs:
+  - job_name: cloud-canary
+    static_configs:
+      - targets:
+          - host.docker.internal:8000   # canary metrics endpoint on the host
+    metrics_path: /metrics
