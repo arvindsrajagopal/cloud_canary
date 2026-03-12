@@ -1,0 +1,68 @@
+# Example Docker Compose deployment for cloud_canary
+#
+# Usage:
+#   1. Copy this file: cp docker-compose.example.yml docker-compose.yml
+#   2. Edit docker-compose.yml to set your CANARY_INSTANCE_ID if needed
+#   3. Ensure config/config.ini exists with your credentials
+#   4. Run: docker compose up -d
+#
+# Multiple instances:
+#   Duplicate the cloud-canary service block and change:
+#   - service name (e.g., cloud-canary-region-2)
+#   - container_name
+#   - CANARY_INSTANCE_ID
+#   - metrics port mapping (e.g., 8001:8000)
+
+version: '3.8'
+
+services:
+  cloud-canary:
+    image: cloud-canary:latest
+    build: .
+    container_name: cloud-canary
+    restart: unless-stopped
+    environment:
+      # Optional: Override instance identifier
+      # If not set, defaults to container hostname
+      - CANARY_INSTANCE_ID=canary-prod-1
+    volumes:
+      # Mount your config.ini (with Confluent Cloud credentials)
+      # IMPORTANT: config.ini must exist and contain valid credentials
+      - ./config/config.ini:/app/config/config.ini:ro
+    ports:
+      # Expose Prometheus metrics endpoint
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Optional: Resource limits
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 512M
+    #     reservations:
+    #       cpus: '0.25'
+    #       memory: 256M
+
+  # Example: Second canary instance for redundancy or multi-region monitoring
+  # cloud-canary-region-2:
+  #   image: cloud-canary:latest
+  #   build: .
+  #   container_name: cloud-canary-region-2
+  #   restart: unless-stopped
+  #   environment:
+  #     - CANARY_INSTANCE_ID=canary-prod-2
+  #   volumes:
+  #     - ./config/config.ini:/app/config/config.ini:ro
+  #   ports:
+  #     - "8001:8000"  # Different host port, same container port
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+  #     interval: 30s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 10s

@@ -8,6 +8,34 @@ replication health, and network connectivity.
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Create and activate a virtual environment
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Configure credentials
+cp config/config.ini.template config/config.ini
+# Edit config/config.ini — fill in bootstrap.servers, sasl.username/password,
+# schema_registry url, and basic.auth.user.info
+
+# 4. Run the canary (from project root)
+python -m src.main
+
+# 5. (Optional) Start Prometheus + Grafana monitoring stack alongside the canary
+#    run.sh starts Colima if needed, brings up the monitoring stack, runs the canary,
+#    and tears the stack down cleanly on exit.
+./run.sh
+# Prometheus: http://localhost:9090   Grafana: http://localhost:3000 (admin/admin)
+```
+
+> `config/config.ini` is git-ignored — never commit it.
+
+---
+
 ## Table of Contents
 
 1. [What It Does](#what-it-does)
@@ -193,6 +221,7 @@ cloud_canary/
 │
 ├── .gitignore
 ├── requirements.txt
+├── run.sh                      # Convenience script: starts monitoring stack + canary together
 └── README.md
 ```
 
@@ -207,7 +236,7 @@ cloud_canary/
 | A Confluent Cloud cluster | Dedicated or Basic tier both work |
 | Kafka API key + secret | Needs `TOPIC:CREATE`, `TOPIC:WRITE`, `TOPIC:READ` ACLs on `cloud-canary*` |
 | Schema Registry API key + secret | Needs `SUBJECT:READ` and `SUBJECT:WRITE` on `com.cloud.canary*` |
-| Docker + Docker Compose V2 | Only required for the optional monitoring stack. Uses `docker compose` (space, not hyphen). Included with Docker Desktop; on Linux install the Compose plugin: `apt install docker-compose-plugin`. |
+| Docker + Docker Compose V2 | Only required for the optional monitoring stack. Uses `docker compose` (space, not hyphen). **macOS:** install [Colima](https://github.com/abiosoft/colima) (`brew install colima docker docker-compose`) or Docker Desktop. **Linux:** install the Compose plugin: `apt install docker-compose-plugin`. |
 
 ---
 
@@ -303,7 +332,12 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `check.interval.seconds` | `15` | Seconds between consecutive end-to-end checks. |
 | `partition.sync.interval.seconds` | `86400` | How often to check for broker count changes and resize the topic. |
 | `sr.check.interval.seconds` | `60` | How often to run an independent Schema Registry health probe. |
+| `instance.id` | *hostname* | Unique identifier for this canary instance. Defaults to the system hostname. Override when running multiple instances on the same host or when you want consistent labels across container restarts. Can also be set via `CANARY_INSTANCE_ID` environment variable (takes precedence). |
 | `metrics.port` | `8000` | TCP port for the Prometheus `/metrics` HTTP endpoint. |
+| `metrics.bind.address` | `0.0.0.0` | IP address to bind the metrics HTTP server to. Use `0.0.0.0` for all interfaces (default), `127.0.0.1` for localhost only, or a specific IP to bind to a single network interface. |
+| `metrics.ssl.enabled` | `false` | Enable HTTPS/TLS for the metrics endpoint. Requires `metrics.ssl.cert` and `metrics.ssl.key` to be configured. Useful for production environments where metrics contain sensitive labels. |
+| `metrics.ssl.cert` | — | Path to SSL certificate file in PEM format. Required when `metrics.ssl.enabled=true`. |
+| `metrics.ssl.key` | — | Path to SSL private key file in PEM format. Required when `metrics.ssl.enabled=true`. |
 | `log.topic.enabled` | `false` | Set to `true` to publish all canary logs as JSON to a Kafka topic. |
 | `log.topic` | `cloud-canary-logs` | Topic name for log capture. Created automatically if enabled. |
 | `log.topic.retention.ms` | `604800000` | Log topic retention period in milliseconds (default: 7 days). |
@@ -318,9 +352,81 @@ These keys are passed directly to the librdkafka client. Key names must match
 
 ## Running the Canary
 
+### Local Development (Python Virtual Environment)
+
 ```bash
 # From the project root, with the virtual environment active:
 python -m src.main
+```
+
+Alternatively, `run.sh` starts the monitoring stack and the canary together, and tears down the stack on exit:
+
+```bash
+# Use default instance ID (hostname)
+./run.sh
+
+# Specify custom instance ID
+./run.sh canary-dev-1
+
+# Or use environment variable
+CANARY_INSTANCE_ID=my-canary ./run.sh
+```
+
+### Docker Deployment (Recommended for Production)
+
+```bash
+# Build the Docker image
+docker build -t cloud-canary:latest .
+
+# Run with mounted config file
+docker run --rm \
+  -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
+  -p 8000:8000 \
+  cloud-canary:latest
+
+# Run with custom instance ID (for multi-instance deployments)
+docker run --rm \
+  -e CANARY_INSTANCE_ID=canary-us-east-1 \
+  -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
+  -p 8000:8000 \
+  cloud-canary:latest
+
+# Run in background (detached mode)
+docker run -d \
+  --name cloud-canary \
+  --restart unless-stopped \
+  -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
+  -p 8000:8000 \
+  cloud-canary:latest
+
+# View logs
+docker logs -f cloud-canary
+
+# Stop the container
+docker stop cloud-canary
+```
+
+**Docker Compose example:**
+
+```yaml
+version: '3.8'
+services:
+  cloud-canary:
+    image: cloud-canary:latest
+    build: .
+    container_name: cloud-canary
+    restart: unless-stopped
+    environment:
+      - CANARY_INSTANCE_ID=canary-prod-1
+    volumes:
+      - ./config/config.ini:/app/config/config.ini:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 ```
 
 ### Log output format
@@ -330,6 +436,7 @@ python -m src.main
 2024-06-10T12:00:00 [INFO] Metrics available at http://0.0.0.0:8000/metrics
 2024-06-10T12:00:00 [INFO] Cluster has 3 broker(s).
 2024-06-10T12:00:00 [INFO] Topic 'cloud-canary' already exists (3 partition(s)) — skipping creation.
+2024-06-10T12:00:00 [INFO] Running initial partition sync...
 2024-06-10T12:00:01 [INFO] Per-partition consumers ready: 3 partition(s) → [0, 1, 2]
 2024-06-10T12:00:01 [INFO] SR OK
 2024-06-10T12:00:01 [INFO] Produced  | seq=1 partition=0 id=3f2a1c7e-... host=my-host
@@ -428,12 +535,25 @@ canary_consecutive_failures
 ```
 
 If multiple instances run on the same physical host with the same hostname, set a unique
-`HOSTNAME` environment variable before starting each instance:
+identifier using one of these methods:
 
+**Method 1: Environment variable (recommended for Docker/Kubernetes)**
 ```bash
-HOSTNAME=canary-us-east python -m src.main &
-HOSTNAME=canary-eu-west python -m src.main &
+CANARY_INSTANCE_ID=canary-us-east python -m src.main &
+CANARY_INSTANCE_ID=canary-eu-west python -m src.main &
+
+# Docker example
+docker run -e CANARY_INSTANCE_ID=canary-prod-1 ...
 ```
+
+**Method 2: Configuration file**
+```ini
+# config/config.ini
+[app]
+instance.id=canary-us-east-1
+```
+
+Note: `CANARY_INSTANCE_ID` environment variable takes precedence over `instance.id` in config.ini.
 
 ---
 
@@ -469,6 +589,7 @@ to a distinct broker leader, giving per-broker latency attribution.
 | Metric | Labels | Description |
 |---|---|---|
 | `canary_consecutive_failures` | `host`, `partition` | Current streak of consecutive failures per partition — **primary alerting signal** |
+| `canary_last_success_timestamp_seconds` | `host`, `partition` | Unix timestamp of the last successful check per partition — **staleness detection**. Alert when `(now - value) > threshold` to detect broken monitoring |
 | `canary_broker_count` | `host` | Broker count as of the last partition sync |
 | `canary_topic_partition_count` | `host` | Canary topic partition count as of the last partition sync |
 | `canary_uptime_seconds` | `host` | Seconds since the canary process started |
@@ -493,6 +614,10 @@ sum by (host, partition, phase, category) (rate(canary_failures_total[5m]))
 
 # Alert: 3 or more consecutive failures on any partition of any instance
 canary_consecutive_failures >= 3
+
+# Alert: Canary monitoring is stale (no successful check in 5+ minutes)
+# Detects when the canary process itself is stuck or stopped
+(time() - canary_last_success_timestamp_seconds) > 300
 ```
 
 ---
@@ -532,6 +657,7 @@ docker compose down -v       # stops containers and deletes all stored data
 | **Consecutive Failures** | Current failure streak — color-coded green/yellow/red |
 | **Check Success Rate (5m)** | Percentage of recent checks that succeeded |
 | **Schema Registry Health (5m)** | SR probe success rate |
+| **Staleness (Max)** | Seconds since last successful check — alerts when canary is stuck/stopped |
 | **Last Check Latency / p95 / p99** | Recent latency stats, color-coded by threshold |
 | **Total Failures (1h)** | Failure count over the past hour |
 | **End-to-End Latency** | Time series of p50 / p95 / p99 latency |
@@ -548,6 +674,54 @@ Prometheus scrapes `host.docker.internal:8000`, which resolves to the host machi
 from inside the Docker network. This works natively on macOS and Windows. On Linux,
 the `extra_hosts: ["host.docker.internal:host-gateway"]` entry in `docker-compose.yml`
 sets up the equivalent alias.
+
+---
+
+## Securing the Metrics Endpoint
+
+The metrics endpoint can be configured for security in production environments:
+
+### Bind to Localhost Only
+
+Restrict metrics access to the local machine (useful when using a metrics collector on the same host):
+
+```ini
+[app]
+metrics.bind.address=127.0.0.1
+```
+
+Prometheus must then scrape `localhost:8000` instead of the external IP.
+
+### Enable HTTPS/TLS
+
+Encrypt metrics traffic with SSL/TLS certificates:
+
+```ini
+[app]
+metrics.ssl.enabled=true
+metrics.ssl.cert=/etc/ssl/certs/canary.crt
+metrics.ssl.key=/etc/ssl/private/canary.key
+```
+
+**Generate self-signed certificate for testing:**
+```bash
+openssl req -x509 -newkey rsa:4096 -nodes \
+  -keyout canary.key -out canary.crt \
+  -days 365 -subj "/CN=canary.example.com"
+```
+
+**Prometheus scrape config for HTTPS:**
+```yaml
+scrape_configs:
+  - job_name: cloud-canary
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true  # Only for self-signed certs
+    static_configs:
+      - targets: ['canary-host:8000']
+```
+
+**Production:** Use certificates from a trusted CA (Let's Encrypt, internal CA, etc.) and set `insecure_skip_verify: false`.
 
 ---
 
@@ -571,13 +745,14 @@ KafkaException: [ERR-8] SASL authentication failed
 Check that `sasl.username` and `sasl.password` in `[kafka]` are correct. Verify the
 API key has not been deleted or revoked in the Confluent Cloud console.
 
-### Partition assignment timeout
+### Startup failed — could not determine partition count
 
 ```
-Startup failed — could not get partition assignment: Timed out waiting for partition assignment.
+Partition sync skipped — could not fetch cluster metadata: ...
+Startup failed — could not determine partition count.
 ```
 
-The consumer could not reach the broker. Check:
+The canary could not reach the broker at startup. Check:
 - `bootstrap.servers` is correct (copy from Confluent Cloud → Cluster → Clients tab)
 - Port 9092 is not blocked by a firewall or VPN
 - `security.protocol=SASL_SSL` and `sasl.mechanisms=PLAIN` are set
@@ -585,7 +760,7 @@ The consumer could not reach the broker. Check:
 ### Consume phase timeout after successful produce
 
 ```
-FAIL [1] | seq=1 phase=CONSUME category=BROKER detail=Message not returned within 5s
+FAIL [1] | seq=1 partition=P phase=CONSUME category=BROKER detail=Message not returned within 5s — produce succeeded so broker received it (possible replication lag or ISR issue)
 ```
 
 The broker acknowledged the write but did not serve it back within the timeout.
@@ -623,8 +798,26 @@ The Kafka API key needs `TOPIC:CREATE` ACL on `cloud-canary` (or a prefix ACL on
 OSError: [Errno 48] Address already in use
 ```
 
-Another process is using the configured port. Change `metrics.port` in `config.ini`
-to a free port (e.g. `8001`) and restart.
+Another process is using the configured port. Options to fix:
+
+1. **Change the port:**
+   ```ini
+   [app]
+   metrics.port=8001
+   ```
+
+2. **Bind to a different interface:**
+   ```ini
+   [app]
+   metrics.bind.address=127.0.0.1
+   ```
+
+3. **Find and stop the conflicting process:**
+   ```bash
+   # macOS/Linux
+   lsof -i :8000
+   # Then kill the process or change its port
+   ```
 
 ### Monitoring stack cannot reach canary metrics
 
@@ -636,3 +829,27 @@ curl http://localhost:8000/metrics | head -20
 
 If it responds, but Prometheus shows the target as `DOWN`, check that Docker has
 network access to the host on that port (firewall rules, Docker Desktop settings).
+
+### SSL certificate errors
+
+```
+Failed to start metrics server: SSL certificate not found: /path/to/cert.pem
+```
+
+Check that:
+- Certificate and key files exist at the configured paths
+- Paths are absolute (not relative)
+- Files are readable by the canary process
+- Certificate and key are in PEM format
+
+**Test SSL setup:**
+```bash
+# Verify certificate is valid
+openssl x509 -in /path/to/cert.pem -text -noout
+
+# Test HTTPS endpoint
+curl -k https://localhost:8000/metrics
+
+# Check Prometheus can scrape (if using self-signed cert)
+# Ensure tls_config.insecure_skip_verify: true in prometheus.yml
+```

@@ -20,11 +20,25 @@ partition.sync.interval.seconds=86400
 sr.check.interval.seconds=60
 warmup.checks=2
 
-# Log topic — set enabled=true to publish all canary logs to Kafka for long-term retention.
-# The topic is created automatically with the retention period below (default 7 days).
+# Instance identification (optional) — defaults to hostname if not set.
+# Override this when running multiple canaries on the same host or when you
+# want consistent instance labels across container restarts.
+# Can also be set via CANARY_INSTANCE_ID environment variable (takes precedence).
+#instance.id=canary-us-east-1
+
+# Metrics HTTP server configuration
 metrics.port=8000
+# Bind address for metrics endpoint (0.0.0.0 = all interfaces, 127.0.0.1 = localhost only)
+metrics.bind.address=0.0.0.0
+# Enable HTTPS for metrics endpoint (requires cert and key files)
+metrics.ssl.enabled=false
+# Path to SSL certificate file (PEM format, required if ssl.enabled=true)
+#metrics.ssl.cert=/path/to/cert.pem
+# Path to SSL private key file (PEM format, required if ssl.enabled=true)
+#metrics.ssl.key=/path/to/key.pem
 
 # Log topic (optional) — set log.topic.enabled=true to publish logs to Kafka for long-term retention.
+# The topic is created automatically with the retention period below (default 7 days).
 log.topic.enabled=false
 log.topic=cloud-canary-logs
 log.topic.retention.ms=604800000

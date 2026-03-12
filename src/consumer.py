@@ -4,9 +4,10 @@
 # Design decisions
 # ----------------
 # Long-lived client
-#     The consumer subscribes once at startup and is reused across every
-#     check cycle.  This avoids the cost of group coordinator round-trips,
-#     partition assignment, and offset fetch on every check iteration.
+#     Each consumer is assigned to a single partition at startup (via assign())
+#     and reused across every check cycle.  This avoids the cost of group
+#     coordinator round-trips, partition assignment, and offset fetch on every
+#     check iteration.
 #
 # seek_to_end() instead of unique group IDs
 #     An earlier design used a fresh group ID (auto.offset.reset=latest) per
@@ -19,16 +20,17 @@
 #     offset via get_watermark_offsets() and manually seeks to it, so the next
 #     poll will only return messages produced *after* that point.
 #
-# fetch.max.wait.ms=100
+# fetch.wait.max.ms=100
 #     Reduced from the 500 ms default.  The broker normally waits up to
-#     fetch.max.wait.ms before responding to a fetch request if fewer bytes
+#     fetch.wait.max.ms before responding to a fetch request if fewer bytes
 #     than fetch.min.bytes are available.  Lowering it reduces the best-case
 #     consume latency at the cost of slightly more fetch requests.
 #
-# enable.auto.commit=true
-#     Offsets are committed automatically.  The canary doesn't need exactly-
-#     once guarantees for its own consumption; committed offsets are never
-#     read back because seek_to_end() bypasses them before each check.
+# enable.auto.commit=false
+#     Auto-commit is disabled for manually-assigned consumers.  Offset position
+#     is controlled entirely by seek_to_end() before each check, so committed
+#     offsets are never used for positioning.  Disabling auto-commit avoids
+#     unnecessary coordinator traffic on manually-assigned partitions.
 # ---------------------------------------------------------------------------
 
 import socket
@@ -75,7 +77,7 @@ _CONSUMER_DEFAULTS = {
     # Reduce the broker's max wait time before responding to a fetch request.
     # The default 500 ms adds unnecessary latency for a canary that polls for
     # a single known message.
-    "fetch.max.wait.ms": 100,
+    "fetch.wait.max.ms": 100,
 
     # ---- Connection / network reliability ----
     "client.dns.lookup": "use_all_dns_ips",         # required for Confluent Cloud
@@ -87,48 +89,6 @@ _CONSUMER_DEFAULTS = {
     "reconnect.backoff.max.ms": 10000,
     "metadata.max.age.ms": 300000,
 }
-
-
-def create_consumer(kafka_config: dict, sr_client, group_id: str) -> DeserializingConsumer:
-    """
-    Build and return a long-lived DeserializingConsumer with Avro value deserialization.
-
-    Parameters
-    ----------
-    kafka_config : dict
-        Connection and authentication settings from config.ini [kafka].
-        Merged on top of _CONSUMER_DEFAULTS; overlapping keys override defaults.
-
-    sr_client : SchemaRegistryClient
-        Shared Schema Registry client used by AvroDeserializer to fetch the
-        writer schema when decoding messages.
-
-    group_id : str
-        Consumer group ID, typically "cloud-canary-<uuid4>" generated at
-        startup.  A unique group ID per process run means the consumer never
-        inherits committed offsets from a previous run, which is desirable
-        because seek_to_end() provides the correct starting position anyway.
-
-    Returns
-    -------
-    DeserializingConsumer
-        Ready-to-use consumer.  Caller must call consumer.subscribe([topic])
-        before polling.
-    """
-    avro_deserializer = AvroDeserializer(
-        sr_client,
-        CANARY_SCHEMA_STR,
-        dict_to_canary,   # converts Avro-decoded dict → CanaryMessage dataclass
-    )
-    return DeserializingConsumer({
-        **_CONSUMER_DEFAULTS,
-        **kafka_config,                              # auth/connection settings override defaults
-        "group.id":             group_id,
-        "auto.offset.reset":    "latest",            # start from end if no committed offset
-        "enable.auto.commit":   True,                # auto-commit (offsets aren't used for positioning)
-        "key.deserializer":     StringDeserializer("utf_8"),
-        "value.deserializer":   avro_deserializer,
-    })
 
 
 def create_partition_consumer(
@@ -179,45 +139,12 @@ def create_partition_consumer(
         # inheritance across restarts.
         "group.id":           f"cloud-canary-{uuid.uuid4()}",
         "auto.offset.reset":  "latest",
-        "enable.auto.commit": True,
+        "enable.auto.commit": False,
         "key.deserializer":   StringDeserializer("utf_8"),
         "value.deserializer": avro_deserializer,
     })
     consumer.assign([TopicPartition(topic, partition)])
     return consumer
-
-
-def wait_for_assignment(consumer: DeserializingConsumer, timeout: float = 10.0) -> None:
-    """
-    Block until the group coordinator assigns at least one partition to this consumer.
-
-    After subscribe(), the Kafka group coordinator runs a join-group /
-    sync-group round-trip to assign partitions.  This takes at least one
-    network round-trip and can take several seconds on a cold start.  Polling
-    drives the librdkafka background thread so that assignment callbacks fire.
-
-    Parameters
-    ----------
-    consumer : DeserializingConsumer
-        Subscribed consumer (subscribe() must have been called already).
-
-    timeout : float
-        Maximum seconds to wait for assignment before raising TimeoutError.
-        Default is 10 s, which is generous for a healthy cluster.
-
-    Raises
-    ------
-    TimeoutError
-        If no partitions are assigned within `timeout` seconds.  This usually
-        indicates a connectivity or authentication problem.
-    """
-    deadline = time.time() + timeout
-    while not consumer.assignment():
-        if time.time() > deadline:
-            raise TimeoutError("Timed out waiting for partition assignment.")
-        # poll(0.1) drives librdkafka's internal event loop so the join-group
-        # response is processed and assignment() is populated.
-        consumer.poll(0.1)
 
 
 def seek_to_end(consumer: DeserializingConsumer) -> None:
@@ -251,13 +178,27 @@ def seek_to_end(consumer: DeserializingConsumer) -> None:
     if not assignment:
         raise RuntimeError("No partition assignment — rebalance may be in progress.")
 
-    for partition in assignment:
-        # get_watermark_offsets returns (low, high).
-        # low  = earliest available offset (oldest retained message)
-        # high = next offset to be written (one past the last message)
-        # Seeking to `high` means: "give me the next message produced after now."
-        _, high = consumer.get_watermark_offsets(partition, timeout=5.0)
-        consumer.seek(TopicPartition(partition.topic, partition.partition, high))
+    # Drive librdkafka's internal event loop so assigned partitions transition
+    # from START to ACTIVE state.  With assign() (not subscribe()), no poll
+    # is ever called by the framework.  poll(0) is non-blocking; on the very
+    # first call right after assign() the state machine may not have transitioned
+    # yet, so retry a few times with a short sleep on _STATE errors.
+    for attempt in range(5):
+        consumer.poll(0)
+        try:
+            for partition in assignment:
+                # get_watermark_offsets returns (low, high).
+                # low  = earliest available offset (oldest retained message)
+                # high = next offset to be written (one past the last message)
+                # Seeking to `high` means: "give me the next message produced after now."
+                _, high = consumer.get_watermark_offsets(partition, timeout=5.0)
+                consumer.seek(TopicPartition(partition.topic, partition.partition, high))
+            return  # all seeks succeeded
+        except KafkaException as exc:
+            if exc.args and exc.args[0].code() == KafkaError._STATE and attempt < 4:
+                time.sleep(0.1)
+                continue
+            raise
 
 
 def consume_canary(

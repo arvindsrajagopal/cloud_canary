@@ -43,6 +43,7 @@
 #   Produce duration: 5 ms  (fast write) → 2.5 s  (degraded ack latency)
 # ---------------------------------------------------------------------------
 
+import os
 import socket
 
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
@@ -50,7 +51,9 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 # Hostname of this canary instance.  Embedded as a constant label on every
 # metric so that dashboards and alerts can filter or group by instance without
 # relying on Prometheus scrape-target configuration.
-HOST = socket.gethostname()
+# Can be overridden via CANARY_INSTANCE_ID environment variable or instance.id
+# in config.ini for multi-instance deployments on the same host.
+HOST = os.getenv("CANARY_INSTANCE_ID") or socket.gethostname()
 
 # ---------------------------------------------------------------------------
 # Latency histograms — labeled per host AND partition at call time.
@@ -121,6 +124,14 @@ CONSECUTIVE_FAILURES = Gauge(
     ["host", "partition"],
 )
 
+LAST_SUCCESS_TIMESTAMP = Gauge(
+    "canary_last_success_timestamp_seconds",
+    "Unix timestamp of the last successful check per host and partition. "
+    "Use (time() - canary_last_success_timestamp_seconds) to detect stale monitoring. "
+    "Alert if this value is too far in the past (e.g., > 300s means no success in 5 minutes).",
+    ["host", "partition"],
+)
+
 # ---------------------------------------------------------------------------
 # Schema Registry counter — host is a variable label; callers must pass host=HOST
 # ---------------------------------------------------------------------------
@@ -177,9 +188,15 @@ _CHECK_SEQUENCE = Gauge(
 CHECK_SEQUENCE = _CHECK_SEQUENCE.labels(host=HOST)
 
 
-def start_metrics_server(port: int) -> None:
+def start_metrics_server(
+    port: int,
+    addr: str = "0.0.0.0",
+    ssl_enabled: bool = False,
+    ssl_cert: str | None = None,
+    ssl_key: str | None = None,
+) -> None:
     """
-    Start the Prometheus HTTP metrics server on the given port.
+    Start the Prometheus HTTP(S) metrics server on the given port and address.
 
     Spawns a background daemon thread that serves the /metrics endpoint.
     The thread exits automatically when the main process exits.
@@ -188,8 +205,58 @@ def start_metrics_server(port: int) -> None:
     ----------
     port : int
         TCP port to listen on (configured via metrics.port in config.ini,
-        default 8000).  Prometheus scrapes http://<host>:<port>/metrics.
+        default 8000). Prometheus scrapes http(s)://<host>:<port>/metrics.
         When running multiple instances on the same host, each must use a
         distinct port.
+
+    addr : str
+        Bind address for the HTTP server (default "0.0.0.0" for all interfaces).
+        Use "127.0.0.1" to bind to localhost only, or a specific IP address
+        to bind to a single interface.
+
+    ssl_enabled : bool
+        If True, enables HTTPS with TLS encryption. Requires ssl_cert and
+        ssl_key to be provided (default False).
+
+    ssl_cert : str | None
+        Path to SSL certificate file in PEM format. Required if ssl_enabled=True.
+
+    ssl_key : str | None
+        Path to SSL private key file in PEM format. Required if ssl_enabled=True.
+
+    Raises
+    ------
+    ValueError
+        If ssl_enabled=True but ssl_cert or ssl_key are not provided.
+    FileNotFoundError
+        If SSL certificate or key files do not exist.
     """
-    start_http_server(port)
+    if ssl_enabled:
+        if not ssl_cert or not ssl_key:
+            raise ValueError(
+                "metrics.ssl.cert and metrics.ssl.key must be set when metrics.ssl.enabled=true"
+            )
+
+        import os
+        import ssl
+        from http.server import HTTPServer
+        from prometheus_client import MetricsHandler
+
+        if not os.path.exists(ssl_cert):
+            raise FileNotFoundError(f"SSL certificate not found: {ssl_cert}")
+        if not os.path.exists(ssl_key):
+            raise FileNotFoundError(f"SSL private key not found: {ssl_key}")
+
+        # Create HTTPS server with SSL context
+        server = HTTPServer((addr, port), MetricsHandler)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+
+        # Start server in background thread
+        import threading
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+    else:
+        # Standard HTTP server (no SSL)
+        start_http_server(port, addr=addr)

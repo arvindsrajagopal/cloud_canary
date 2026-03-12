@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+ENV/
+env/
+
+# Config (actual credentials should be mounted, not baked in)
+config/config.ini
+
+# Monitoring stack (not needed in container)
+monitoring/
+
+# Documentation and development files
+README.md
+*.md
+.DS_Store
+
+# Run scripts (container uses CMD directly)
+run.sh

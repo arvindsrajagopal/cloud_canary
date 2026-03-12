@@ -98,6 +98,7 @@
 # ---------------------------------------------------------------------------
 
 import logging
+import os
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -364,12 +365,22 @@ def run() -> None:
     app           = config["app"]
 
     # -- Application settings (with defaults) --
+    # Instance ID can be set via instance.id in config.ini or CANARY_INSTANCE_ID env var
+    # (env var takes precedence, set in metrics.py). If config provides it, update metrics.HOST.
+    instance_id = app.get("instance.id")
+    if instance_id and not os.getenv("CANARY_INSTANCE_ID"):
+        metrics.HOST = instance_id
+
     topic               = app.get("topic",                          "cloud-canary")
     timeout             = float(app.get("consumer.timeout.seconds",              "5"))
     interval            = float(app.get("check.interval.seconds",               "15"))
     sync_interval       = float(app.get("partition.sync.interval.seconds",   "86400"))
     sr_check_interval   = float(app.get("sr.check.interval.seconds",            "60"))
     metrics_port        = int(app.get("metrics.port",                          "8000"))
+    metrics_bind_addr   = app.get("metrics.bind.address",                  "0.0.0.0")
+    metrics_ssl_enabled = app.get("metrics.ssl.enabled", "false").lower() == "true"
+    metrics_ssl_cert    = app.get("metrics.ssl.cert")
+    metrics_ssl_key     = app.get("metrics.ssl.key")
     log_topic_enabled   = app.get("log.topic.enabled", "false").lower() == "true"
     log_topic           = app.get("log.topic",                    "cloud-canary-logs")
     log_topic_retention_ms = int(app.get("log.topic.retention.ms",        "604800000"))
@@ -390,11 +401,22 @@ def run() -> None:
         f"warmup.checks={warmup_checks}"
     )
 
-    # Start the Prometheus metrics HTTP server (background daemon thread).
+    # Start the Prometheus metrics HTTP(S) server (background daemon thread).
     # The /metrics endpoint is available immediately, returning zeros for
     # counters/histograms that haven't been updated yet.
-    start_metrics_server(metrics_port)
-    log.info(f"Metrics available at http://0.0.0.0:{metrics_port}/metrics")
+    try:
+        start_metrics_server(
+            port=metrics_port,
+            addr=metrics_bind_addr,
+            ssl_enabled=metrics_ssl_enabled,
+            ssl_cert=metrics_ssl_cert,
+            ssl_key=metrics_ssl_key,
+        )
+        protocol = "https" if metrics_ssl_enabled else "http"
+        log.info(f"Metrics available at {protocol}://{metrics_bind_addr}:{metrics_port}/metrics")
+    except (ValueError, FileNotFoundError) as exc:
+        log.error(f"Failed to start metrics server: {exc}")
+        return
 
     # ------------------------------------------------------------------
     # Startup: ensure the canary topic exists before creating clients.
@@ -536,6 +558,7 @@ def run() -> None:
                     consecutive_failures[p] = 0
                     metrics.CHECKS_TOTAL.labels(result="success", host=metrics.HOST, partition=str(p)).inc()
                     metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=str(p)).set(0)
+                    metrics.LAST_SUCCESS_TIMESTAMP.labels(host=metrics.HOST, partition=str(p)).set(time.time())
                     metrics.CHECK_SEQUENCE.set(check_sequence)
 
                     if is_warming_up:

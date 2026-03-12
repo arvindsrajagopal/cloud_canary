@@ -43,6 +43,8 @@
 #       partition count (recreated by another instance), recreation is skipped.
 # ---------------------------------------------------------------------------
 
+from __future__ import annotations
+
 import logging
 import time
 
@@ -417,25 +419,30 @@ def sync_topic_partitions(
         f"Broker count change detected: {current_partitions} → {num_brokers}. "
         f"Increasing partitions for '{topic}' to {num_brokers}."
     )
+    final_partitions = current_partitions
     futures = admin.create_partitions([NewPartitions(topic, num_brokers)])
     for topic_name, future in futures.items():
         try:
             future.result()
             log.info(f"Topic '{topic_name}' now has {num_brokers} partition(s).")
+            final_partitions = num_brokers
         except KafkaException as exc:
             # Re-fetch metadata to check whether another instance already
             # increased the partition count while this call was in flight.
             try:
                 refreshed = _get_metadata(admin)
-                if (topic_name in refreshed.topics and
-                        len(refreshed.topics[topic_name].partitions) == num_brokers):
+                actual = len(refreshed.topics[topic_name].partitions) if topic_name in refreshed.topics else current_partitions
+                if actual == num_brokers:
                     log.info(
                         f"Topic '{topic_name}' already has {num_brokers} partition(s) "
                         "(updated by another instance) — skipping."
                     )
+                    final_partitions = num_brokers
                 else:
                     log.error(f"Failed to update partitions for '{topic_name}': {exc}")
+                    final_partitions = actual
             except RuntimeError:
                 log.error(f"Failed to update partitions for '{topic_name}': {exc}")
+                final_partitions = current_partitions
 
-    return num_brokers, num_brokers
+    return num_brokers, final_partitions
