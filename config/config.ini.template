@@ -37,6 +37,14 @@ metrics.ssl.enabled=false
 # Path to SSL private key file (PEM format, required if ssl.enabled=true)
 #metrics.ssl.key=/path/to/key.pem
 
+# Logging configuration
+# log.format controls output format: "json" (structured), "text" (human-readable), or "auto" (detect based on TTY)
+# "auto" = JSON in Docker/production (non-TTY), text for local development (TTY)
+# Can also be set via CANARY_LOG_FORMAT environment variable (takes precedence)
+log.format=auto
+# log.level controls verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
+log.level=INFO
+
 # Log topic (optional) — set log.topic.enabled=true to publish logs to Kafka for long-term retention.
 # The topic is created automatically with the retention period below (default 7 days).
 log.topic.enabled=false

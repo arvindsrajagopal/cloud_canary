@@ -41,54 +41,69 @@ from confluent_kafka import DeserializingConsumer, KafkaError, KafkaException, T
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import StringDeserializer
 
+from src import constants as const
 from src.schema import (
     CANARY_SCHEMA_STR,
     CanaryMessage,
     dict_to_canary,
 )
 
+# Import metrics.HOST to use the configurable instance ID.
+# This respects CANARY_INSTANCE_ID env var and instance.id config setting.
+from src import metrics
+
 # ---------------------------------------------------------------------------
 # Default librdkafka consumer configuration.
-# Merged with connection/auth settings from config.ini in create_consumer().
+# Implemented as a function to pick up the current metrics.HOST value, which
+# may be updated after config loading (via instance.id setting).
+# Merged with connection/auth settings from config.ini in create_partition_consumer().
 # ---------------------------------------------------------------------------
-_CONSUMER_DEFAULTS = {
-    # ---- Identification ----
-    "client.id": socket.gethostname(),
+def _get_consumer_defaults() -> dict:
+    """
+    Return consumer default configuration with current instance ID.
 
-    # ---- Group membership & rebalance ----
-    # session.timeout.ms: how long the broker waits for a heartbeat before
-    # considering the consumer dead and triggering a rebalance.  45 s gives
-    # headroom for transient network hiccups without over-triggering rebalances.
-    "session.timeout.ms": 45000,
+    Called when creating consumers (after config is loaded), ensuring
+    client.id respects the configurable instance ID from config.ini or env var.
+    """
+    return {
+        # ---- Identification ----
+        # Uses metrics.HOST which respects CANARY_INSTANCE_ID env var and instance.id config.
+        "client.id": metrics.HOST,
 
-    # heartbeat.interval.ms must be < session.timeout.ms / 3 per the Kafka spec.
-    # 3 s is aggressive enough to detect failures promptly.
-    "heartbeat.interval.ms": 3000,
+        # ---- Group membership & rebalance ----
+        # session.timeout.ms: how long the broker waits for a heartbeat before
+        # considering the consumer dead and triggering a rebalance.  45 s gives
+        # headroom for transient network hiccups without over-triggering rebalances.
+        "session.timeout.ms": const.CONSUMER_SESSION_TIMEOUT_MS,
 
-    # max.poll.interval.ms: maximum time between poll() calls before the broker
-    # evicts this consumer from the group.  300 s accommodates the canary's
-    # consumer.timeout.seconds (default 5 s) with ample margin.
-    "max.poll.interval.ms": 300000,
+        # heartbeat.interval.ms must be < session.timeout.ms / 3 per the Kafka spec.
+        # 3 s is aggressive enough to detect failures promptly.
+        "heartbeat.interval.ms": const.CONSUMER_HEARTBEAT_INTERVAL_MS,
 
-    # ---- Fetch behaviour (optimised for low latency) ----
-    # Return a fetch response as soon as any data is available (1 byte minimum).
-    "fetch.min.bytes": 1,
+        # max.poll.interval.ms: maximum time between poll() calls before the broker
+        # evicts this consumer from the group.  300 s accommodates the canary's
+        # consumer.timeout.seconds (default 5 s) with ample margin.
+        "max.poll.interval.ms": const.CONSUMER_MAX_POLL_INTERVAL_MS,
 
-    # Reduce the broker's max wait time before responding to a fetch request.
-    # The default 500 ms adds unnecessary latency for a canary that polls for
-    # a single known message.
-    "fetch.wait.max.ms": 100,
+        # ---- Fetch behaviour (optimised for low latency) ----
+        # Return a fetch response as soon as any data is available (1 byte minimum).
+        "fetch.min.bytes": const.CONSUMER_FETCH_MIN_BYTES,
 
-    # ---- Connection / network reliability ----
-    "client.dns.lookup": "use_all_dns_ips",         # required for Confluent Cloud
-    "api.version.request.timeout.ms": 30000,        # increased from 10 s default
-    "socket.keepalive.enable": True,
-    "socket.nagle.disable": True,                   # flush small packets immediately
-    "socket.connection.setup.timeout.ms": 30000,
-    "reconnect.backoff.ms": 1000,
-    "reconnect.backoff.max.ms": 10000,
-    "metadata.max.age.ms": 300000,
-}
+        # Reduce the broker's max wait time before responding to a fetch request.
+        # The default 500 ms adds unnecessary latency for a canary that polls for
+        # a single known message.
+        "fetch.wait.max.ms": const.CONSUMER_FETCH_WAIT_MAX_MS,
+
+        # ---- Connection / network reliability ----
+        "client.dns.lookup": "use_all_dns_ips",         # required for Confluent Cloud
+        "api.version.request.timeout.ms": const.API_VERSION_REQUEST_TIMEOUT_MS,
+        "socket.keepalive.enable": True,
+        "socket.nagle.disable": True,                   # flush small packets immediately
+        "socket.connection.setup.timeout.ms": const.SOCKET_CONNECTION_SETUP_TIMEOUT_MS,
+        "reconnect.backoff.ms": const.RECONNECT_BACKOFF_MIN_MS,
+        "reconnect.backoff.max.ms": const.RECONNECT_BACKOFF_MAX_MS,
+        "metadata.max.age.ms": const.METADATA_MAX_AGE_MS,
+    }
 
 
 def create_partition_consumer(
@@ -131,7 +146,7 @@ def create_partition_consumer(
         dict_to_canary,
     )
     consumer = DeserializingConsumer({
-        **_CONSUMER_DEFAULTS,
+        **_get_consumer_defaults(),  # get defaults with current instance ID
         **kafka_config,
         # A unique group.id is required by librdkafka even for manually-assigned
         # consumers (it is used internally for offset commits and heartbeats).
@@ -183,7 +198,7 @@ def seek_to_end(consumer: DeserializingConsumer) -> None:
     # is ever called by the framework.  poll(0) is non-blocking; on the very
     # first call right after assign() the state machine may not have transitioned
     # yet, so retry a few times with a short sleep on _STATE errors.
-    for attempt in range(5):
+    for attempt in range(const.CONSUMER_STATE_TRANSITION_MAX_ATTEMPTS):
         consumer.poll(0)
         try:
             for partition in assignment:
@@ -191,14 +206,24 @@ def seek_to_end(consumer: DeserializingConsumer) -> None:
                 # low  = earliest available offset (oldest retained message)
                 # high = next offset to be written (one past the last message)
                 # Seeking to `high` means: "give me the next message produced after now."
-                _, high = consumer.get_watermark_offsets(partition, timeout=5.0)
+                _, high = consumer.get_watermark_offsets(
+                    partition,
+                    timeout=const.CONSUMER_WATERMARK_TIMEOUT_SECONDS
+                )
                 consumer.seek(TopicPartition(partition.topic, partition.partition, high))
             return  # all seeks succeeded
         except KafkaException as exc:
-            if exc.args and exc.args[0].code() == KafkaError._STATE and attempt < 4:
-                time.sleep(0.1)
+            if exc.args and exc.args[0].code() == KafkaError._STATE and attempt < const.CONSUMER_STATE_TRANSITION_MAX_ATTEMPTS - 1:
+                time.sleep(const.CONSUMER_STATE_TRANSITION_RETRY_SLEEP_SECONDS)
                 continue
             raise
+
+    # If we exhausted all retry attempts without success, raise an error
+    raise RuntimeError(
+        f"Consumer failed to transition to ACTIVE state after "
+        f"{const.CONSUMER_STATE_TRANSITION_MAX_ATTEMPTS} attempts. "
+        "This may indicate broker connectivity issues or consumer group problems."
+    )
 
 
 def consume_canary(
@@ -248,10 +273,18 @@ def consume_canary(
     """
     deadline = time.time() + timeout
 
-    while time.time() < deadline:
-        # poll() with a 1 s timeout drives the librdkafka event loop and
-        # returns as soon as a message (or error) is available, or after 1 s.
-        msg = consumer.poll(timeout=1.0)
+    while True:
+        # Calculate remaining time dynamically to avoid unnecessary busy-waiting
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            # Timeout exceeded
+            break
+
+        # poll() with a timeout drives the librdkafka event loop and
+        # returns as soon as a message (or error) is available, or after the timeout.
+        # Use dynamic timeout based on remaining time (capped at CONSUMER_POLL_TIMEOUT_SECONDS).
+        poll_timeout = min(remaining, const.CONSUMER_POLL_TIMEOUT_SECONDS)
+        msg = consumer.poll(timeout=poll_timeout)
 
         if msg is None:
             # No message in this poll window; keep waiting.

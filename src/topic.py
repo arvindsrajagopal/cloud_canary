@@ -51,12 +51,9 @@ import time
 from confluent_kafka import KafkaError, KafkaException
 from confluent_kafka.admin import AdminClient, NewPartitions, NewTopic
 
-log = logging.getLogger(__name__)
+from src import constants as const
 
-# How long to wait for a topic deletion to propagate across all brokers before
-# attempting to recreate it.  Kafka deletes topics asynchronously; re-creating
-# before deletion completes can result in a "topic already exists" error.
-_DELETE_PROPAGATION_TIMEOUT = 30  # seconds
+log = logging.getLogger(__name__)
 
 
 def _get_metadata(admin: AdminClient):
@@ -81,7 +78,7 @@ def _get_metadata(admin: AdminClient):
         is unreachable.
     """
     try:
-        return admin.list_topics(timeout=10)
+        return admin.list_topics(timeout=const.ADMIN_METADATA_TIMEOUT_SECONDS)
     except KafkaException as exc:
         raise RuntimeError(f"Could not reach cluster to inspect topics: {exc}")
 
@@ -117,28 +114,28 @@ def _create_topic(admin: AdminClient, topic: str, num_brokers: int) -> None:
     """
     replication_factor = min(num_brokers, 3)
     log.info(
-        f"Creating topic '{topic}' with "
-        f"num_partitions={num_brokers}, replication_factor={replication_factor}."
+        "Creating topic '%s' with num_partitions=%s, replication_factor=%s.",
+        topic, num_brokers, replication_factor
     )
     futures = admin.create_topics([
         NewTopic(
             topic=topic,
             num_partitions=num_brokers,
             replication_factor=replication_factor,
-            config={"retention.ms": "86400000"},  # 1 day — canary messages have no value after the check completes
+            config={"retention.ms": str(const.CANARY_TOPIC_RETENTION_MS)},
         )
     ])
     for topic_name, future in futures.items():
         try:
             future.result()   # blocks until the broker confirms or rejects creation
-            log.info(f"Topic '{topic_name}' created successfully.")
+            log.info("Topic '%s' created successfully.", topic_name)
         except KafkaException as exc:
             # Another instance won the creation race — the topic exists and is
             # ready to use, so treat this as a success rather than an error.
             if exc.args and exc.args[0].code() == KafkaError.TOPIC_ALREADY_EXISTS:
-                log.info(f"Topic '{topic_name}' already exists (created by another instance) — skipping.")
+                log.info("Topic '%s' already exists (created by another instance) — skipping.", topic_name)
             else:
-                raise RuntimeError(f"Failed to create topic '{topic_name}': {exc}")
+                raise RuntimeError("Failed to create topic '%s': %s" % (topic_name, exc))
 
 
 def _delete_and_recreate(admin: AdminClient, topic: str, num_brokers: int) -> None:
@@ -206,7 +203,11 @@ def _delete_and_recreate(admin: AdminClient, topic: str, num_brokers: int) -> No
     # Multi-instance case: if another instance deleted and already recreated
     # the topic with the correct partition count, the topic will reappear in
     # metadata before we see it disappear.  Detect this and skip recreation.
-    deadline = time.time() + _DELETE_PROPAGATION_TIMEOUT
+    #
+    # Use exponential backoff to reduce metadata fetch overhead while still
+    # detecting completion quickly (starts at 0.1s, doubles up to 5s max).
+    deadline = time.time() + const.DELETE_PROPAGATION_TIMEOUT_SECONDS
+    sleep_time = 0.1  # Start with 100ms for fast detection
     while time.time() < deadline:
         metadata = _get_metadata(admin)
         if topic not in metadata.topics:
@@ -219,19 +220,21 @@ def _delete_and_recreate(admin: AdminClient, topic: str, num_brokers: int) -> No
                 "by another instance — skipping recreation."
             )
             return
-        time.sleep(1)
+        # Exponential backoff: double sleep time up to 5 seconds max
+        time.sleep(sleep_time)
+        sleep_time = min(sleep_time * 2, 5.0)
     else:
         # Loop exhausted without breaking — topic still visible after timeout.
         log.error(
             f"Timed out waiting for topic '{topic}' deletion to propagate "
-            f"({_DELETE_PROPAGATION_TIMEOUT}s). Skipping recreation — will retry on next sync."
+            f"({const.DELETE_PROPAGATION_TIMEOUT_SECONDS}s). Skipping recreation — will retry on next sync."
         )
         return
 
     _create_topic(admin, topic, num_brokers)
 
 
-def ensure_log_topic(kafka_config: dict, topic: str, retention_ms: int) -> None:
+def ensure_log_topic(kafka_config: dict, topic: str, retention_ms: int, admin: AdminClient | None = None) -> None:
     """
     Ensure the Kafka log-capture topic exists with the requested retention period.
 
@@ -246,7 +249,7 @@ def ensure_log_topic(kafka_config: dict, topic: str, retention_ms: int) -> None:
     Parameters
     ----------
     kafka_config : dict
-        Connection/auth settings passed to AdminClient.
+        Connection/auth settings passed to AdminClient (used only if admin is None).
 
     topic : str
         Name of the log topic (e.g. "cloud-canary-logs").
@@ -255,52 +258,64 @@ def ensure_log_topic(kafka_config: dict, topic: str, retention_ms: int) -> None:
         How long (milliseconds) messages are retained before being deleted.
         Default in config is 604800000 (7 days).
 
+    admin : AdminClient, optional
+        Pre-created AdminClient to reuse. If None, a new one is created and cleaned up.
+
     Raises
     ------
     RuntimeError
         If topic creation fails (propagated from the AdminClient future).
     """
-    admin = AdminClient(kafka_config)
-    metadata = _get_metadata(admin)
+    # Reuse provided admin or create a new one
+    admin_provided = admin is not None
+    if not admin_provided:
+        admin = AdminClient(kafka_config)
 
-    if topic in metadata.topics:
-        num_partitions = len(metadata.topics[topic].partitions)
+    try:
+        metadata = _get_metadata(admin)
+
+        if topic in metadata.topics:
+            num_partitions = len(metadata.topics[topic].partitions)
+            log.info(
+                f"Log topic '{topic}' already exists ({num_partitions} partition(s)) — skipping creation."
+            )
+            return
+
+        num_brokers = len(metadata.brokers)
+        replication_factor = min(num_brokers, 3)
+
         log.info(
-            f"Log topic '{topic}' already exists ({num_partitions} partition(s)) — skipping creation."
+            f"Creating log topic '{topic}' with "
+            f"num_partitions=1, replication_factor={replication_factor}, "
+            f"retention.ms={retention_ms}."
         )
-        return
 
-    num_brokers = len(metadata.brokers)
-    replication_factor = min(num_brokers, 3)
+        futures = admin.create_topics([
+            NewTopic(
+                topic=topic,
+                num_partitions=1,
+                replication_factor=replication_factor,
+                config={"retention.ms": str(retention_ms)},   # topic-level retention override
+            )
+        ])
 
-    log.info(
-        f"Creating log topic '{topic}' with "
-        f"num_partitions=1, replication_factor={replication_factor}, "
-        f"retention.ms={retention_ms}."
-    )
-
-    futures = admin.create_topics([
-        NewTopic(
-            topic=topic,
-            num_partitions=1,
-            replication_factor=replication_factor,
-            config={"retention.ms": str(retention_ms)},   # topic-level retention override
-        )
-    ])
-
-    for topic_name, future in futures.items():
-        try:
-            future.result()
-            log.info(f"Log topic '{topic_name}' created successfully.")
-        except KafkaException as exc:
-            # Another instance won the creation race — treat as success.
-            if exc.args and exc.args[0].code() == KafkaError.TOPIC_ALREADY_EXISTS:
-                log.info(f"Log topic '{topic_name}' already exists (created by another instance) — skipping.")
-            else:
-                raise RuntimeError(f"Failed to create log topic '{topic_name}': {exc}")
+        for topic_name, future in futures.items():
+            try:
+                future.result()
+                log.info(f"Log topic '{topic_name}' created successfully.")
+            except KafkaException as exc:
+                # Another instance won the creation race — treat as success.
+                if exc.args and exc.args[0].code() == KafkaError.TOPIC_ALREADY_EXISTS:
+                    log.info(f"Log topic '{topic_name}' already exists (created by another instance) — skipping.")
+                else:
+                    raise RuntimeError(f"Failed to create log topic '{topic_name}': {exc}")
+    finally:
+        # Only delete if we created it locally
+        if not admin_provided:
+            del admin
 
 
-def ensure_topic(kafka_config: dict, topic: str) -> None:
+def ensure_topic(kafka_config: dict, topic: str, admin: AdminClient | None = None) -> None:
     """
     Ensure the canary topic exists on the cluster, creating it if necessary.
 
@@ -315,35 +330,48 @@ def ensure_topic(kafka_config: dict, topic: str) -> None:
     Parameters
     ----------
     kafka_config : dict
-        Connection/auth settings passed to AdminClient.
+        Connection/auth settings passed to AdminClient (used only if admin is None).
 
     topic : str
         Name of the canary topic (e.g. "cloud-canary").
+
+    admin : AdminClient, optional
+        Pre-created AdminClient to reuse. If None, a new one is created and cleaned up.
 
     Raises
     ------
     RuntimeError
         If the cluster is unreachable or topic creation fails.
     """
-    admin = AdminClient(kafka_config)
-    metadata = _get_metadata(admin)
+    # Reuse provided admin or create a new one
+    admin_provided = admin is not None
+    if not admin_provided:
+        admin = AdminClient(kafka_config)
 
-    num_brokers = len(metadata.brokers)
-    log.info(f"Cluster has {num_brokers} broker(s).")
+    try:
+        metadata = _get_metadata(admin)
 
-    if topic in metadata.topics:
-        num_partitions = len(metadata.topics[topic].partitions)
-        log.info(
-            f"Topic '{topic}' already exists ({num_partitions} partition(s)) — skipping creation."
-        )
-        return
+        num_brokers = len(metadata.brokers)
+        log.info(f"Cluster has {num_brokers} broker(s).")
 
-    _create_topic(admin, topic, num_brokers)
+        if topic in metadata.topics:
+            num_partitions = len(metadata.topics[topic].partitions)
+            log.info(
+                f"Topic '{topic}' already exists ({num_partitions} partition(s)) — skipping creation."
+            )
+            return
+
+        _create_topic(admin, topic, num_brokers)
+    finally:
+        # Only delete if we created it locally
+        if not admin_provided:
+            del admin
 
 
 def sync_topic_partitions(
     kafka_config: dict,
     topic: str,
+    admin: AdminClient | None = None,
 ) -> tuple[int, int] | None:
     """
     Detect broker count changes and reconcile the canary topic's partition count.
@@ -376,10 +404,13 @@ def sync_topic_partitions(
     Parameters
     ----------
     kafka_config : dict
-        Connection/auth settings passed to AdminClient.
+        Connection/auth settings passed to AdminClient (used only if admin is None).
 
     topic : str
         Name of the canary topic to sync.
+
+    admin : AdminClient, optional
+        Pre-created AdminClient to reuse. If None, a new one is created and cleaned up.
 
     Returns
     -------
@@ -388,61 +419,69 @@ def sync_topic_partitions(
         any reconciliation.  Returns None if cluster metadata could not be
         fetched (errors are logged; the next sync will retry).
     """
-    admin = AdminClient(kafka_config)
+    # Reuse provided admin or create a new one
+    admin_provided = admin is not None
+    if not admin_provided:
+        admin = AdminClient(kafka_config)
 
     try:
-        metadata = _get_metadata(admin)
-    except RuntimeError as exc:
-        log.error(f"Partition sync skipped — could not fetch cluster metadata: {exc}")
-        return None
-
-    if topic not in metadata.topics:
-        log.warning(f"Partition sync skipped — topic '{topic}' not found in metadata.")
-        return None
-
-    num_brokers = len(metadata.brokers)
-    current_partitions = len(metadata.topics[topic].partitions)
-
-    # No change — broker count matches partition count.
-    if num_brokers == current_partitions:
-        return num_brokers, current_partitions
-
-    # Scale-down: partition count exceeds broker count.
-    # Kafka does not support reducing partitions, so drop and recreate.
-    if num_brokers < current_partitions:
-        _delete_and_recreate(admin, topic, num_brokers)
-        return num_brokers, num_brokers
-
-    # Scale-up: more brokers than partitions.
-    # create_partitions() increases the count to num_brokers.
-    log.info(
-        f"Broker count change detected: {current_partitions} → {num_brokers}. "
-        f"Increasing partitions for '{topic}' to {num_brokers}."
-    )
-    final_partitions = current_partitions
-    futures = admin.create_partitions([NewPartitions(topic, num_brokers)])
-    for topic_name, future in futures.items():
         try:
-            future.result()
-            log.info(f"Topic '{topic_name}' now has {num_brokers} partition(s).")
-            final_partitions = num_brokers
-        except KafkaException as exc:
-            # Re-fetch metadata to check whether another instance already
-            # increased the partition count while this call was in flight.
-            try:
-                refreshed = _get_metadata(admin)
-                actual = len(refreshed.topics[topic_name].partitions) if topic_name in refreshed.topics else current_partitions
-                if actual == num_brokers:
-                    log.info(
-                        f"Topic '{topic_name}' already has {num_brokers} partition(s) "
-                        "(updated by another instance) — skipping."
-                    )
-                    final_partitions = num_brokers
-                else:
-                    log.error(f"Failed to update partitions for '{topic_name}': {exc}")
-                    final_partitions = actual
-            except RuntimeError:
-                log.error(f"Failed to update partitions for '{topic_name}': {exc}")
-                final_partitions = current_partitions
+            metadata = _get_metadata(admin)
+        except RuntimeError as exc:
+            log.error(f"Partition sync skipped — could not fetch cluster metadata: {exc}")
+            return None
 
-    return num_brokers, final_partitions
+        if topic not in metadata.topics:
+            log.warning(f"Partition sync skipped — topic '{topic}' not found in metadata.")
+            return None
+
+        num_brokers = len(metadata.brokers)
+        current_partitions = len(metadata.topics[topic].partitions)
+
+        # No change — broker count matches partition count.
+        if num_brokers == current_partitions:
+            return num_brokers, current_partitions
+
+        # Scale-down: partition count exceeds broker count.
+        # Kafka does not support reducing partitions, so drop and recreate.
+        if num_brokers < current_partitions:
+            _delete_and_recreate(admin, topic, num_brokers)
+            return num_brokers, num_brokers
+
+        # Scale-up: more brokers than partitions.
+        # create_partitions() increases the count to num_brokers.
+        log.info(
+            f"Broker count change detected: {current_partitions} → {num_brokers}. "
+            f"Increasing partitions for '{topic}' to {num_brokers}."
+        )
+        final_partitions = current_partitions
+        futures = admin.create_partitions([NewPartitions(topic, num_brokers)])
+        for topic_name, future in futures.items():
+            try:
+                future.result()
+                log.info(f"Topic '{topic_name}' now has {num_brokers} partition(s).")
+                final_partitions = num_brokers
+            except KafkaException as exc:
+                # Re-fetch metadata to check whether another instance already
+                # increased the partition count while this call was in flight.
+                try:
+                    refreshed = _get_metadata(admin)
+                    actual = len(refreshed.topics[topic_name].partitions) if topic_name in refreshed.topics else current_partitions
+                    if actual == num_brokers:
+                        log.info(
+                            f"Topic '{topic_name}' already has {num_brokers} partition(s) "
+                            "(updated by another instance) — skipping."
+                        )
+                        final_partitions = num_brokers
+                    else:
+                        log.error(f"Failed to update partitions for '{topic_name}': {exc}")
+                        final_partitions = actual
+                except RuntimeError:
+                    log.error(f"Failed to update partitions for '{topic_name}': {exc}")
+                    final_partitions = current_partitions
+
+        return num_brokers, final_partitions
+    finally:
+        # Only delete if we created it locally
+        if not admin_provided:
+            del admin

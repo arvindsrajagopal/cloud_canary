@@ -100,13 +100,19 @@
 import logging
 import os
 import signal
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from confluent_kafka import KafkaException
+from confluent_kafka.admin import AdminClient
+from confluent_kafka.consumer import Consumer as DeserializingConsumer
+from confluent_kafka.producer import Producer as SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 
+from src import constants as const
 from src import metrics
+from src.__version__ import __version__
 from src.config import load_config
 from src.consumer import (
     consume_canary,
@@ -123,40 +129,49 @@ from src.error_classifier import (
 from src.kafka_log_handler import KafkaLogHandler
 from src.metrics import start_metrics_server
 from src.producer import create_producer, produce_canary
+from src.structured_logging import CanaryLoggerAdapter, setup_logging
 from src.topic import ensure_log_topic, ensure_topic, sync_topic_partitions
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+# Logging will be configured in run() after loading config.
+# Initialize adapter at module level with placeholder context.
+# The context will be updated in run() after loading config,
+# avoiding global variable reassignment.
+_base_logger = logging.getLogger(__name__)
+log = CanaryLoggerAdapter(_base_logger, {
+    "host": "unknown",     # Updated in run() after loading config
+    "version": "unknown",  # Updated in run() after loading config
+})
 
 # Path to the INI configuration file, relative to the working directory
 # from which the application is launched (typically the project root).
-CONFIG_FILE = "config/config.ini"
+# Can be overridden via CANARY_CONFIG_FILE environment variable.
+CONFIG_FILE = os.getenv("CANARY_CONFIG_FILE", "config/config.ini")
 
-# Shutdown flag — set to True by the SIGINT/SIGTERM handler.
+# Shutdown event — set by the SIGINT/SIGTERM handler.
 # The main loop checks this at the top of each iteration and exits cleanly
-# after the current check completes.  Using a module-level bool is safe here
-# because Python's GIL ensures the flag write is atomic.
-_shutdown = False
+# after the current check completes.  Using threading.Event() provides
+# thread-safe signaling and prevents race conditions when multiple signals
+# arrive concurrently.
+_shutdown_event = threading.Event()
 
 
 def _handle_signal(sig, frame) -> None:
     """
     Signal handler for SIGINT (Ctrl-C) and SIGTERM (container stop).
 
-    Sets _shutdown=True so the main loop exits after the current check
+    Sets the shutdown event so the main loop exits after the current check
     rather than terminating mid-flight, which could leave a stale consumer
     group registration on the broker.
+
+    Multiple signals are handled safely — only the first signal triggers
+    the log message; subsequent signals are silently ignored.
     """
-    global _shutdown
-    log.info("Shutdown signal received — finishing current check then exiting.")
-    _shutdown = True
+    if not _shutdown_event.is_set():
+        log.info("Shutdown signal received — finishing current check then exiting.")
+        _shutdown_event.set()
 
 
-def check_sr(sr_client) -> None:
+def check_sr(sr_client: SchemaRegistryClient) -> None:
     """
     Verify that the Schema Registry is reachable and responding.
 
@@ -181,8 +196,8 @@ def check_sr(sr_client) -> None:
 
 
 def check_kafka(
-    producer,
-    consumer,
+    producer: SerializingProducer,
+    consumer: DeserializingConsumer,
     topic: str,
     timeout: float,
     check_sequence: int,
@@ -243,7 +258,7 @@ def check_kafka(
     # (one per partition), so its duration reflects broker fetch latency
     # independent of the write/read path.
     # ------------------------------------------------------------------
-    t_seek = time.time()
+    t_seek = time.perf_counter()
     try:
         seek_to_end(consumer)
     except (RuntimeError, KafkaException) as exc:
@@ -257,8 +272,10 @@ def check_kafka(
         # Record seek duration regardless of success or failure so the
         # histogram captures partial attempts (e.g. successful on some
         # partitions before failing on another).
-        metrics.SEEK_DURATION.labels(host=metrics.HOST, partition=str(partition)).observe(
-            (time.time() - t_seek) * 1000
+        # Using perf_counter() for monotonic, accurate timing measurement.
+        # Note: Partition label removed to prevent metrics cardinality explosion.
+        metrics.SEEK_DURATION.labels(host=metrics.HOST).observe(
+            (time.perf_counter() - t_seek) * 1000
         )
 
     # ------------------------------------------------------------------
@@ -269,24 +286,31 @@ def check_kafka(
     # possible ISR degradation, quota exceeded, or network issue between
     # the client and the leader for this partition.
     # ------------------------------------------------------------------
-    t_produce = time.time()
+    t_produce = time.perf_counter()
     try:
         sent = produce_canary(producer, topic, check_sequence, partition)
-        log.info(
-            f"Produced  | seq={sent.check_sequence} partition={partition} "
-            f"id={sent.message_id} host={sent.producer_host}"
+        log.debug(
+            "Message produced",
+            extra={
+                "check_sequence": sent.check_sequence,
+                "partition": partition,
+                "message_id": sent.message_id,
+                "producer_host": sent.producer_host,
+            }
         )
     except KafkaException as exc:
         category = classify_kafka_error(exc.args[0]) if exc.args else ErrorCategory.UNKNOWN
         raise CanaryError(Phase.PRODUCE, category, str(exc))
     except RuntimeError as exc:
-        # flush() wall-clock timeout — broker did not ack within 15 s.
+        # flush() wall-clock timeout — broker did not ack within 2s.
         # delivery.timeout.ms has not expired so the cause is unknown;
         # UNKNOWN is more honest than NETWORK or BROKER here.
         raise CanaryError(Phase.PRODUCE, ErrorCategory.UNKNOWN, str(exc))
     finally:
-        metrics.PRODUCE_DURATION.labels(host=metrics.HOST, partition=str(partition)).observe(
-            (time.time() - t_produce) * 1000
+        # Using perf_counter() for monotonic, accurate timing measurement.
+        # Note: Partition label removed to prevent metrics cardinality explosion.
+        metrics.PRODUCE_DURATION.labels(host=metrics.HOST).observe(
+            (time.perf_counter() - t_produce) * 1000
         )
 
     # ------------------------------------------------------------------
@@ -320,20 +344,112 @@ def check_kafka(
 
 
 def _build_consumer_pool(
-    kafka_config: dict,
-    sr_client,
+    kafka_config: dict[str, str],
+    sr_client: SchemaRegistryClient,
     topic: str,
     partitions: list[int],
-) -> dict:
+) -> dict[int, DeserializingConsumer]:
     """
     Create one DeserializingConsumer per partition, each manually assigned.
 
+    Consumers are created in parallel (up to 10 concurrent connections) to reduce
+    startup time. Sequential creation can take 1+ second per consumer due to
+    TCP handshake, metadata fetch, and group join operations.
+
     Returns a dict mapping partition index → consumer.
     """
-    return {
-        p: create_partition_consumer(kafka_config, sr_client, topic, p)
-        for p in partitions
-    }
+    # Use a temporary executor to parallelize consumer creation during startup.
+    # Cap at 10 workers to avoid overwhelming the broker with concurrent connections.
+    with ThreadPoolExecutor(max_workers=min(len(partitions), 10)) as pool:
+        futures = {
+            p: pool.submit(create_partition_consumer, kafka_config, sr_client, topic, p)
+            for p in partitions
+        }
+        # Wait for all consumers to be created, then return as dict
+        # If any consumer fails, the entire pool creation fails (fail-fast behavior)
+        consumers = {}
+        for p, future in futures.items():
+            try:
+                consumers[p] = future.result()
+            except Exception as exc:
+                log.error(f"Failed to create consumer for partition {p}: {exc}")
+                raise
+        return consumers
+
+
+def _update_success_metrics(
+    partition: int,
+    check_sequence: int,
+    latency_ms: int,
+    consecutive_failures: dict[int, int],
+    is_warming_up: bool,
+) -> None:
+    """
+    Update Prometheus metrics after a successful check.
+
+    Parameters
+    ----------
+    partition : int
+        Partition index that succeeded.
+    check_sequence : int
+        Current check sequence number.
+    latency_ms : int
+        Measured end-to-end latency in milliseconds.
+    consecutive_failures : dict[int, int]
+        Mutable dict tracking consecutive failure counts per partition.
+        This partition's count will be reset to 0.
+    is_warming_up : bool
+        Whether this check is part of the warmup period (latency not recorded).
+    """
+    consecutive_failures[partition] = 0
+    # Convert partition to string once to avoid repeated conversions
+    partition_str = str(partition)
+    metrics.CHECKS_TOTAL.labels(result="success", host=metrics.HOST, partition=partition_str).inc()
+    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_str).set(0)
+    metrics.LAST_SUCCESS_TIMESTAMP.labels(host=metrics.HOST, partition=partition_str).set(time.time())
+    metrics.CHECK_SEQUENCE.set(check_sequence)
+
+    if not is_warming_up:
+        # Note: Partition label removed to prevent metrics cardinality explosion.
+        metrics.E2E_LATENCY.labels(host=metrics.HOST).observe(latency_ms)
+
+
+def _update_failure_metrics(
+    partition: int,
+    check_sequence: int,
+    consecutive_failures: dict[int, int],
+    phase: str,
+    category: str,
+) -> None:
+    """
+    Update Prometheus metrics after a failed check.
+
+    Parameters
+    ----------
+    partition : int
+        Partition index that failed.
+    check_sequence : int
+        Current check sequence number.
+    consecutive_failures : dict[int, int]
+        Mutable dict tracking consecutive failure counts per partition.
+        This partition's count will be incremented.
+    phase : str
+        Phase where the failure occurred (SEEK, PRODUCE, CONSUME, etc.).
+    category : str
+        Error category (NETWORK, BROKER, UNKNOWN).
+    """
+    consecutive_failures[partition] += 1
+    # Convert partition to string once to avoid repeated conversions
+    partition_str = str(partition)
+    metrics.CHECKS_TOTAL.labels(result="failure", host=metrics.HOST, partition=partition_str).inc()
+    metrics.FAILURES_TOTAL.labels(
+        phase=phase, category=category,
+        host=metrics.HOST, partition=partition_str,
+    ).inc()
+    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_str).set(
+        consecutive_failures[partition]
+    )
+    metrics.CHECK_SEQUENCE.set(check_sequence)
 
 
 def run() -> None:
@@ -344,13 +460,14 @@ def run() -> None:
     Startup sequence
     ----------------
     1. Load config.ini and extract per-section settings.
-    2. Start the Prometheus HTTP metrics server.
-    3. Ensure the canary topic exists (create if missing).
-    4. Optionally attach the Kafka log handler to the root logger.
-    5. Create the Schema Registry client and producer.
-    6. Run an initial partition sync to get the current partition count.
-    7. Create one DeserializingConsumer per partition (manual assignment).
-    8. Enter the main loop (canary checks, partition sync, SR checks).
+    2. Configure structured logging based on environment.
+    3. Start the Prometheus HTTP metrics server.
+    4. Ensure the canary topic exists (create if missing).
+    5. Optionally attach the Kafka log handler to the root logger.
+    6. Create the Schema Registry client and producer.
+    7. Run an initial partition sync to get the current partition count.
+    8. Create one DeserializingConsumer per partition (manual assignment).
+    9. Enter the main loop (canary checks, partition sync, SR checks).
 
     Shutdown sequence (finally block)
     -----------------------------------
@@ -363,6 +480,23 @@ def run() -> None:
     kafka_config  = config["kafka"]
     sr_config     = config["schema_registry"]
     app           = config["app"]
+
+    # -- Logging configuration --
+    # Configure structured logging before any log output.
+    # Format can be controlled via CANARY_LOG_FORMAT env var or config.ini.
+    # "auto" = JSON for non-TTY (Docker/production), text for TTY (local dev)
+    log_format = os.getenv("CANARY_LOG_FORMAT", app.get("log.format", "auto"))
+    log_level = getattr(logging, app.get("log.level", "INFO").upper(), logging.INFO)
+    setup_logging(log_format=log_format, level=log_level)
+
+    # Update logger adapter context with actual values (host, version)
+    # This automatically includes these fields in every log entry.
+    # We update the existing adapter's context dict instead of reassigning
+    # the global variable, avoiding the global reassignment anti-pattern.
+    log.extra.update({
+        "host": metrics.HOST,
+        "version": __version__,
+    })
 
     # -- Application settings (with defaults) --
     # Instance ID can be set via instance.id in config.ini or CANARY_INSTANCE_ID env var
@@ -391,14 +525,24 @@ def run() -> None:
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    # Set version info metric
+    metrics.VERSION_INFO.info({
+        'version': __version__,
+        'host': metrics.HOST,
+    })
+
     log.info(
-        f"cloud_canary started | topic={topic} "
-        f"check.interval={interval}s "
-        f"partition.sync.interval={sync_interval}s "
-        f"sr.check.interval={sr_check_interval}s "
-        f"timeout={timeout}s "
-        f"metrics.port={metrics_port} "
-        f"warmup.checks={warmup_checks}"
+        "cloud_canary started",
+        extra={
+            "topic": topic,
+            "check_interval_seconds": interval,
+            "partition_sync_interval_seconds": sync_interval,
+            "sr_check_interval_seconds": sr_check_interval,
+            "consumer_timeout_seconds": timeout,
+            "metrics_port": metrics_port,
+            "warmup_checks": warmup_checks,
+            "log_format": log_format,
+        }
     )
 
     # Start the Prometheus metrics HTTP(S) server (background daemon thread).
@@ -413,20 +557,36 @@ def run() -> None:
             ssl_key=metrics_ssl_key,
         )
         protocol = "https" if metrics_ssl_enabled else "http"
-        log.info(f"Metrics available at {protocol}://{metrics_bind_addr}:{metrics_port}/metrics")
+        log.info(
+            "Metrics server started",
+            extra={
+                "protocol": protocol,
+                "bind_address": metrics_bind_addr,
+                "port": metrics_port,
+                "ssl_enabled": metrics_ssl_enabled,
+            }
+        )
     except (ValueError, FileNotFoundError) as exc:
-        log.error(f"Failed to start metrics server: {exc}")
+        log.error(
+            "Failed to start metrics server",
+            extra={"error": str(exc)}
+        )
         return
 
     # ------------------------------------------------------------------
+    # Startup: Create a long-lived AdminClient for topic management.
+    # Reusing the AdminClient across topic operations eliminates repeated
+    # TCP handshakes and metadata fetches, improving startup performance.
+    # ------------------------------------------------------------------
+    admin = AdminClient(kafka_config)
+
+    # ------------------------------------------------------------------
     # Startup: ensure the canary topic exists before creating clients.
-    # AdminClient is used only here and in sync_topic_partitions(); it is
-    # not kept alive because topic management calls are infrequent.
     # ------------------------------------------------------------------
     try:
-        ensure_topic(kafka_config, topic)
+        ensure_topic(kafka_config, topic, admin=admin)
     except RuntimeError as exc:
-        log.error(f"Startup failed: {exc}")
+        log.error("Startup failed during topic creation", extra={"error": str(exc)})
         return
 
     # Optionally attach the Kafka log handler so all subsequent log output
@@ -435,16 +595,25 @@ def run() -> None:
     kafka_log_handler = None
     if log_topic_enabled:
         try:
-            ensure_log_topic(kafka_config, log_topic, log_topic_retention_ms)
+            ensure_log_topic(kafka_config, log_topic, log_topic_retention_ms, admin=admin)
             kafka_log_handler = KafkaLogHandler(kafka_config, log_topic)
             kafka_log_handler.setFormatter(logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
             ))
             logging.getLogger().addHandler(kafka_log_handler)
-            log.info(f"Log topic enabled — publishing logs to '{log_topic}'.")
+            log.info(
+                "Log topic enabled",
+                extra={
+                    "log_topic": log_topic,
+                    "retention_ms": log_topic_retention_ms,
+                }
+            )
         except RuntimeError as exc:
-            log.error(f"Failed to set up log topic — continuing without it: {exc}")
+            log.error(
+                "Failed to set up log topic, continuing without it",
+                extra={"error": str(exc)}
+            )
 
     # Create the shared Schema Registry client.  The same instance is used by
     # both the producer's AvroSerializer and the consumer's AvroDeserializer,
@@ -458,12 +627,12 @@ def run() -> None:
     # ------------------------------------------------------------------
     # Initial partition sync — determines how many per-partition consumers
     # to create.  Setting last_sync_time=now prevents a duplicate sync on
-    # the first main loop iteration.
+    # the first main loop iteration. Reuse the AdminClient created earlier.
     # ------------------------------------------------------------------
-    log.info("Running initial partition sync...")
-    result = sync_topic_partitions(kafka_config, topic)
+    log.info("Running initial partition sync")
+    result = sync_topic_partitions(kafka_config, topic, admin=admin)
     if not result:
-        log.error("Startup failed — could not determine partition count.")
+        log.error("Startup failed, could not determine partition count")
         return
     num_brokers, num_partitions = result
     metrics.BROKER_COUNT.set(num_brokers)
@@ -475,17 +644,27 @@ def run() -> None:
     # No subscribe() or wait_for_assignment() needed — partitions are
     # immediately available for seek_to_end() and poll().
     consumers = _build_consumer_pool(kafka_config, sr_client, topic, partitions)
-    log.info(f"Per-partition consumers ready: {num_partitions} partition(s) → {partitions}")
+    log.info(
+        "Per-partition consumers ready",
+        extra={
+            "num_brokers": num_brokers,
+            "num_partitions": num_partitions,
+            "partitions": partitions,
+        }
+    )
 
     consecutive_failures = {p: 0 for p in partitions}
     check_sequence       = 0
     start_time           = time.time()
     last_sr_check_time   = 0.0   # set to 0 so the first iteration triggers an SR check immediately
 
-    executor = ThreadPoolExecutor(max_workers=num_partitions)
+    # Cap max workers to prevent unbounded thread growth on large clusters.
+    # 100 partitions would create 100 threads = ~800MB just for stack memory.
+    # 20 workers provides sufficient concurrency while limiting resource usage.
+    executor = ThreadPoolExecutor(max_workers=min(num_partitions, const.MAX_WORKERS))
 
     try:
-        while not _shutdown:
+        while not _shutdown_event.is_set():
 
             # Update uptime gauge at the top of every iteration so it reflects
             # elapsed time even if a check takes a long time.
@@ -494,26 +673,69 @@ def run() -> None:
             # ------------------------------------------------------------------
             # Partition sync — detect broker count changes (scale-up/down)
             # Runs on its own cadence, independently of canary checks.
-            # If the partition count changes, the consumer pool is rebuilt.
+            # Uses incremental updates: only add/remove changed consumers instead
+            # of rebuilding the entire pool, preventing monitoring gaps.
+            # Reuses the long-lived AdminClient to avoid connection overhead.
             # ------------------------------------------------------------------
             if time.time() - last_sync_time >= sync_interval:
-                result = sync_topic_partitions(kafka_config, topic)
+                result = sync_topic_partitions(kafka_config, topic, admin=admin)
                 if result:
                     metrics.BROKER_COUNT.set(result[0])
                     metrics.TOPIC_PARTITION_COUNT.set(result[1])
                     if result[1] != len(partitions):
                         log.info(
-                            f"Partition count changed {len(partitions)} → {result[1]} "
-                            "— rebuilding consumer pool."
+                            "Partition count changed, updating consumer pool incrementally",
+                            extra={
+                                "old_partition_count": len(partitions),
+                                "new_partition_count": result[1],
+                            }
                         )
-                        executor.shutdown(wait=False)
-                        for c in consumers.values():
-                            c.close()
+                        new_partitions = set(range(result[1]))
+                        old_partitions = set(partitions)
+
+                        # Add new partitions (scale-up case)
+                        added = new_partitions - old_partitions
+                        if added:
+                            log.info(f"Adding {len(added)} new partition(s): {sorted(added)}")
+                            # Create new consumers in parallel to minimize downtime
+                            with ThreadPoolExecutor(max_workers=min(len(added), 10)) as pool:
+                                futures = {p: pool.submit(create_partition_consumer, kafka_config, sr_client, topic, p) for p in added}
+                                for p, future in futures.items():
+                                    consumers[p] = future.result()
+                                    consecutive_failures[p] = 0
+
+                        # Remove deleted partitions (scale-down case)
+                        removed = old_partitions - new_partitions
+                        if removed:
+                            log.info(f"Removing {len(removed)} partition(s): {sorted(removed)}")
+                            for p in removed:
+                                consumers[p].close()
+                                del consumers[p]
+                                del consecutive_failures[p]
+
+                        # Update partition list
                         partitions = list(range(result[1]))
-                        consumers = _build_consumer_pool(kafka_config, sr_client, topic, partitions)
-                        consecutive_failures = {p: 0 for p in partitions}
-                        executor = ThreadPoolExecutor(max_workers=result[1])
-                        log.info(f"Consumer pool rebuilt: {result[1]} partition(s) → {partitions}")
+
+                        # Resize executor only if needed (worker count changed significantly)
+                        new_max_workers = min(result[1], const.MAX_WORKERS)
+                        old_max_workers = min(len(old_partitions), const.MAX_WORKERS)
+                        if new_max_workers != old_max_workers:
+                            log.info(
+                                f"Resizing executor: {old_max_workers} → {new_max_workers} workers"
+                            )
+                            # Shut down old executor gracefully after in-flight checks complete
+                            executor.shutdown(wait=True)
+                            executor = ThreadPoolExecutor(max_workers=new_max_workers)
+
+                        log.info(
+                            "Consumer pool updated",
+                            extra={
+                                "num_partitions": result[1],
+                                "partitions": partitions,
+                                "added": len(added),
+                                "removed": len(removed),
+                            }
+                        )
                 last_sync_time = time.time()
 
             # ------------------------------------------------------------------
@@ -523,13 +745,26 @@ def run() -> None:
             # separately to surface SR outages as a distinct metric.
             # ------------------------------------------------------------------
             if time.time() - last_sr_check_time >= sr_check_interval:
+                sr_start = time.time()
                 try:
                     check_sr(sr_client)
+                    sr_duration_ms = (time.time() - sr_start) * 1000
+                    metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
                     metrics.SR_CHECKS_TOTAL.labels(result="success", host=metrics.HOST).inc()
-                    log.info("SR OK")
+                    log.info("Schema Registry check succeeded", extra={"latency_ms": sr_duration_ms})
                 except CanaryError as exc:
+                    sr_duration_ms = (time.time() - sr_start) * 1000
+                    metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
                     metrics.SR_CHECKS_TOTAL.labels(result="failure", host=metrics.HOST).inc()
-                    log.error(f"SR FAIL | {exc}")
+                    log.error(
+                        "Schema Registry check failed",
+                        extra={
+                            "phase": exc.phase,
+                            "category": exc.category,
+                            "detail": exc.detail,
+                            "latency_ms": sr_duration_ms,
+                        }
+                    )
                 last_sr_check_time = time.time()
 
             # ------------------------------------------------------------------
@@ -555,71 +790,93 @@ def run() -> None:
 
                     # Success path — counters are always updated (even during warmup)
                     # so failure detection is never suppressed.
-                    consecutive_failures[p] = 0
-                    metrics.CHECKS_TOTAL.labels(result="success", host=metrics.HOST, partition=str(p)).inc()
-                    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=str(p)).set(0)
-                    metrics.LAST_SUCCESS_TIMESTAMP.labels(host=metrics.HOST, partition=str(p)).set(time.time())
-                    metrics.CHECK_SEQUENCE.set(check_sequence)
+                    _update_success_metrics(p, check_sequence, latency_ms, consecutive_failures, is_warming_up)
 
                     if is_warming_up:
                         log.info(
-                            f"WARMUP    | seq={check_sequence} partition={p} "
-                            f"latency={latency_ms}ms (not recorded)"
+                            "Warmup check succeeded (latency not recorded)",
+                            extra={
+                                "check_sequence": check_sequence,
+                                "partition": p,
+                                "latency_ms": latency_ms,
+                                "warmup": True,
+                            }
                         )
                     else:
-                        metrics.E2E_LATENCY.labels(host=metrics.HOST, partition=str(p)).observe(latency_ms)
-                        log.info(f"Consumed  | seq={check_sequence} partition={p} latency={latency_ms}ms")
+                        log.info(
+                            "Check succeeded",
+                            extra={
+                                "check_sequence": check_sequence,
+                                "partition": p,
+                                "latency_ms": latency_ms,
+                            }
+                        )
 
                 except CanaryError as exc:
                     # Classified failure — phase and category are known
-                    consecutive_failures[p] += 1
-                    metrics.CHECKS_TOTAL.labels(result="failure", host=metrics.HOST, partition=str(p)).inc()
-                    metrics.FAILURES_TOTAL.labels(
-                        phase=exc.phase, category=exc.category,
-                        host=metrics.HOST, partition=str(p),
-                    ).inc()
-                    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=str(p)).set(
-                        consecutive_failures[p]
-                    )
-                    metrics.CHECK_SEQUENCE.set(check_sequence)
+                    _update_failure_metrics(p, check_sequence, consecutive_failures, exc.phase, exc.category)
                     log.error(
-                        f"FAIL [{consecutive_failures[p]}] | seq={check_sequence} partition={p} {exc}"
+                        "Check failed",
+                        extra={
+                            "consecutive_failures": consecutive_failures[p],
+                            "check_sequence": check_sequence,
+                            "partition": p,
+                            "phase": exc.phase,
+                            "category": exc.category,
+                            "detail": exc.detail,
+                        }
                     )
 
                 except Exception as exc:
                     # Unexpected failure — not a CanaryError, so phase/category unknown.
                     # Still recorded in metrics so the failure is visible.
-                    consecutive_failures[p] += 1
-                    metrics.CHECKS_TOTAL.labels(result="failure", host=metrics.HOST, partition=str(p)).inc()
-                    metrics.FAILURES_TOTAL.labels(
-                        phase="UNKNOWN", category="UNKNOWN",
-                        host=metrics.HOST, partition=str(p),
-                    ).inc()
-                    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=str(p)).set(
-                        consecutive_failures[p]
-                    )
-                    metrics.CHECK_SEQUENCE.set(check_sequence)
+                    _update_failure_metrics(p, check_sequence, consecutive_failures, "UNKNOWN", "UNKNOWN")
                     log.error(
-                        f"FAIL [{consecutive_failures[p]}] | seq={check_sequence} partition={p} "
-                        f"phase=UNKNOWN category=UNKNOWN detail={exc}"
+                        "Check failed (unexpected exception)",
+                        extra={
+                            "consecutive_failures": consecutive_failures[p],
+                            "check_sequence": check_sequence,
+                            "partition": p,
+                            "phase": "UNKNOWN",
+                            "category": "UNKNOWN",
+                            "detail": str(exc),
+                            "exception_type": type(exc).__name__,
+                        }
                     )
 
             if is_warming_up and check_sequence == warmup_checks:
-                log.info("Warmup complete — latency metrics enabled from the next check.")
+                log.info(
+                    "Warmup complete, latency metrics enabled",
+                    extra={"warmup_checks": warmup_checks}
+                )
 
             # Wait for the configured interval before the next check.
-            # Skip the sleep if a shutdown signal arrived during this check.
-            if not _shutdown:
-                log.info(f"Next check in {interval}s")
-                time.sleep(interval)
+            # Using Event.wait() instead of time.sleep() ensures that shutdown
+            # signals are detected immediately rather than waiting for the full
+            # interval. wait() returns True if shutdown was signaled, False on timeout.
+            log.debug("Sleeping until next check", extra={"interval_seconds": interval})
+            _shutdown_event.wait(interval)
 
     finally:
+        # Shut down executor gracefully, waiting for any in-flight checks to complete.
+        # This ensures all metrics are properly recorded before exit.
+        executor.shutdown(wait=True)
+
         # Close all per-partition consumers so brokers remove them from their
         # groups immediately rather than waiting for the session timeout.
         for c in consumers.values():
             c.close()
-        executor.shutdown(wait=False)
-        log.info("cloud_canary stopped.")
+
+        # Flush and release the producer to close connections immediately.
+        # confluent_kafka.SerializingProducer wraps Producer which doesn't have
+        # a close() method, but flush() ensures all messages are delivered before
+        # the process exits and resources are cleaned up by __del__.
+        producer.flush(timeout=5)
+
+        # Release the AdminClient to close connections immediately.
+        del admin
+
+        log.info("cloud_canary stopped")
 
         # Flush and detach the Kafka log handler so the last few log records
         # (including "cloud_canary stopped") reach the log topic before exit.

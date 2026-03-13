@@ -43,10 +43,13 @@
 #   Produce duration: 5 ms  (fast write) → 2.5 s  (degraded ack latency)
 # ---------------------------------------------------------------------------
 
+import logging
 import os
 import socket
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+
+log = logging.getLogger(__name__)
 
 # Hostname of this canary instance.  Embedded as a constant label on every
 # metric so that dashboards and alerts can filter or group by instance without
@@ -63,28 +66,28 @@ HOST = os.getenv("CANARY_INSTANCE_ID") or socket.gethostname()
 E2E_LATENCY = Histogram(
     "canary_e2e_latency_ms",
     "End-to-end latency per check (produce timestamp → consumer receive timestamp) in ms, "
-    "per host and partition. Each partition corresponds to a distinct broker leader, so "
-    "this histogram surfaces per-broker latency attribution.",
-    ["host", "partition"],
+    "aggregated across all partitions per host. Partition label removed to prevent cardinality "
+    "explosion on large clusters (100 partitions × 12 buckets = 1200 series per host). "
+    "Use canary_checks_total{partition=N} to identify per-partition issues.",
+    ["host"],
     buckets=[10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
 )
 
 SEEK_DURATION = Histogram(
     "canary_seek_duration_ms",
     "Time to fetch watermark offsets from the broker and seek the assigned partition in ms, "
-    "per host and partition. A sustained increase here indicates broker-side fetch latency "
-    "on the specific partition's leader.",
-    ["host", "partition"],
+    "aggregated across all partitions per host. Partition label removed to prevent cardinality "
+    "explosion on large clusters.",
+    ["host"],
     buckets=[1, 5, 10, 25, 50, 100, 250, 500],
 )
 
 PRODUCE_DURATION = Histogram(
     "canary_produce_duration_ms",
-    "Time from produce() call to broker ack (flush return) in ms, per host and partition. "
-    "With acks=all this measures the time for all in-sync replicas to acknowledge the write "
-    "— an increase on a specific partition may indicate replication lag or leader overload "
-    "on that broker.",
-    ["host", "partition"],
+    "Time from produce() call to broker ack (flush return) in ms, aggregated across all "
+    "partitions per host. With acks=all this measures the time for all in-sync replicas to "
+    "acknowledge the write. Partition label removed to prevent cardinality explosion.",
+    ["host"],
     buckets=[5, 10, 25, 50, 100, 250, 500, 1000, 2500],
 )
 
@@ -133,7 +136,7 @@ LAST_SUCCESS_TIMESTAMP = Gauge(
 )
 
 # ---------------------------------------------------------------------------
-# Schema Registry counter — host is a variable label; callers must pass host=HOST
+# Schema Registry metrics — host is a variable label; callers must pass host=HOST
 # ---------------------------------------------------------------------------
 
 SR_CHECKS_TOTAL = Counter(
@@ -143,6 +146,15 @@ SR_CHECKS_TOTAL = Counter(
     "independent signal of SR availability per instance.",
     ["result", "host"],
     # result values: "success" | "failure"
+)
+
+SR_LATENCY = Histogram(
+    "canary_sr_latency_ms",
+    "Schema Registry health check response time in ms, per host. "
+    "Measures HTTP round-trip time for get_subjects() call. "
+    "High latency indicates SR performance degradation or network issues.",
+    ["host"],
+    buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500],
 )
 
 # ---------------------------------------------------------------------------
@@ -187,13 +199,23 @@ _CHECK_SEQUENCE = Gauge(
 )
 CHECK_SEQUENCE = _CHECK_SEQUENCE.labels(host=HOST)
 
+# ---------------------------------------------------------------------------
+# Build info — version metadata (set once at startup)
+# ---------------------------------------------------------------------------
+
+VERSION_INFO = Info(
+    "canary_version",
+    "Cloud canary version information",
+)
+# Note: VERSION_INFO is populated in main.py after importing __version__
+
 
 def start_metrics_server(
     port: int,
     addr: str = "0.0.0.0",
     ssl_enabled: bool = False,
-    ssl_cert: str | None = None,
-    ssl_key: str | None = None,
+    ssl_cert: str = None,
+    ssl_key: str = None,
 ) -> None:
     """
     Start the Prometheus HTTP(S) metrics server on the given port and address.
@@ -218,10 +240,10 @@ def start_metrics_server(
         If True, enables HTTPS with TLS encryption. Requires ssl_cert and
         ssl_key to be provided (default False).
 
-    ssl_cert : str | None
+    ssl_cert : str, optional
         Path to SSL certificate file in PEM format. Required if ssl_enabled=True.
 
-    ssl_key : str | None
+    ssl_key : str, optional
         Path to SSL private key file in PEM format. Required if ssl_enabled=True.
 
     Raises
@@ -250,7 +272,19 @@ def start_metrics_server(
         # Create HTTPS server with SSL context
         server = HTTPServer((addr, port), MetricsHandler)
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+
+        # Set secure defaults for TLS 1.2+ only (disable older protocols)
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        # Load certificate and key
+        # SSLContext will validate the certificate format, expiration, and key match
+        # automatically when the first connection is made. No need for external
+        # validation via subprocess - this is faster and more reliable.
+        try:
+            ssl_context.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+        except ssl.SSLError as exc:
+            raise ValueError(f"Invalid SSL certificate or key: {exc}")
+
         server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
 
         # Start server in background thread

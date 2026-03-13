@@ -30,6 +30,7 @@
 
 import logging
 import socket
+import threading
 import time
 import uuid
 
@@ -37,6 +38,7 @@ from confluent_kafka import KafkaException, SerializingProducer
 from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import StringSerializer
 
+from src import constants as const
 from src.schema import (
     CANARY_SCHEMA_STR,
     CanaryMessage,
@@ -45,64 +47,78 @@ from src.schema import (
 
 log = logging.getLogger(__name__)
 
+# Import metrics.HOST to use the configurable instance ID.
+# This respects CANARY_INSTANCE_ID env var and instance.id config setting.
+from src import metrics
+
 # ---------------------------------------------------------------------------
 # Default librdkafka producer configuration.
+# Implemented as a function to pick up the current metrics.HOST value, which
+# may be updated after config loading (via instance.id setting).
 # These are merged with the user-supplied connection/auth settings from
 # config.ini (which take precedence via the dict merge order in create_producer).
 # ---------------------------------------------------------------------------
-_PRODUCER_DEFAULTS = {
-    # ---- Identification ----
-    # Used in broker logs to identify which client produced a message.
-    "client.id": socket.gethostname(),
+def _get_producer_defaults() -> dict:
+    """
+    Return producer default configuration with current instance ID.
 
-    # ---- Durability ----
-    # Require all in-sync replicas to ack before flush() returns.
-    # This exercises the full replication pipeline on every canary check.
-    "acks": "all",
+    Called when creating the producer (after config is loaded), ensuring
+    client.id respects the configurable instance ID from config.ini or env var.
+    """
+    return {
+        # ---- Identification ----
+        # Used in broker logs to identify which client produced a message.
+        # Uses metrics.HOST which respects CANARY_INSTANCE_ID env var and instance.id config.
+        "client.id": metrics.HOST,
 
-    # ---- Retry / timeout ----
-    # retries=MAX_INT defers all retry control to delivery.timeout.ms so
-    # the producer keeps trying until the 2-minute budget is exhausted.
-    "retries": 2147483647,
-    "delivery.timeout.ms": 120000,          # 2-minute total per-message budget
+        # ---- Durability ----
+        # Require all in-sync replicas to ack before flush() returns.
+        # This exercises the full replication pipeline on every canary check.
+        "acks": "all",
 
-    # Keep up to 5 in-flight requests per broker connection for throughput;
-    # safe without idempotence because the canary doesn't require ordering.
-    "max.in.flight.requests.per.connection": 5,
+        # ---- Retry / timeout ----
+        # retries=MAX_INT defers all retry control to delivery.timeout.ms so
+        # the producer keeps trying until the 2-minute budget is exhausted.
+        "retries": const.MAX_PRODUCER_RETRIES,
+        "delivery.timeout.ms": const.PRODUCER_DELIVERY_TIMEOUT_MS,
 
-    # ---- Batching (optimised for latency, not throughput) ----
-    "linger.ms": 0,                         # send immediately, no batching delay
-    "batch.size": 65536,                    # 64 KB max batch size
-    "compression.type": "none",             # no compression: single tiny message
-    "queue.buffering.max.messages": 100000,
-    "queue.buffering.max.kbytes": 1048576,  # 1 GB producer queue limit
+        # Keep up to 5 in-flight requests per broker connection for throughput;
+        # safe without idempotence because the canary doesn't require ordering.
+        "max.in.flight.requests.per.connection": const.MAX_IN_FLIGHT_REQUESTS,
 
-    # ---- Connection / network reliability ----
-    # Required by Confluent Cloud: resolve all IPs behind the DNS name and
-    # try each one so that a single unhealthy broker doesn't block connections.
-    "client.dns.lookup": "use_all_dns_ips",
+        # ---- Batching (optimised for latency, not throughput) ----
+        "linger.ms": 0,                         # send immediately, no batching delay
+        "batch.size": const.PRODUCER_BATCH_SIZE_BYTES,
+        "compression.type": "none",             # no compression: single tiny message
+        "queue.buffering.max.messages": const.PRODUCER_QUEUE_MAX_MESSAGES,
+        "queue.buffering.max.kbytes": const.PRODUCER_QUEUE_MAX_KBYTES,
 
-    # Increase the API version negotiation timeout from the 10 s default;
-    # Confluent Cloud can occasionally take longer on cold start.
-    "api.version.request.timeout.ms": 30000,
+        # ---- Connection / network reliability ----
+        # Required by Confluent Cloud: resolve all IPs behind the DNS name and
+        # try each one so that a single unhealthy broker doesn't block connections.
+        "client.dns.lookup": "use_all_dns_ips",
 
-    # Keep TCP connections alive to detect silent network drops quickly.
-    "socket.keepalive.enable": True,
+        # Increase the API version negotiation timeout from the 10 s default;
+        # Confluent Cloud can occasionally take longer on cold start.
+        "api.version.request.timeout.ms": const.API_VERSION_REQUEST_TIMEOUT_MS,
 
-    # Disable Nagle's algorithm so small packets (like a single canary message)
-    # are sent immediately rather than waiting to fill a TCP segment.
-    "socket.nagle.disable": True,
+        # Keep TCP connections alive to detect silent network drops quickly.
+        "socket.keepalive.enable": True,
 
-    "socket.connection.setup.timeout.ms": 30000,
+        # Disable Nagle's algorithm so small packets (like a single canary message)
+        # are sent immediately rather than waiting to fill a TCP segment.
+        "socket.nagle.disable": True,
 
-    # Exponential backoff on reconnect attempts (1 s base, 10 s cap).
-    "reconnect.backoff.ms": 1000,
-    "reconnect.backoff.max.ms": 10000,
+        "socket.connection.setup.timeout.ms": const.SOCKET_CONNECTION_SETUP_TIMEOUT_MS,
 
-    # Refresh broker metadata every 5 minutes so partition leadership changes
-    # (e.g. after a broker restart) are picked up without manual intervention.
-    "metadata.max.age.ms": 300000,
-}
+        # Exponential backoff on reconnect attempts (1 s base, 10 s cap).
+        "reconnect.backoff.ms": const.RECONNECT_BACKOFF_MIN_MS,
+        "reconnect.backoff.max.ms": const.RECONNECT_BACKOFF_MAX_MS,
+
+        # Refresh broker metadata every 5 minutes so partition leadership changes
+        # (e.g. after a broker restart) are picked up without manual intervention.
+        "metadata.max.age.ms": const.METADATA_MAX_AGE_MS,
+    }
 
 
 def create_producer(kafka_config: dict, sr_client) -> SerializingProducer:
@@ -113,8 +129,8 @@ def create_producer(kafka_config: dict, sr_client) -> SerializingProducer:
     ----------
     kafka_config : dict
         Connection and authentication settings from config.ini [kafka].
-        Merged on top of _PRODUCER_DEFAULTS, so any overlapping key in
-        kafka_config overrides the default.
+        Merged with producer defaults from _get_producer_defaults(), so any
+        overlapping key in kafka_config overrides the default.
 
     sr_client : SchemaRegistryClient
         Shared Schema Registry client.  The AvroSerializer uses it to
@@ -131,7 +147,7 @@ def create_producer(kafka_config: dict, sr_client) -> SerializingProducer:
         canary_to_dict,   # converts CanaryMessage dataclass → dict for Avro encoding
     )
     return SerializingProducer({
-        **_PRODUCER_DEFAULTS,
+        **_get_producer_defaults(),                  # get defaults with current instance ID
         **kafka_config,                              # auth/connection settings override defaults
         "key.serializer":   StringSerializer("utf_8"),
         "value.serializer": avro_serializer,
@@ -147,6 +163,10 @@ def produce_canary(
     """
     Produce a single canary message to a specific partition and block until
     the broker acknowledges it.
+
+    Thread-safe implementation using threading.Event to eliminate race conditions
+    in the delivery callback mechanism. Safe to call concurrently from multiple
+    threads using the same producer instance.
 
     The send_timestamp_ms is captured just before produce() is called so that
     network + broker write time is included in the end-to-end latency.
@@ -180,61 +200,75 @@ def produce_canary(
     KafkaException
         If the broker does not acknowledge the message within
         delivery.timeout.ms (120 s), or if any other produce error occurs.
+
+    RuntimeError
+        If the delivery callback does not fire within the timeout period
+        (PRODUCER_FLUSH_TIMEOUT_SECONDS).
     """
     message = CanaryMessage(
         message_id=        str(uuid.uuid4()),         # unique ID for consumer to match this message
         send_timestamp_ms= int(time.time() * 1000),   # capture as late as possible before produce
-        producer_host=     socket.gethostname(),
+        producer_host=     metrics.HOST,              # use configurable instance ID
         check_sequence=    check_sequence,
     )
 
-    # Track delivery outcome via callback.  Two separate lists — one for
-    # errors, one for confirmed delivery — let the caller distinguish between
-    # three states after flush() returns:
-    #   delivered non-empty → ack received, success
-    #   errors non-empty    → broker rejected the message
-    #   both empty          → flush() timed out before the callback fired
-    #                         (message still in flight; not a confirmed failure
-    #                          but also not a confirmed success)
-    delivered = []
-    errors = []
+    # Thread-safe callback state using Event and optional error holder.
+    # Event.set() is atomic and thread-safe, providing happens-before
+    # relationship that guarantees delivery_error is visible after wait()
+    # returns True.
+    callback_complete = threading.Event()
+    delivery_error = None
 
     def on_delivery(err, msg):
+        """
+        Delivery callback - called by librdkafka thread when broker acks.
+
+        Thread-safe: Uses Event.set() which is atomic and thread-safe.
+        The error is captured before setting the event, ensuring atomicity.
+        """
+        nonlocal delivery_error
+
         if err:
-            errors.append(err)
-            log.error(f"Delivery failed: {err}")
+            delivery_error = err
+            # Use % formatting for lazy evaluation (not evaluated if ERROR level disabled)
+            log.error("Delivery failed: %s", err)
         else:
-            delivered.append(True)
+            # Use % formatting for lazy evaluation (not evaluated if DEBUG level disabled)
             log.debug(
-                f"Delivered to {msg.topic()}[{msg.partition()}] @ offset {msg.offset()}"
+                "Delivered to %s[%s] @ offset %s",
+                msg.topic(), msg.partition(), msg.offset()
             )
+
+        # Signal completion atomically.
+        # Once set, the main thread will wake and see delivery_error state.
+        callback_complete.set()
 
     # produce() is asynchronous — it enqueues the message in librdkafka's
     # internal buffer and returns immediately.
     producer.produce(topic=topic, partition=partition, key=message.message_id, value=message, on_delivery=on_delivery)
 
-    # flush() blocks until the delivery report callback fires (ack received
-    # or delivery.timeout.ms exceeded).  The 15 s wall-clock guard prevents
-    # flush() from hanging indefinitely if librdkafka itself gets stuck.
-    # Note: in the multi-threaded per-partition check pattern, any thread's
-    # flush() may process delivery callbacks for other threads' messages.
-    # The per-call delivered/errors lists correctly capture only this message's
-    # outcome regardless of which thread's flush() invokes the callback.
-    producer.flush(timeout=15)
+    # flush() blocks until delivery callbacks fire or timeout.
+    # It processes ALL queued messages' callbacks (not just this thread's).
+    producer.flush(timeout=const.PRODUCER_FLUSH_TIMEOUT_SECONDS)
 
-    if errors:
-        raise KafkaException(errors[0])
+    # Wait for THIS message's callback with timeout.
+    # This is separate from flush() timeout and ensures we wait for our specific callback.
+    callback_fired = callback_complete.wait(timeout=const.PRODUCER_FLUSH_TIMEOUT_SECONDS)
 
-    if not delivered:
-        # flush() returned without the callback firing — the 15 s wall-clock
-        # guard expired before the broker acked.  delivery.timeout.ms (120 s)
-        # has not yet elapsed so this is not a definitive delivery failure, but
-        # we cannot claim success either.  Raise so the caller records a PRODUCE
-        # failure rather than silently returning a message that was never acked.
+    if not callback_fired:
+        # Timeout waiting for callback.
+        # The callback genuinely did not fire within the timeout period.
         raise RuntimeError(
-            f"Produce flush timed out after 15s on partition {partition} — "
+            "Produce flush timed out after %ss on partition %s — "
             "broker did not ack within the wall-clock guard "
             "(message may still be in flight; check broker connectivity)"
+            % (const.PRODUCER_FLUSH_TIMEOUT_SECONDS, partition)
         )
 
+    # Callback fired - check result atomically.
+    # At this point, delivery_error is finalized (callback won't fire again).
+    if delivery_error:
+        raise KafkaException(delivery_error)
+
+    # Success - callback fired and no error.
     return message

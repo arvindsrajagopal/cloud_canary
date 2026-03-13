@@ -567,14 +567,16 @@ The canary exposes metrics at `http://localhost:8000/metrics` (port configurable
 
 ### Latency histograms
 
-All latency histograms carry `host` and `partition` labels. Each partition corresponds
-to a distinct broker leader, giving per-broker latency attribution.
+Kafka latency histograms carry `host` and `partition` labels. Each partition corresponds
+to a distinct broker leader, giving per-broker latency attribution. Schema Registry
+latency carries only `host` as it is not partition-specific.
 
-| Metric | Description | Bucket boundaries (ms) |
-|---|---|---|
-| `canary_e2e_latency_ms` | End-to-end latency per partition check (produce timestamp → consumer receive) | 10 25 50 100 250 500 1000 2500 5000 10000 |
-| `canary_seek_duration_ms` | Time to fetch high-watermark offset and seek the partition | 1 5 10 25 50 100 250 500 |
-| `canary_produce_duration_ms` | Time from `produce()` call to broker ack (`flush` return) | 5 10 25 50 100 250 500 1000 2500 |
+| Metric | Labels | Description | Bucket boundaries (ms) |
+|---|---|---|---|
+| `canary_e2e_latency_ms` | `host`, `partition` | End-to-end latency per partition check (produce timestamp → consumer receive) | 10 25 50 100 250 500 1000 2500 5000 10000 |
+| `canary_seek_duration_ms` | `host`, `partition` | Time to fetch high-watermark offset and seek the partition | 1 5 10 25 50 100 250 500 |
+| `canary_produce_duration_ms` | `host`, `partition` | Time from `produce()` call to broker ack (`flush` return) | 5 10 25 50 100 250 500 1000 2500 |
+| `canary_sr_latency_ms` | `host` | Schema Registry health check response time (HTTP round-trip for `get_subjects()`) | 1 5 10 25 50 100 250 500 1000 2500 |
 
 ### Counters
 
