@@ -6,6 +6,8 @@ Avro-encoded message, consumes it back, and records the round-trip latency and a
 errors as Prometheus metrics — giving you an always-on signal of cluster availability,
 replication health, and network connectivity.
 
+> **📢 Recent Migration (2026-03-27):** Cloud Canary has been migrated from the experimental `SerializingProducer`/`DeserializingConsumer` classes to the stable `Producer`/`Consumer` API with manual serialization. This ensures long-term stability and prevents breaking changes in future `confluent-kafka-python` versions. See [MIGRATION_STABLE_API.md](MIGRATION_STABLE_API.md) for details. **No configuration changes required.**
+
 ---
 
 ## Quick Start
@@ -80,38 +82,38 @@ The canary runs three independent check cadences in a single-threaded loop:
 
 ```mermaid
 flowchart TD
-    A([Start]) --> B[Load config.ini]
-    B --> C[Start Prometheus HTTP server]
-    C --> D["ensure_topic()\nCreate canary topic if missing\npartitions = broker count, RF = min(brokers, 3)\nretention.ms = 1 day"]
-    D --> E{log.topic.enabled?}
-    E -- yes --> F["ensure_log_topic()\nAttach KafkaLogHandler to root logger"]
+    A([Start]) --> B[Load configuration file]
+    B --> C[Start metrics web server]
+    C --> D["Create canary topic if it doesn't exist\nOne partition per broker\nKeep messages for 1 day"]
+    D --> E{Log to Kafka\nenabled?}
+    E -- yes --> F["Create log topic\nSend all logs to Kafka"]
     E -- no --> G
-    F --> G["Create SchemaRegistryClient · SerializingProducer"]
-    G --> H["sync_topic_partitions()\nGet initial partition count\nUpdate BROKER_COUNT and TOPIC_PARTITION_COUNT"]
-    H --> I{Partition count\nknown?}
-    I -- error --> Z1([Exit — broker unreachable])
-    I -- yes --> J["Create one DeserializingConsumer per partition\nusing assign() — no group coordinator needed\npartitions immediately available"]
+    F --> G["Connect to Schema Registry\nCreate message producer"]
+    G --> H["Count brokers and partitions\nUpdate broker count metric"]
+    H --> I{Connection\nsuccessful?}
+    I -- no --> Z1([Exit — can't reach cluster])
+    I -- yes --> J["Create one message reader per partition\nReady to start monitoring"]
     J --> LOOP
 
-    subgraph LOOP[" Main loop — repeats every check.interval.seconds "]
+    subgraph LOOP[" Main monitoring loop — runs continuously "]
         direction TB
-        L1[Update UPTIME_SECONDS gauge] --> L2{Partition sync\ndue?}
-        L2 -- yes --> L3["sync_topic_partitions()\nScale up: add partitions\nScale down: delete and recreate topic\nIf partition count changed: rebuild consumer pool\nUpdate BROKER_COUNT and TOPIC_PARTITION_COUNT"]
+        L1[Update uptime metric] --> L2{Time to check\nfor new brokers?}
+        L2 -- yes --> L3["Check if cluster scaled up or down\nAdd/remove partitions if needed\nRebuild readers if changed\nUpdate broker count metric"]
         L2 -- no --> L4
-        L3 --> L4{SR check due?}
-        L4 -- yes --> L5["check_sr()\nsr_client.get_subjects()\nUpdate SR_CHECKS_TOTAL"]
+        L3 --> L4{Time to check\nSchema Registry?}
+        L4 -- yes --> L5["Test Schema Registry connection\nUpdate health metric"]
         L4 -- no --> L6
-        L5 --> L6["ThreadPoolExecutor: run check_kafka(partition=P)\nfor each partition P concurrently"]
-        L6 --> L7{Each partition\nsucceeded?}
-        L7 -- yes --> L8["E2E_LATENCY.labels(partition=P).observe(ms)\nCONSECUTIVE_FAILURES[P] = 0\nCHECKS_TOTAL[P] success"]
-        L7 -- CanaryError --> L9["FAILURES_TOTAL.inc(phase, category, partition=P)\nCONSECUTIVE_FAILURES[P] += 1\nCHECKS_TOTAL[P] failure"]
-        L8 --> L10{Shutdown\nsignal received?}
+        L5 --> L6["Run health check on all partitions\nat the same time"]
+        L6 --> L7{Did all checks\nsucceed?}
+        L7 -- yes --> L8["Record latency\nReset failure count\nIncrement success counter"]
+        L7 -- no --> L9["Record error type and phase\nIncrement failure count\nIncrement error counter"]
+        L8 --> L10{Stop signal\nreceived?}
         L9 --> L10
-        L10 -- no --> L11[sleep check.interval.seconds]
+        L10 -- no --> L11[Wait until next check interval]
         L11 --> L1
     end
 
-    L10 -- SIGINT or SIGTERM --> CLEAN["Close all per-partition consumers\nShutdown ThreadPoolExecutor\nFlush KafkaLogHandler"]
+    L10 -- Ctrl+C or shutdown --> CLEAN["Clean up connections\nFlush pending logs\nShutdown gracefully"]
     CLEAN --> Z2([Done])
 ```
 
@@ -122,43 +124,43 @@ independently so you can isolate where latency is coming from.
 
 ```mermaid
 flowchart TD
-    A([check_kafka]) --> B
+    A([Health Check]) --> B
 
-    subgraph B[" Phase 1 — SEEK "]
-        B1["get_watermark_offsets() per partition\nbroker round-trip to fetch high watermark"] --> B2["consumer.seek(high watermark)\nnext poll will only return newly produced messages"]
+    subgraph B[" Phase 1 — Position Reader "]
+        B1["Ask broker for latest message position\nin this partition"] --> B2["Move reader to that position\nso we only see new messages"]
     end
 
-    B --> BC{OK?}
-    BC -- error --> BE["CanaryError phase=SEEK\ncategory=NETWORK or BROKER"]
-    BC -- yes --> BM["Record SEEK_DURATION histogram\nalways recorded, even on failure"]
+    B --> BC{Success?}
+    BC -- no --> BE["Report error in positioning phase\nLikely network or broker issue"]
+    BC -- yes --> BM["Record how long positioning took"]
 
     BM --> E
 
-    subgraph E[" Phase 2 — PRODUCE "]
-        E1["produce(CanaryCheck Avro record)\nmessage_id=UUID4  send_timestamp_ms=now\ncheck_sequence=N  producer_host=hostname"] --> E2["flush() — blocks until broker ack\nacks=all requires all ISRs to confirm"]
+    subgraph E[" Phase 2 — Send Test Message "]
+        E1["Create test message with:\n• Unique ID\n• Send timestamp\n• Sequence number\n• Hostname"] --> E2["Send to broker\nWait for all replicas to confirm"]
     end
 
-    E --> EC{OK?}
-    EC -- error --> EE["CanaryError phase=PRODUCE\ncategory=NETWORK or BROKER"]
-    EC -- yes --> EM[Record PRODUCE_DURATION histogram]
+    E --> EC{Success?}
+    EC -- no --> EE["Report error in send phase\nLikely network or broker issue"]
+    EC -- yes --> EM[Record how long sending took]
 
     EM --> G
 
-    subgraph G[" Phase 3 — CONSUME "]
-        G1["consumer.poll(timeout=1s) loop"] --> G2{message_id\nmatches target?}
+    subgraph G[" Phase 3 — Receive Test Message "]
+        G1["Read messages from broker"] --> G2{Is this our\ntest message?}
         G2 -- no --> G1
-        G2 -- yes --> G3[Capture receive_timestamp_ms]
+        G2 -- yes --> G3[Record when we received it]
     end
 
-    G --> GC{Message received\nwithin timeout?}
-    GC -- timeout --> GE["CanaryError phase=CONSUME category=BROKER\nBroker acked the write but is not serving it back\npossible replication lag or ISR issue"]
-    GC -- yes --> GM["return receive_timestamp_ms - send_timestamp_ms\nEnd-to-end latency in ms"]
+    G --> GC{Message received\nin time?}
+    GC -- no --> GE["Report timeout in receive phase\nBroker confirmed the write but isn't serving it back\nPossible replication lag"]
+    GC -- yes --> GM["Calculate total round-trip time\nReceive time minus send time"]
 ```
 
-> **Why a CONSUME timeout implies a broker fault:** by the time CONSUME starts,
-> the produce already succeeded with `acks=all`. The broker confirmed the write to
-> all in-sync replicas. A timeout here therefore means the broker is not serving
-> the message back — not that it was lost.
+> **Why a receive timeout indicates a broker problem:** By the time we try to receive
+> the message, we already know the send was successful. The broker confirmed it saved
+> the message to all backup copies. So if we can't read it back, that means the broker
+> isn't serving messages properly — not that the message was lost.
 
 ### Error Classification
 
@@ -167,15 +169,15 @@ two categories based on where the error originated.
 
 ```mermaid
 flowchart TD
-    A[Exception caught] --> B{Exception type}
-    B -- KafkaException --> C{librdkafka error code sign}
-    B -- SchemaRegistryError --> D{HTTP status code}
-    B -- "ConnectionError / TimeoutError / SSLError" --> NET[NETWORK]
-    B -- other --> UNK[UNKNOWN]
-    C -- "Negative — client-side\n_TRANSPORT · _ALL_BROKERS_DOWN · _RESOLVE · _SSL" --> NET
-    C -- "Positive — broker protocol error" --> BRK[BROKER]
-    D -- "5xx — server fault" --> BRK
-    D -- "4xx — auth or config issue" --> NET
+    A[Error occurred] --> B{What type\nof error?}
+    B -- Kafka error --> C{Where did it\noriginate?}
+    B -- Schema Registry error --> D{HTTP status}
+    B -- "Connection / Timeout / SSL error" --> NET[NETWORK]
+    B -- Other --> UNK[UNKNOWN]
+    C -- "Client-side\nCan't connect, resolve DNS, or establish SSL" --> NET
+    C -- "Server-side\nBroker returned an error response" --> BRK[BROKER]
+    D -- "5xx\nServer error" --> BRK
+    D -- "4xx\nAuthentication or permission issue" --> NET
 ```
 
 | Category | Meaning | Examples |
@@ -210,12 +212,12 @@ cloud_canary/
 ├── src/
 │   ├── __init__.py
 │   ├── config.py               # INI loader — returns kafka / schema_registry / app dicts
-│   ├── consumer.py             # DeserializingConsumer, seek_to_end(), consume_canary()
+│   ├── consumer.py             # Consumer + AvroDeserializer, seek_to_end(), consume_canary()
 │   ├── error_classifier.py     # Phase enum, ErrorCategory enum, CanaryError exception
 │   ├── kafka_log_handler.py    # logging.Handler that publishes JSON records to Kafka
 │   ├── main.py                 # Entry point: startup, main loop, signal handling
 │   ├── metrics.py              # All Prometheus metric definitions
-│   ├── producer.py             # SerializingProducer, produce_canary()
+│   ├── producer.py             # Producer + AvroSerializer, produce_canary()
 │   ├── schema.py               # Avro schema string, CanaryMessage dataclass
 │   └── topic.py                # ensure_topic(), sync_topic_partitions()
 │
@@ -332,7 +334,6 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `check.interval.seconds` | `15` | Seconds between consecutive end-to-end checks. |
 | `partition.sync.interval.seconds` | `86400` | How often to check for broker count changes and resize the topic. |
 | `sr.check.interval.seconds` | `60` | How often to run an independent Schema Registry health probe. |
-| `instance.id` | *hostname* | Unique identifier for this canary instance. Defaults to the system hostname. Override when running multiple instances on the same host or when you want consistent labels across container restarts. Can also be set via `CANARY_INSTANCE_ID` environment variable (takes precedence). |
 | `metrics.port` | `8000` | TCP port for the Prometheus `/metrics` HTTP endpoint. |
 | `metrics.bind.address` | `0.0.0.0` | IP address to bind the metrics HTTP server to. Use `0.0.0.0` for all interfaces (default), `127.0.0.1` for localhost only, or a specific IP to bind to a single network interface. |
 | `metrics.ssl.enabled` | `false` | Enable HTTPS/TLS for the metrics endpoint. Requires `metrics.ssl.cert` and `metrics.ssl.key` to be configured. Useful for production environments where metrics contain sensitive labels. |
@@ -428,6 +429,8 @@ services:
       timeout: 5s
       retries: 3
 ```
+
+> **DNS Troubleshooting:** If you encounter DNS resolution issues connecting to Confluent Cloud from Docker, see [DNS_TROUBLESHOOTING.md](DNS_TROUBLESHOOTING.md) for diagnostic tools and solutions. Quick fix: use the provided `docker-compose.yml` which includes DNS configuration, or run with `--dns 8.8.8.8 --dns 8.8.4.4`.
 
 ### Log output format
 
@@ -535,25 +538,21 @@ canary_consecutive_failures
 ```
 
 If multiple instances run on the same physical host with the same hostname, set a unique
-identifier using one of these methods:
+identifier using the `CANARY_INSTANCE_ID` environment variable:
 
-**Method 1: Environment variable (recommended for Docker/Kubernetes)**
 ```bash
+# Multiple instances on the same host
 CANARY_INSTANCE_ID=canary-us-east python -m src.main &
 CANARY_INSTANCE_ID=canary-eu-west python -m src.main &
 
 # Docker example
 docker run -e CANARY_INSTANCE_ID=canary-prod-1 ...
-```
 
-**Method 2: Configuration file**
-```ini
-# config/config.ini
-[app]
-instance.id=canary-us-east-1
+# Kubernetes example
+env:
+  - name: CANARY_INSTANCE_ID
+    value: "canary-prod-1"
 ```
-
-Note: `CANARY_INSTANCE_ID` environment variable takes precedence over `instance.id` in config.ini.
 
 ---
 

@@ -11,8 +11,8 @@
 #   [schema_registry] — Confluent Schema Registry URL and credentials
 #   [app]             — Application-level knobs (topic name, intervals, ports)
 #
-# The kafka dict is passed directly to AdminClient, SerializingProducer, and
-# DeserializingConsumer, so its keys must match librdkafka configuration
+# The kafka dict is passed directly to AdminClient, Producer, and
+# Consumer, so its keys must match librdkafka configuration
 # property names exactly (see https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md).
 # The schema_registry dict is passed to SchemaRegistryClient.
 # ---------------------------------------------------------------------------

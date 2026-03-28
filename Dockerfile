@@ -18,8 +18,31 @@
 #     cloud-canary:latest
 #   (Ensure config.ini has metrics.ssl.enabled=true and cert/key paths)
 #
+# DNS Troubleshooting:
+#   If you encounter DNS resolution issues with Confluent Cloud:
+#
+#   1. Run diagnostics:
+#      docker run --rm cloud-canary:latest diagnose
+#
+#   2. Use custom DNS servers (bypasses Docker's DNS):
+#      docker run --rm \
+#        -e USE_CUSTOM_DNS=1 \
+#        -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
+#        -p 8000:8000 \
+#        cloud-canary:latest
+#
+#   3. Or specify DNS servers explicitly:
+#      docker run --rm \
+#        --dns 8.8.8.8 --dns 8.8.4.4 \
+#        -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
+#        -p 8000:8000 \
+#        cloud-canary:latest
+#
 # Environment Variables:
 #   CANARY_INSTANCE_ID - Override instance hostname (optional)
+#   USE_CUSTOM_DNS - Enable custom DNS configuration (1=enabled)
+#   DNS_CHECK - Run DNS check before startup (true=enabled)
+#   KAFKA_BOOTSTRAP_SERVER - Bootstrap server for DNS testing
 
 FROM python:3.11-slim
 
@@ -34,9 +57,17 @@ LABEL org.opencontainers.image.vendor="Cloud Canary Team"
 
 WORKDIR /app
 
-# Install system dependencies (curl for healthcheck)
+# Install system dependencies
+# - curl: healthcheck endpoint testing
+# - dnsutils: DNS troubleshooting (nslookup, dig)
+# - iputils-ping: network connectivity testing
+# - ca-certificates: ensure SSL/TLS certificates are up to date
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        dnsutils \
+        iputils-ping \
+        ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -48,6 +79,10 @@ COPY src/ src/
 
 # Copy config template (actual config.ini should be mounted at runtime)
 COPY config/config.ini.template config/
+
+# Copy and configure entrypoint script for DNS handling
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose Prometheus metrics port (configurable via config.ini)
 EXPOSE 8000
@@ -65,4 +100,8 @@ ENV CANARY_LOG_FORMAT=json
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:8000/metrics || exit 1
 
+# Use entrypoint script to handle DNS configuration and diagnostics
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# Default command - can be overridden (e.g., "diagnose" for DNS troubleshooting)
 CMD ["python", "-m", "src.main"]

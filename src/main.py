@@ -50,9 +50,9 @@
 # Per-partition concurrency
 # -------------------------
 # check_kafka() is called once per partition on every cycle via a
-# ThreadPoolExecutor.  Each partition has a dedicated DeserializingConsumer
+# ThreadPoolExecutor.  Each partition has a dedicated Consumer
 # (created with assign() rather than subscribe() — no group coordinator needed).
-# The shared SerializingProducer is thread-safe in librdkafka; all metrics
+# The shared Producer is thread-safe in librdkafka; all metrics
 # writes are thread-safe in prometheus_client.
 #
 # Warmup period
@@ -104,11 +104,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from confluent_kafka import KafkaException
+from confluent_kafka import KafkaException, Consumer, Producer
 from confluent_kafka.admin import AdminClient
-from confluent_kafka.consumer import Consumer as DeserializingConsumer
-from confluent_kafka.producer import Producer as SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserializer
 
 from src import constants as const
 from src import metrics
@@ -196,8 +195,10 @@ def check_sr(sr_client: SchemaRegistryClient) -> None:
 
 
 def check_kafka(
-    producer: SerializingProducer,
-    consumer: DeserializingConsumer,
+    producer: Producer,
+    avro_serializer: AvroSerializer,
+    consumer: Consumer,
+    avro_deserializer: AvroDeserializer,
     topic: str,
     timeout: float,
     check_sequence: int,
@@ -212,12 +213,18 @@ def check_kafka(
 
     Parameters
     ----------
-    producer : SerializingProducer
-        Long-lived Avro producer created at startup.  Thread-safe in librdkafka.
+    producer : Producer
+        Long-lived Kafka producer created at startup.  Thread-safe in librdkafka.
 
-    consumer : DeserializingConsumer
-        Per-partition Avro consumer, manually assigned to `partition` via
+    avro_serializer : AvroSerializer
+        Avro serializer for encoding CanaryMessage objects.
+
+    consumer : Consumer
+        Per-partition consumer, manually assigned to `partition` via
         assign() at startup.
+
+    avro_deserializer : AvroDeserializer
+        Avro deserializer for decoding CanaryMessage objects.
 
     topic : str
         Kafka topic used for the canary check (e.g. "cloud-canary").
@@ -288,7 +295,7 @@ def check_kafka(
     # ------------------------------------------------------------------
     t_produce = time.perf_counter()
     try:
-        sent = produce_canary(producer, topic, check_sequence, partition)
+        sent = produce_canary(producer, avro_serializer, topic, check_sequence, partition)
         log.debug(
             "Message produced",
             extra={
@@ -325,7 +332,7 @@ def check_kafka(
     # round-trip from send_timestamp_ms to receive_timestamp_ms).
     # ------------------------------------------------------------------
     try:
-        received, receive_ts = consume_canary(consumer, sent.message_id, timeout)
+        received, receive_ts = consume_canary(consumer, avro_deserializer, sent.message_id, timeout)
     except TimeoutError:
         raise CanaryError(
             Phase.CONSUME,
@@ -348,15 +355,17 @@ def _build_consumer_pool(
     sr_client: SchemaRegistryClient,
     topic: str,
     partitions: list[int],
-) -> dict[int, DeserializingConsumer]:
+) -> tuple[dict[int, Consumer], dict[int, AvroDeserializer]]:
     """
-    Create one DeserializingConsumer per partition, each manually assigned.
+    Create one Consumer per partition, each manually assigned.
 
     Consumers are created in parallel (up to 10 concurrent connections) to reduce
     startup time. Sequential creation can take 1+ second per consumer due to
     TCP handshake, metadata fetch, and group join operations.
 
-    Returns a dict mapping partition index → consumer.
+    Returns a tuple of two dicts:
+        - consumers: partition index → Consumer
+        - deserializers: partition index → AvroDeserializer
     """
     # Use a temporary executor to parallelize consumer creation during startup.
     # Cap at 10 workers to avoid overwhelming the broker with concurrent connections.
@@ -368,13 +377,16 @@ def _build_consumer_pool(
         # Wait for all consumers to be created, then return as dict
         # If any consumer fails, the entire pool creation fails (fail-fast behavior)
         consumers = {}
+        deserializers = {}
         for p, future in futures.items():
             try:
-                consumers[p] = future.result()
+                consumer, deserializer = future.result()
+                consumers[p] = consumer
+                deserializers[p] = deserializer
             except Exception as exc:
                 log.error(f"Failed to create consumer for partition {p}: {exc}")
                 raise
-        return consumers
+        return consumers, deserializers
 
 
 def _update_success_metrics(
@@ -464,9 +476,9 @@ def run() -> None:
     3. Start the Prometheus HTTP metrics server.
     4. Ensure the canary topic exists (create if missing).
     5. Optionally attach the Kafka log handler to the root logger.
-    6. Create the Schema Registry client and producer.
+    6. Create the Schema Registry client, producer, and serializers.
     7. Run an initial partition sync to get the current partition count.
-    8. Create one DeserializingConsumer per partition (manual assignment).
+    8. Create one Consumer per partition (manual assignment).
     9. Enter the main loop (canary checks, partition sync, SR checks).
 
     Shutdown sequence (finally block)
@@ -499,11 +511,8 @@ def run() -> None:
     })
 
     # -- Application settings (with defaults) --
-    # Instance ID can be set via instance.id in config.ini or CANARY_INSTANCE_ID env var
-    # (env var takes precedence, set in metrics.py). If config provides it, update metrics.HOST.
-    instance_id = app.get("instance.id")
-    if instance_id and not os.getenv("CANARY_INSTANCE_ID"):
-        metrics.HOST = instance_id
+    # Instance ID is set via CANARY_INSTANCE_ID env var (defaults to hostname in metrics.py).
+    # Do NOT modify metrics.HOST after module load - pre-labeled metrics capture it at import time.
 
     topic               = app.get("topic",                          "cloud-canary")
     timeout             = float(app.get("consumer.timeout.seconds",              "5"))
@@ -620,9 +629,9 @@ def run() -> None:
     # and by check_sr() for independent SR health checks.
     sr_client = SchemaRegistryClient(sr_config)
 
-    # Create the long-lived producer.  Thread-safe in librdkafka — shared
-    # across all per-partition check threads.
-    producer = create_producer(kafka_config, sr_client)
+    # Create the long-lived producer and serializer.  Thread-safe in librdkafka —
+    # shared across all per-partition check threads.
+    producer, avro_serializer = create_producer(kafka_config, sr_client)
 
     # ------------------------------------------------------------------
     # Initial partition sync — determines how many per-partition consumers
@@ -643,7 +652,7 @@ def run() -> None:
     # Create one consumer per partition using manual assignment (assign()).
     # No subscribe() or wait_for_assignment() needed — partitions are
     # immediately available for seek_to_end() and poll().
-    consumers = _build_consumer_pool(kafka_config, sr_client, topic, partitions)
+    consumers, deserializers = _build_consumer_pool(kafka_config, sr_client, topic, partitions)
     log.info(
         "Per-partition consumers ready",
         extra={
@@ -701,7 +710,9 @@ def run() -> None:
                             with ThreadPoolExecutor(max_workers=min(len(added), 10)) as pool:
                                 futures = {p: pool.submit(create_partition_consumer, kafka_config, sr_client, topic, p) for p in added}
                                 for p, future in futures.items():
-                                    consumers[p] = future.result()
+                                    consumer, deserializer = future.result()
+                                    consumers[p] = consumer
+                                    deserializers[p] = deserializer
                                     consecutive_failures[p] = 0
 
                         # Remove deleted partitions (scale-down case)
@@ -711,6 +722,7 @@ def run() -> None:
                             for p in removed:
                                 consumers[p].close()
                                 del consumers[p]
+                                del deserializers[p]
                                 del consecutive_failures[p]
 
                         # Update partition list
@@ -778,7 +790,7 @@ def run() -> None:
 
             futures = {
                 executor.submit(
-                    check_kafka, producer, consumers[p], topic, timeout, check_sequence, p
+                    check_kafka, producer, avro_serializer, consumers[p], deserializers[p], topic, timeout, check_sequence, p
                 ): p
                 for p in partitions
             }
@@ -868,9 +880,9 @@ def run() -> None:
             c.close()
 
         # Flush and release the producer to close connections immediately.
-        # confluent_kafka.SerializingProducer wraps Producer which doesn't have
-        # a close() method, but flush() ensures all messages are delivered before
-        # the process exits and resources are cleaned up by __del__.
+        # confluent_kafka.Producer doesn't have a close() method, but flush()
+        # ensures all messages are delivered before the process exits and
+        # resources are cleaned up by __del__.
         producer.flush(timeout=5)
 
         # Release the AdminClient to close connections immediately.

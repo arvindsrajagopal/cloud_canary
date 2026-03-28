@@ -34,9 +34,9 @@ import threading
 import time
 import uuid
 
-from confluent_kafka import KafkaException, SerializingProducer
+from confluent_kafka import KafkaException, Producer
 from confluent_kafka.schema_registry.avro import AvroSerializer
-from confluent_kafka.serialization import StringSerializer
+from confluent_kafka.serialization import SerializationContext, MessageField
 
 from src import constants as const
 from src.schema import (
@@ -121,9 +121,12 @@ def _get_producer_defaults() -> dict:
     }
 
 
-def create_producer(kafka_config: dict, sr_client) -> SerializingProducer:
+def create_producer(kafka_config: dict, sr_client) -> tuple[Producer, AvroSerializer]:
     """
-    Build and return a long-lived SerializingProducer with Avro value serialization.
+    Build and return a long-lived Producer with Avro value serialization.
+
+    This uses the stable pattern recommended by Confluent: standard Producer
+    with manual serialization, rather than the experimental SerializingProducer.
 
     Parameters
     ----------
@@ -138,24 +141,27 @@ def create_producer(kafka_config: dict, sr_client) -> SerializingProducer:
 
     Returns
     -------
-    SerializingProducer
-        Ready-to-use producer.  Call produce() then flush() to send a message.
+    tuple[Producer, AvroSerializer]
+        Producer instance and AvroSerializer.  Call produce() with manually
+        serialized values, then flush() to send messages.
     """
+    producer = Producer({
+        **_get_producer_defaults(),  # get defaults with current instance ID
+        **kafka_config,               # auth/connection settings override defaults
+    })
+
     avro_serializer = AvroSerializer(
         sr_client,
         CANARY_SCHEMA_STR,
-        canary_to_dict,   # converts CanaryMessage dataclass → dict for Avro encoding
+        canary_to_dict,  # converts CanaryMessage dataclass → dict for Avro encoding
     )
-    return SerializingProducer({
-        **_get_producer_defaults(),                  # get defaults with current instance ID
-        **kafka_config,                              # auth/connection settings override defaults
-        "key.serializer":   StringSerializer("utf_8"),
-        "value.serializer": avro_serializer,
-    })
+
+    return producer, avro_serializer
 
 
 def produce_canary(
-    producer: SerializingProducer,
+    producer: Producer,
+    avro_serializer: AvroSerializer,
     topic: str,
     check_sequence: int,
     partition: int,
@@ -173,8 +179,11 @@ def produce_canary(
 
     Parameters
     ----------
-    producer : SerializingProducer
+    producer : Producer
         The long-lived producer created by create_producer().
+
+    avro_serializer : AvroSerializer
+        The Avro serializer for encoding CanaryMessage objects.
 
     topic : str
         Kafka topic to produce to (the canary topic, e.g. "cloud-canary").
@@ -243,9 +252,23 @@ def produce_canary(
         # Once set, the main thread will wake and see delivery_error state.
         callback_complete.set()
 
+    # Manually serialize the value using AvroSerializer.
+    # SerializationContext provides topic and field information for schema resolution.
+    serialized_value = avro_serializer(
+        message,
+        SerializationContext(topic, MessageField.VALUE)
+    )
+
     # produce() is asynchronous — it enqueues the message in librdkafka's
     # internal buffer and returns immediately.
-    producer.produce(topic=topic, partition=partition, key=message.message_id, value=message, on_delivery=on_delivery)
+    # Key is sent as plain string (UTF-8 encoded message_id).
+    producer.produce(
+        topic=topic,
+        partition=partition,
+        key=message.message_id.encode('utf-8'),
+        value=serialized_value,
+        on_delivery=on_delivery
+    )
 
     # flush() blocks until delivery callbacks fire or timeout.
     # It processes ALL queued messages' callbacks (not just this thread's).

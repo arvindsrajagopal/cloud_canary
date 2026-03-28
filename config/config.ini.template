@@ -20,11 +20,10 @@ partition.sync.interval.seconds=86400
 sr.check.interval.seconds=60
 warmup.checks=2
 
-# Instance identification (optional) — defaults to hostname if not set.
-# Override this when running multiple canaries on the same host or when you
-# want consistent instance labels across container restarts.
-# Can also be set via CANARY_INSTANCE_ID environment variable (takes precedence).
-#instance.id=canary-us-east-1
+# Instance identification — defaults to hostname if not set.
+# Set CANARY_INSTANCE_ID environment variable to override when running multiple
+# canaries on the same host or when you want consistent instance labels across
+# container restarts: export CANARY_INSTANCE_ID=canary-prod-1
 
 # Metrics HTTP server configuration
 metrics.port=8000
