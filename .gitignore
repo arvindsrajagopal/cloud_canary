@@ -1,7 +1,35 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local config
 config/config.ini
 docker-compose.yml
+
+# Logs
+*.log
+nohup.out

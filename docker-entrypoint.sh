@@ -18,25 +18,17 @@ check_dns() {
     fi
 }
 
-# If USE_CUSTOM_DNS is set, configure DNS servers
-# This is useful when Docker's default DNS (127.0.0.11) has issues
+# Note: USE_CUSTOM_DNS environment variable is deprecated and removed for security.
+# Container runs as non-root user (UID 1000) and cannot modify /etc/resolv.conf.
+# To use custom DNS servers, use Docker's built-in --dns flag instead:
+#   docker run --dns 8.8.8.8 --dns 8.8.4.4 ...
+# Or in docker-compose.yml:
+#   dns:
+#     - 8.8.8.8
+#     - 8.8.4.4
 if [ -n "$USE_CUSTOM_DNS" ]; then
-    echo "Configuring custom DNS servers..."
-
-    # Backup original resolv.conf (Docker-managed)
-    cp /etc/resolv.conf /etc/resolv.conf.docker-backup
-
-    # Write new resolv.conf with custom DNS
-    cat > /etc/resolv.conf <<EOF
-# Custom DNS configuration for container
-# Original Docker DNS backed up to /etc/resolv.conf.docker-backup
-options timeout:2 attempts:3 rotate
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-nameserver 1.1.1.1
-EOF
-
-    echo "Custom DNS configured: 8.8.8.8, 8.8.4.4, 1.1.1.1"
+    echo "WARNING: USE_CUSTOM_DNS is deprecated and has no effect."
+    echo "Use Docker's --dns flag instead: docker run --dns 8.8.8.8 --dns 8.8.4.4 ..."
 fi
 
 # Diagnostic mode - run DNS checks and exit
@@ -80,7 +72,7 @@ echo "DNS servers: $(grep nameserver /etc/resolv.conf | awk '{print $2}' | tr '\
 if [ "$DNS_CHECK" = "true" ]; then
     if ! check_dns; then
         echo "WARNING: DNS resolution check failed. Application may not be able to connect to Confluent Cloud."
-        echo "Consider running with: docker run -e USE_CUSTOM_DNS=1 ..."
+        echo "Consider using custom DNS: docker run --dns 8.8.8.8 --dns 8.8.4.4 ..."
         # Don't exit - let the application try anyway
     fi
 fi

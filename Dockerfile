@@ -24,27 +24,29 @@
 #   1. Run diagnostics:
 #      docker run --rm cloud-canary:latest diagnose
 #
-#   2. Use custom DNS servers (bypasses Docker's DNS):
-#      docker run --rm \
-#        -e USE_CUSTOM_DNS=1 \
-#        -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
-#        -p 8000:8000 \
-#        cloud-canary:latest
-#
-#   3. Or specify DNS servers explicitly:
+#   2. Use custom DNS servers (recommended method):
 #      docker run --rm \
 #        --dns 8.8.8.8 --dns 8.8.4.4 \
 #        -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
 #        -p 8000:8000 \
 #        cloud-canary:latest
 #
+#   3. Or use docker-compose.yml with DNS configuration:
+#      services:
+#        cloud-canary:
+#          dns:
+#            - 8.8.8.8
+#            - 8.8.4.4
+#
 # Environment Variables:
 #   CANARY_INSTANCE_ID - Override instance hostname (optional)
-#   USE_CUSTOM_DNS - Enable custom DNS configuration (1=enabled)
 #   DNS_CHECK - Run DNS check before startup (true=enabled)
 #   KAFKA_BOOTSTRAP_SERVER - Bootstrap server for DNS testing
 
-FROM python:3.11-slim
+# Pin base image with SHA256 digest to prevent supply chain attacks
+# Image: python:3.11-slim
+# To update: docker pull python:3.11-slim && docker inspect python:3.11-slim --format='{{index .RepoDigests 0}}'
+FROM python:3.11-slim@sha256:9358444059ed78e2975ada2c189f1c1a3144a5dab6f35bff8c981afb38946634
 
 # Build argument for version (can be overridden during build)
 ARG VERSION=1.2.3
@@ -68,6 +70,7 @@ RUN apt-get update && \
         dnsutils \
         iputils-ping \
         ca-certificates && \
+    update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -95,10 +98,11 @@ USER canary
 # Use JSON logging in Docker containers for log aggregators
 ENV CANARY_LOG_FORMAT=json
 
-# Health check - verify metrics endpoint is responding
-# Using curl instead of python for reliability and security
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:8000/metrics || exit 1
+# Health check - verify application is healthy
+# Uses /health endpoint which returns 200 only when healthy
+# start-period gives warmup time before first check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
 
 # Use entrypoint script to handle DNS configuration and diagnostics
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -8,6 +8,23 @@ sasl.mechanisms=PLAIN
 sasl.username=YOUR_KAFKA_API_KEY
 sasl.password=YOUR_KAFKA_API_SECRET
 
+# SSL/TLS Certificate Validation
+# CRITICAL: Ensures secure connection to Confluent Cloud
+# ssl.ca.location specifies the CA certificate bundle for verifying server certificates
+# Default: uses system CA bundle (/etc/ssl/certs/ca-certificates.crt on Debian/Ubuntu)
+# Uncomment to use custom CA bundle (required for corporate/private CAs):
+#ssl.ca.location=/app/certs/ca-bundle.pem
+
+# Enable strict hostname verification (prevents MITM attacks)
+# Default: true (recommended for production, made explicit here)
+enable.ssl.certificate.verification=true
+
+# Optional: Mutual TLS (mTLS) - client certificate authentication
+# Uncomment if your Confluent Cloud deployment requires client certificates:
+#ssl.certificate.location=/app/certs/client-cert.pem
+#ssl.key.location=/app/certs/client-key.pem
+#ssl.key.password=optional_key_password
+
 [schema_registry]
 url=https://psrc-xxxxx.region.provider.confluent.cloud
 basic.auth.user.info=SR_API_KEY:SR_API_SECRET
@@ -35,6 +52,26 @@ metrics.ssl.enabled=false
 #metrics.ssl.cert=/path/to/cert.pem
 # Path to SSL private key file (PEM format, required if ssl.enabled=true)
 #metrics.ssl.key=/path/to/key.pem
+
+# Metrics cardinality control for large clusters
+# metrics.partition.threshold controls when to disable per-partition labels
+# When partition count > threshold, metrics use aggregated labels to prevent
+# Prometheus cardinality explosion (100 partitions = 2,200+ time series per host)
+# Default: 100 (good for most deployments)
+# Set to 0 to always use per-partition labels (not recommended for >100 partitions)
+# Set higher (e.g., 500) to keep granularity on larger clusters (requires more Prometheus memory)
+metrics.partition.threshold=100
+
+# Concurrency configuration
+# max.workers controls the maximum number of concurrent threads for partition checks
+# Default: 20 (good for most deployments)
+# Each thread uses ~8MB stack memory. Adjust based on:
+#   - Cluster size: Increase for 100+ partitions to reduce check cycle time
+#   - Memory: Decrease if experiencing memory pressure
+#   - CPU cores: Generally set to 1-2x CPU cores for I/O-bound workloads
+# Formula: actual_workers = min(partition_count, max.workers)
+# Examples: 10 (~80MB), 20 (~160MB), 50 (~400MB), 100 (~800MB)
+max.workers=20
 
 # Logging configuration
 # log.format controls output format: "json" (structured), "text" (human-readable), or "auto" (detect based on TTY)

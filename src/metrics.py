@@ -84,7 +84,7 @@ SEEK_DURATION = Histogram(
 
 PRODUCE_DURATION = Histogram(
     "canary_produce_duration_ms",
-    "Time from produce() call to broker ack (flush return) in ms, aggregated across all "
+    "Time from produce() call to delivery callback in ms, aggregated across all "
     "partitions per host. With acks=all this measures the time for all in-sync replicas to "
     "acknowledge the write. Partition label removed to prevent cardinality explosion.",
     ["host"],
@@ -218,9 +218,13 @@ def start_metrics_server(
     ssl_key: str = None,
 ) -> None:
     """
-    Start the Prometheus HTTP(S) metrics server on the given port and address.
+    Start the Prometheus HTTP(S) metrics server with health endpoints.
 
-    Spawns a background daemon thread that serves the /metrics endpoint.
+    Spawns a background daemon thread that serves multiple endpoints:
+    - /metrics — Prometheus metrics exposition format
+    - /health  — Liveness probe (healthy/degraded/unhealthy)
+    - /ready   — Readiness probe (ready/not_ready)
+
     The thread exits automatically when the main process exits.
 
     Parameters
@@ -253,6 +257,79 @@ def start_metrics_server(
     FileNotFoundError
         If SSL certificate or key files do not exist.
     """
+    import json
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from src.health import get_health_status, get_readiness_status
+
+    class CanaryHTTPHandler(BaseHTTPRequestHandler):
+        """
+        HTTP handler that serves metrics and health endpoints.
+        """
+
+        def do_GET(self):
+            """Handle GET requests for /metrics, /health, and /ready"""
+
+            if self.path == "/metrics":
+                # Prometheus metrics endpoint
+                try:
+                    metrics_output = generate_latest()
+                    self.send_response(200)
+                    self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+                    self.end_headers()
+                    self.wfile.write(metrics_output)
+                except Exception as e:
+                    self.send_error(500, f"Error generating metrics: {e}")
+
+            elif self.path == "/health":
+                # Liveness probe endpoint
+                try:
+                    health = get_health_status()
+                    self.send_response(health.http_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+
+                    response = {
+                        "status": health.status.value,
+                        "timestamp": health.timestamp,
+                        "uptime_seconds": health.uptime_seconds,
+                        "message": health.message,
+                        "checks": health.checks,
+                    }
+                    self.wfile.write(json.dumps(response, indent=2).encode())
+                except Exception as e:
+                    self.send_error(500, f"Error checking health: {e}")
+
+            elif self.path == "/ready":
+                # Readiness probe endpoint
+                try:
+                    readiness = get_readiness_status()
+                    self.send_response(readiness.http_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+
+                    response = {
+                        "status": readiness.status.value,
+                        "timestamp": readiness.timestamp,
+                        "message": readiness.message,
+                        "checks": readiness.checks,
+                    }
+                    self.wfile.write(json.dumps(response, indent=2).encode())
+                except Exception as e:
+                    self.send_error(500, f"Error checking readiness: {e}")
+
+            else:
+                # Unknown endpoint
+                self.send_error(404, f"Endpoint not found: {self.path}")
+
+        def log_message(self, format, *args):
+            """Suppress default logging - application uses structured logging"""
+            # Only log errors
+            if args[1].startswith(("4", "5")):
+                log.warning(f"{self.address_string()} - {format % args}")
+
+    # Validate SSL configuration
     if ssl_enabled:
         if not ssl_cert or not ssl_key:
             raise ValueError(
@@ -261,8 +338,6 @@ def start_metrics_server(
 
         import os
         import ssl
-        from http.server import HTTPServer
-        from prometheus_client import MetricsHandler
 
         if not os.path.exists(ssl_cert):
             raise FileNotFoundError(f"SSL certificate not found: {ssl_cert}")
@@ -270,16 +345,13 @@ def start_metrics_server(
             raise FileNotFoundError(f"SSL private key not found: {ssl_key}")
 
         # Create HTTPS server with SSL context
-        server = HTTPServer((addr, port), MetricsHandler)
+        server = HTTPServer((addr, port), CanaryHTTPHandler)
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
         # Set secure defaults for TLS 1.2+ only (disable older protocols)
         ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
 
         # Load certificate and key
-        # SSLContext will validate the certificate format, expiration, and key match
-        # automatically when the first connection is made. No need for external
-        # validation via subprocess - this is faster and more reliable.
         try:
             ssl_context.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
         except ssl.SSLError as exc:
@@ -287,10 +359,11 @@ def start_metrics_server(
 
         server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
 
-        # Start server in background thread
-        import threading
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
     else:
         # Standard HTTP server (no SSL)
-        start_http_server(port, addr=addr)
+        server = HTTPServer((addr, port), CanaryHTTPHandler)
+
+    # Start server in background thread
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.debug(f"Metrics server started on {addr}:{port} (ssl={ssl_enabled})")

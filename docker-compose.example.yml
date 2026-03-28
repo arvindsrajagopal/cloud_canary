@@ -13,8 +13,6 @@
 #   - CANARY_INSTANCE_ID
 #   - metrics port mapping (e.g., 8001:8000)
 
-version: '3.8'
-
 services:
   cloud-canary:
     image: cloud-canary:latest
@@ -33,11 +31,21 @@ services:
       # Expose Prometheus metrics endpoint
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
+
+    # Security hardening (production recommended)
+    security_opt:
+      - no-new-privileges:true  # Prevent privilege escalation
+    cap_drop:
+      - ALL  # Drop all Linux capabilities
+    read_only: true  # Read-only root filesystem
+    tmpfs:
+      - /tmp  # Writable temp directory
+
     # Optional: Resource limits
     # deploy:
     #   resources:
@@ -61,8 +69,15 @@ services:
   #   ports:
   #     - "8001:8000"  # Different host port, same container port
   #   healthcheck:
-  #     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
   #     interval: 30s
   #     timeout: 5s
   #     retries: 3
-  #     start_period: 10s
+  #     start_period: 30s
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   cap_drop:
+  #     - ALL
+  #   read_only: true
+  #   tmpfs:
+  #     - /tmp

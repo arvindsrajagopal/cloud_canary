@@ -395,6 +395,8 @@ def _update_success_metrics(
     latency_ms: int,
     consecutive_failures: dict[int, int],
     is_warming_up: bool,
+    num_partitions: int,
+    partition_threshold: int,
 ) -> None:
     """
     Update Prometheus metrics after a successful check.
@@ -412,13 +414,25 @@ def _update_success_metrics(
         This partition's count will be reset to 0.
     is_warming_up : bool
         Whether this check is part of the warmup period (latency not recorded).
+    num_partitions : int
+        Total number of partitions in the cluster.
+    partition_threshold : int
+        Threshold above which partition labels are aggregated to prevent
+        metric cardinality explosion.
     """
     consecutive_failures[partition] = 0
-    # Convert partition to string once to avoid repeated conversions
-    partition_str = str(partition)
-    metrics.CHECKS_TOTAL.labels(result="success", host=metrics.HOST, partition=partition_str).inc()
-    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_str).set(0)
-    metrics.LAST_SUCCESS_TIMESTAMP.labels(host=metrics.HOST, partition=partition_str).set(time.time())
+
+    # Cardinality control: Use per-partition labels only if under threshold
+    # When partition count exceeds threshold, use aggregated label to prevent
+    # Prometheus memory explosion (100 partitions = 2,200+ series per host)
+    if num_partitions <= partition_threshold:
+        partition_label = str(partition)
+    else:
+        partition_label = "*"  # Aggregated - all partitions combined
+
+    metrics.CHECKS_TOTAL.labels(result="success", host=metrics.HOST, partition=partition_label).inc()
+    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_label).set(0)
+    metrics.LAST_SUCCESS_TIMESTAMP.labels(host=metrics.HOST, partition=partition_label).set(time.time())
     metrics.CHECK_SEQUENCE.set(check_sequence)
 
     if not is_warming_up:
@@ -432,6 +446,8 @@ def _update_failure_metrics(
     consecutive_failures: dict[int, int],
     phase: str,
     category: str,
+    num_partitions: int,
+    partition_threshold: int,
 ) -> None:
     """
     Update Prometheus metrics after a failed check.
@@ -449,19 +465,199 @@ def _update_failure_metrics(
         Phase where the failure occurred (SEEK, PRODUCE, CONSUME, etc.).
     category : str
         Error category (NETWORK, BROKER, UNKNOWN).
+    num_partitions : int
+        Total number of partitions in the cluster.
+    partition_threshold : int
+        Threshold above which partition labels are aggregated to prevent
+        metric cardinality explosion.
     """
     consecutive_failures[partition] += 1
-    # Convert partition to string once to avoid repeated conversions
-    partition_str = str(partition)
-    metrics.CHECKS_TOTAL.labels(result="failure", host=metrics.HOST, partition=partition_str).inc()
+
+    # Cardinality control: Use per-partition labels only if under threshold
+    if num_partitions <= partition_threshold:
+        partition_label = str(partition)
+    else:
+        partition_label = "*"  # Aggregated - all partitions combined
+
+    metrics.CHECKS_TOTAL.labels(result="failure", host=metrics.HOST, partition=partition_label).inc()
     metrics.FAILURES_TOTAL.labels(
         phase=phase, category=category,
-        host=metrics.HOST, partition=partition_str,
+        host=metrics.HOST, partition=partition_label,
     ).inc()
-    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_str).set(
+    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_label).set(
         consecutive_failures[partition]
     )
     metrics.CHECK_SEQUENCE.set(check_sequence)
+
+
+def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
+    """
+    Verify SSL/TLS connectivity to Confluent Cloud before entering main loop.
+
+    This startup validation ensures:
+    1. CA certificates are properly configured and valid
+    2. Server certificate chains are trusted
+    3. Hostname verification works correctly
+    4. No MITM attack is in progress
+
+    Fails fast with a clear error message if SSL/TLS validation fails,
+    preventing the application from running with compromised security.
+
+    Parameters
+    ----------
+    kafka_config : dict
+        Kafka connection settings from [kafka] section.
+    sr_config : dict
+        Schema Registry connection settings from [schema_registry] section.
+
+    Raises
+    ------
+    SystemExit
+        If SSL/TLS validation fails for either Kafka or Schema Registry.
+    """
+    from confluent_kafka import Producer
+
+    log.info("Validating SSL/TLS connectivity to Confluent Cloud...")
+
+    # ------------------------------------------------------------------
+    # Test 1: Kafka broker SSL/TLS validation
+    # ------------------------------------------------------------------
+    try:
+        # Create a test producer with SSL settings
+        test_config = {
+            'bootstrap.servers': kafka_config['bootstrap.servers'],
+            'security.protocol': kafka_config['security.protocol'],
+            'sasl.mechanisms': kafka_config['sasl.mechanisms'],
+            'sasl.username': kafka_config['sasl.username'],
+            'sasl.password': kafka_config['sasl.password'],
+            'socket.timeout.ms': 10000,
+            'api.version.request.timeout.ms': 10000,
+        }
+
+        # Include all SSL-related settings from config
+        for key, value in kafka_config.items():
+            if key.startswith('ssl.') or key.startswith('enable.ssl'):
+                test_config[key] = value
+
+        test_producer = Producer(test_config)
+
+        # Trigger actual connection by fetching metadata
+        # This performs TCP handshake, TLS handshake, and certificate validation
+        metadata = test_producer.list_topics(timeout=15)
+
+        broker_count = len(metadata.brokers)
+        log.info(
+            "SSL/TLS validation successful for Kafka",
+            extra={
+                "brokers": broker_count,
+                "security_protocol": kafka_config['security.protocol'],
+                "ssl_ca_location": kafka_config.get('ssl.ca.location', 'system default'),
+            }
+        )
+
+        # Clean up test producer
+        test_producer.flush(timeout=2)
+
+    except Exception as exc:
+        error_msg = str(exc).lower()
+
+        # Provide specific guidance based on error type
+        if "certificate verify failed" in error_msg or "ssl" in error_msg:
+            log.error(
+                "Kafka SSL/TLS certificate validation FAILED",
+                extra={
+                    "error": str(exc),
+                    "bootstrap_servers": kafka_config['bootstrap.servers'],
+                    "ssl_ca_location": kafka_config.get('ssl.ca.location', 'not set (using system default)'),
+                }
+            )
+            log.error("")
+            log.error("Possible causes:")
+            log.error("  1. Expired or invalid CA certificate bundle")
+            log.error("  2. MITM attack in progress")
+            log.error("  3. Incorrect ssl.ca.location setting")
+            log.error("  4. System CA certificates not up to date")
+            log.error("")
+            log.error("To fix:")
+            log.error("  - Verify ssl.ca.location points to valid CA bundle")
+            log.error("  - Run 'update-ca-certificates' to refresh system CAs")
+            log.error("  - Check network for MITM proxies or intercepting firewalls")
+            sys.exit(1)
+        else:
+            log.error(
+                "Kafka connection failed (non-SSL error)",
+                extra={"error": str(exc)}
+            )
+            sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Test 2: Schema Registry SSL/TLS validation
+    # ------------------------------------------------------------------
+    try:
+        import urllib.request
+        import ssl as ssl_module
+
+        sr_url = sr_config['url']
+        auth_string = sr_config['basic.auth.user.info']
+        username, password = auth_string.split(':', 1)
+
+        # Create SSL context with strict verification
+        ssl_context = ssl_module.create_default_context()
+        ssl_context.check_hostname = True
+        ssl_context.verify_mode = ssl_module.CERT_REQUIRED
+
+        # Create authenticated request
+        password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        password_mgr.add_password(None, sr_url, username, password)
+        auth_handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
+        https_handler = urllib.request.HTTPSHandler(context=ssl_context)
+        opener = urllib.request.build_opener(https_handler, auth_handler)
+
+        # Test connection to Schema Registry
+        request = urllib.request.Request(f"{sr_url}/subjects")
+        response = opener.open(request, timeout=10)
+        response.read()
+
+        log.info(
+            "SSL/TLS validation successful for Schema Registry",
+            extra={"url": sr_url}
+        )
+
+    except urllib.error.URLError as exc:
+        if hasattr(exc, 'reason') and 'CERTIFICATE_VERIFY_FAILED' in str(exc.reason):
+            log.error(
+                "Schema Registry SSL/TLS certificate validation FAILED",
+                extra={
+                    "error": str(exc),
+                    "url": sr_config['url'],
+                }
+            )
+            log.error("")
+            log.error("Possible causes:")
+            log.error("  1. Expired or invalid CA certificate")
+            log.error("  2. MITM attack in progress")
+            log.error("  3. Schema Registry using self-signed certificate")
+            log.error("")
+            log.error("To fix:")
+            log.error("  - Verify Schema Registry URL is correct")
+            log.error("  - Update system CA certificates")
+            log.error("  - Check for intercepting proxies")
+            sys.exit(1)
+        else:
+            log.error(
+                "Schema Registry connection failed",
+                extra={"error": str(exc)}
+            )
+            sys.exit(1)
+
+    except Exception as exc:
+        log.error(
+            "Schema Registry validation failed",
+            extra={"error": str(exc)}
+        )
+        sys.exit(1)
+
+    log.info("SSL/TLS connectivity validation complete - all checks passed")
 
 
 def run() -> None:
@@ -528,6 +724,8 @@ def run() -> None:
     log_topic           = app.get("log.topic",                    "cloud-canary-logs")
     log_topic_retention_ms = int(app.get("log.topic.retention.ms",        "604800000"))
     warmup_checks          = int(app.get("warmup.checks",                         "2"))
+    max_workers            = int(app.get("max.workers",                str(const.MAX_WORKERS)))
+    partition_threshold    = int(app.get("metrics.partition.threshold",         "100"))
 
     # Register signal handlers so SIGINT (Ctrl-C) and SIGTERM (container stop)
     # cause a clean exit after the current check rather than a hard kill.
@@ -550,9 +748,19 @@ def run() -> None:
             "consumer_timeout_seconds": timeout,
             "metrics_port": metrics_port,
             "warmup_checks": warmup_checks,
+            "max_workers": max_workers,
+            "partition_threshold": partition_threshold,
             "log_format": log_format,
         }
     )
+
+    # ------------------------------------------------------------------
+    # CRITICAL: Validate SSL/TLS connectivity before creating clients
+    # ------------------------------------------------------------------
+    # This fail-fast check ensures certificates are valid and prevents
+    # the application from running with compromised security.
+    # Validates both Kafka broker and Schema Registry SSL/TLS connections.
+    validate_ssl_connectivity(kafka_config, sr_config)
 
     # Start the Prometheus metrics HTTP(S) server (background daemon thread).
     # The /metrics endpoint is available immediately, returning zeros for
@@ -662,15 +870,30 @@ def run() -> None:
         }
     )
 
+    # Warn if partition count exceeds threshold (cardinality control)
+    if num_partitions > partition_threshold:
+        log.warning(
+            "Partition count exceeds threshold - using aggregated partition labels",
+            extra={
+                "num_partitions": num_partitions,
+                "partition_threshold": partition_threshold,
+                "message": f"Metrics will use partition='*' instead of per-partition labels to prevent "
+                          f"Prometheus cardinality explosion ({num_partitions} partitions would create "
+                          f"~{num_partitions * 22} time series per host). Increase metrics.partition.threshold "
+                          f"in config.ini if you need per-partition granularity and have sufficient Prometheus memory."
+            }
+        )
+
     consecutive_failures = {p: 0 for p in partitions}
     check_sequence       = 0
     start_time           = time.time()
     last_sr_check_time   = 0.0   # set to 0 so the first iteration triggers an SR check immediately
 
     # Cap max workers to prevent unbounded thread growth on large clusters.
-    # 100 partitions would create 100 threads = ~800MB just for stack memory.
-    # 20 workers provides sufficient concurrency while limiting resource usage.
-    executor = ThreadPoolExecutor(max_workers=min(num_partitions, const.MAX_WORKERS))
+    # Each thread uses ~8MB stack memory (100 threads = ~800MB).
+    # max_workers is configurable via config.ini (default: 20).
+    # Formula: actual_workers = min(partition_count, max_workers)
+    executor = ThreadPoolExecutor(max_workers=min(num_partitions, max_workers))
 
     try:
         while not _shutdown_event.is_set():
@@ -729,15 +952,15 @@ def run() -> None:
                         partitions = list(range(result[1]))
 
                         # Resize executor only if needed (worker count changed significantly)
-                        new_max_workers = min(result[1], const.MAX_WORKERS)
-                        old_max_workers = min(len(old_partitions), const.MAX_WORKERS)
-                        if new_max_workers != old_max_workers:
+                        new_max_workers_count = min(result[1], max_workers)
+                        old_max_workers_count = min(len(old_partitions), max_workers)
+                        if new_max_workers_count != old_max_workers_count:
                             log.info(
-                                f"Resizing executor: {old_max_workers} → {new_max_workers} workers"
+                                f"Resizing executor: {old_max_workers_count} → {new_max_workers_count} workers"
                             )
                             # Shut down old executor gracefully after in-flight checks complete
                             executor.shutdown(wait=True)
-                            executor = ThreadPoolExecutor(max_workers=new_max_workers)
+                            executor = ThreadPoolExecutor(max_workers=new_max_workers_count)
 
                         log.info(
                             "Consumer pool updated",
@@ -802,7 +1025,7 @@ def run() -> None:
 
                     # Success path — counters are always updated (even during warmup)
                     # so failure detection is never suppressed.
-                    _update_success_metrics(p, check_sequence, latency_ms, consecutive_failures, is_warming_up)
+                    _update_success_metrics(p, check_sequence, latency_ms, consecutive_failures, is_warming_up, num_partitions, partition_threshold)
 
                     if is_warming_up:
                         log.info(
@@ -826,7 +1049,7 @@ def run() -> None:
 
                 except CanaryError as exc:
                     # Classified failure — phase and category are known
-                    _update_failure_metrics(p, check_sequence, consecutive_failures, exc.phase, exc.category)
+                    _update_failure_metrics(p, check_sequence, consecutive_failures, exc.phase, exc.category, num_partitions, partition_threshold)
                     log.error(
                         "Check failed",
                         extra={
@@ -842,7 +1065,7 @@ def run() -> None:
                 except Exception as exc:
                     # Unexpected failure — not a CanaryError, so phase/category unknown.
                     # Still recorded in metrics so the failure is visible.
-                    _update_failure_metrics(p, check_sequence, consecutive_failures, "UNKNOWN", "UNKNOWN")
+                    _update_failure_metrics(p, check_sequence, consecutive_failures, "UNKNOWN", "UNKNOWN", num_partitions, partition_threshold)
                     log.error(
                         "Check failed (unexpected exception)",
                         extra={

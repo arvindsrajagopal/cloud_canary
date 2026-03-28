@@ -80,15 +80,15 @@ def validate_config(config: dict) -> None:
     # Validate security.protocol is SASL_SSL for Confluent Cloud
     if kafka['security.protocol'] != 'SASL_SSL':
         log.warning(
-            f"[kafka].security.protocol is '{kafka['security.protocol']}' — "
-            "Confluent Cloud requires 'SASL_SSL'"
+            "[kafka].security.protocol is '%s' — Confluent Cloud requires 'SASL_SSL'",
+            kafka['security.protocol']
         )
 
     # Validate sasl.mechanisms is PLAIN for Confluent Cloud
     if kafka['sasl.mechanisms'] != 'PLAIN':
         log.warning(
-            f"[kafka].sasl.mechanisms is '{kafka['sasl.mechanisms']}' — "
-            "Confluent Cloud requires 'PLAIN'"
+            "[kafka].sasl.mechanisms is '%s' — Confluent Cloud requires 'PLAIN'",
+            kafka['sasl.mechanisms']
         )
 
     # Validate Schema Registry URL format
@@ -104,6 +104,42 @@ def validate_config(config: dict) -> None:
             "[schema_registry].basic.auth.user.info must be in format 'KEY:SECRET'"
         )
 
+    # Validate SSL/TLS certificate configuration
+    if 'ssl.ca.location' in kafka:
+        ca_path = kafka['ssl.ca.location']
+        if not ca_path:
+            raise ValueError(
+                "[kafka].ssl.ca.location cannot be empty. "
+                "Remove the setting to use system default CA bundle."
+            )
+        # Note: We don't check if the file exists here because it might be
+        # mounted at runtime (Docker volumes). File existence is validated
+        # during SSL connectivity check at startup.
+
+    # Validate SSL certificate verification setting (security critical)
+    ssl_verify = kafka.get('enable.ssl.certificate.verification', 'true').lower()
+    if ssl_verify not in ('true', 'false'):
+        raise ValueError(
+            "[kafka].enable.ssl.certificate.verification must be 'true' or 'false' "
+            f"(got: '{kafka.get('enable.ssl.certificate.verification')}')"
+        )
+    if ssl_verify == 'false':
+        log.warning(
+            "SSL certificate verification is DISABLED - this is a critical security risk! "
+            "Only disable for local testing. NEVER use in production."
+        )
+
+    # Validate mTLS configuration (if client cert is provided)
+    if 'ssl.certificate.location' in kafka or 'ssl.key.location' in kafka:
+        if not kafka.get('ssl.certificate.location'):
+            raise ValueError(
+                "[kafka].ssl.certificate.location must be set when using client certificates (mTLS)"
+            )
+        if not kafka.get('ssl.key.location'):
+            raise ValueError(
+                "[kafka].ssl.key.location must be set when using client certificates (mTLS)"
+            )
+
     # Validate numeric app settings (if present)
     numeric_settings = {
         'consumer.timeout.seconds': (1, 300),
@@ -111,7 +147,9 @@ def validate_config(config: dict) -> None:
         'partition.sync.interval.seconds': (60, 604800),
         'sr.check.interval.seconds': (10, 3600),
         'warmup.checks': (0, 100),
+        'max.workers': (1, 200),  # Thread pool size
         'metrics.port': (1024, 65535),
+        'metrics.partition.threshold': (0, 10000),  # Cardinality control
         'log.topic.retention.ms': (60000, 2592000000),  # 1 min to 30 days
     }
 

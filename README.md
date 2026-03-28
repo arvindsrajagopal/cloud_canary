@@ -317,6 +317,13 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `sasl.mechanisms` | Yes | Must be `PLAIN` for Confluent Cloud |
 | `sasl.username` | Yes | Kafka API key |
 | `sasl.password` | Yes | Kafka API secret |
+| `enable.ssl.certificate.verification` | **Recommended** | Enable strict SSL certificate verification (`true` by default). **NEVER set to `false` in production** — this disables MITM protection. |
+| `ssl.ca.location` | No | Path to custom CA certificate bundle (PEM format). If not set, uses system default CA bundle (`/etc/ssl/certs/ca-certificates.crt`). Required for corporate/private CAs. |
+| `ssl.certificate.location` | No | Path to client certificate for mutual TLS (mTLS). Requires `ssl.key.location`. |
+| `ssl.key.location` | No | Path to client private key for mutual TLS (mTLS). Requires `ssl.certificate.location`. |
+| `ssl.key.password` | No | Password for encrypted private key file (if `ssl.key.location` uses encrypted key). |
+
+> **🔒 SSL/TLS Security:** Cloud Canary validates SSL certificates at startup to prevent man-in-the-middle attacks. If certificate validation fails, the application exits immediately with a clear error message. Always use `enable.ssl.certificate.verification=true` (default) in production.
 
 ### `[schema_registry]` — Confluent Schema Registry
 
@@ -343,6 +350,8 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `log.topic` | `cloud-canary-logs` | Topic name for log capture. Created automatically if enabled. |
 | `log.topic.retention.ms` | `604800000` | Log topic retention period in milliseconds (default: 7 days). |
 | `warmup.checks` | `2` | Number of initial checks whose E2E latency is measured but not recorded to `canary_e2e_latency_ms`. Suppresses cold-start inflation (TCP/TLS, metadata fetch, SR schema registration). Set to `0` to disable warmup and record all observations. |
+| `max.workers` | `20` | Maximum number of concurrent worker threads for partition checks. Each thread uses ~8MB stack memory. Formula: `actual_workers = min(partition_count, max.workers)`. Increase for large clusters (100+ partitions) to reduce check cycle time. Typical values: 10-20 (small), 30-50 (large), 50-100 (huge clusters with spare memory). |
+| `metrics.partition.threshold` | `100` | **Cardinality control for large clusters.** When partition count exceeds this threshold, metrics use aggregated labels (`partition="*"`) instead of per-partition labels to prevent Prometheus memory explosion. 100 partitions with per-partition labels = ~2,200 time series per host. Set to `0` to always use per-partition labels (not recommended for >100 partitions). Increase (e.g., `500`) to keep granularity on larger clusters if Prometheus has sufficient memory. |
 
 > **Canary topic retention** is fixed at **1 day (86400000 ms)** and is not configurable via `config.ini`. It is set at topic creation time. If the topic already exists, update it manually:
 > ```bash
@@ -566,31 +575,43 @@ The canary exposes metrics at `http://localhost:8000/metrics` (port configurable
 
 ### Latency histograms
 
-Kafka latency histograms carry `host` and `partition` labels. Each partition corresponds
-to a distinct broker leader, giving per-broker latency attribution. Schema Registry
-latency carries only `host` as it is not partition-specific.
+Kafka latency histograms carry only `host` labels (partition labels removed to prevent
+Prometheus cardinality explosion on large clusters). Schema Registry latency carries
+only `host` as it is not partition-specific.
+
+**Note**: Per-partition latency is not available by design. On a 100-partition cluster,
+per-partition labels would create 2,200+ time series per canary instance. Use aggregated
+metrics and rely on broker-level monitoring for partition-specific troubleshooting.
 
 | Metric | Labels | Description | Bucket boundaries (ms) |
 |---|---|---|---|
-| `canary_e2e_latency_ms` | `host`, `partition` | End-to-end latency per partition check (produce timestamp → consumer receive) | 10 25 50 100 250 500 1000 2500 5000 10000 |
-| `canary_seek_duration_ms` | `host`, `partition` | Time to fetch high-watermark offset and seek the partition | 1 5 10 25 50 100 250 500 |
-| `canary_produce_duration_ms` | `host`, `partition` | Time from `produce()` call to broker ack (`flush` return) | 5 10 25 50 100 250 500 1000 2500 |
+| `canary_e2e_latency_ms` | `host` | End-to-end latency aggregated across all partitions (produce timestamp → consumer receive) | 10 25 50 100 250 500 1000 2500 5000 10000 |
+| `canary_seek_duration_ms` | `host` | Time to fetch high-watermark offset and seek (aggregated across all partitions) | 1 5 10 25 50 100 250 500 |
+| `canary_produce_duration_ms` | `host` | Time from `produce()` call to delivery callback (aggregated across all partitions) | 5 10 25 50 100 250 500 1000 2500 |
 | `canary_sr_latency_ms` | `host` | Schema Registry health check response time (HTTP round-trip for `get_subjects()`) | 1 5 10 25 50 100 250 500 1000 2500 |
 
 ### Counters
 
+**Cardinality Control**: When partition count exceeds `metrics.partition.threshold` (default: 100),
+the `partition` label uses `"*"` (aggregated) instead of individual partition numbers to prevent
+Prometheus cardinality explosion. Set `metrics.partition.threshold=0` to always use per-partition
+labels (not recommended for >100 partitions).
+
 | Metric | Labels | Description |
 |---|---|---|
-| `canary_checks_total` | `result` (`success`\|`failure`), `host`, `partition` | Total check attempts per partition |
-| `canary_failures_total` | `phase`, `category`, `host`, `partition` | Failed checks by phase, error category, and partition |
+| `canary_checks_total` | `result` (`success`\|`failure`), `host`, `partition` | Total check attempts. `partition` is per-partition number or `"*"` when count exceeds threshold |
+| `canary_failures_total` | `phase`, `category`, `host`, `partition` | Failed checks by phase, error category. `partition` is per-partition number or `"*"` when count exceeds threshold |
 | `canary_sr_checks_total` | `result` (`success`\|`failure`), `host` | Schema Registry health check attempts |
 
 ### Gauges
 
+**Cardinality Control**: When partition count exceeds `metrics.partition.threshold` (default: 100),
+the `partition` label uses `"*"` (aggregated) instead of individual partition numbers.
+
 | Metric | Labels | Description |
 |---|---|---|
-| `canary_consecutive_failures` | `host`, `partition` | Current streak of consecutive failures per partition — **primary alerting signal** |
-| `canary_last_success_timestamp_seconds` | `host`, `partition` | Unix timestamp of the last successful check per partition — **staleness detection**. Alert when `(now - value) > threshold` to detect broken monitoring |
+| `canary_consecutive_failures` | `host`, `partition` | Current streak of consecutive failures. `partition` is per-partition number or `"*"` when count exceeds threshold — **primary alerting signal** |
+| `canary_last_success_timestamp_seconds` | `host`, `partition` | Unix timestamp of the last successful check. `partition` is per-partition number or `"*"` when count exceeds threshold — **staleness detection**. Alert when `(now - value) > threshold` to detect broken monitoring |
 | `canary_broker_count` | `host` | Broker count as of the last partition sync |
 | `canary_topic_partition_count` | `host` | Canary topic partition count as of the last partition sync |
 | `canary_uptime_seconds` | `host` | Seconds since the canary process started |
@@ -603,14 +624,14 @@ latency carries only `host` as it is not partition-specific.
 sum(rate(canary_checks_total{result="success", host="my-host"}[5m]))
   / sum(rate(canary_checks_total{host="my-host"}[5m])) * 100
 
-# Check success rate across all instances and partitions
+# Check success rate across all instances (by partition if count < threshold)
 sum by (host, partition) (rate(canary_checks_total{result="success"}[5m]))
   / sum by (host, partition) (rate(canary_checks_total[5m])) * 100
 
-# p95 end-to-end latency per broker partition
-histogram_quantile(0.95, sum by (host, partition, le) (rate(canary_e2e_latency_ms_bucket[5m])))
+# p95 end-to-end latency per host (partition labels not available on histograms)
+histogram_quantile(0.95, sum by (host, le) (rate(canary_e2e_latency_ms_bucket[5m])))
 
-# Failure rate by phase and category, broken down by partition
+# Failure rate by phase and category (by partition if count < threshold)
 sum by (host, partition, phase, category) (rate(canary_failures_total[5m]))
 
 # Alert: 3 or more consecutive failures on any partition of any instance
@@ -620,6 +641,111 @@ canary_consecutive_failures >= 3
 # Detects when the canary process itself is stuck or stopped
 (time() - canary_last_success_timestamp_seconds) > 300
 ```
+
+---
+
+## Health Endpoints
+
+In addition to `/metrics`, the canary provides health check endpoints for load balancers, Kubernetes, and monitoring systems:
+
+### `/health` — Liveness Probe
+
+**Purpose**: Determine if the application is running and healthy.
+
+**Returns**:
+- `200 OK` — Healthy (all checks passing, recent successes)
+- `503 Service Unavailable` — Degraded or Unhealthy
+
+**Response Format**:
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-03-27T20:00:00Z",
+  "uptime_seconds": 3600.5,
+  "message": "Healthy - all checks passing",
+  "checks": {
+    "max_staleness_seconds": 15.2,
+    "failure_rate": 0.0,
+    "total_checks": 240,
+    "broker_count": 18,
+    "schema_registry_healthy": true
+  }
+}
+```
+
+**Status Determination**:
+- **HEALTHY** (200): Last success < 60s ago, low failure rate
+- **DEGRADED** (503): Last success within 5 minutes, or high failure rate
+- **UNHEALTHY** (503): No successful checks in 5+ minutes
+
+**Usage**:
+```bash
+# Check health
+curl http://localhost:8000/health
+
+# Use in Docker Compose
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+
+# Use in Kubernetes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+```
+
+### `/ready` — Readiness Probe
+
+**Purpose**: Determine if the application is ready to serve traffic.
+
+**Returns**:
+- `200 OK` — Ready (warmup complete, checks passing)
+- `503 Service Unavailable` — Not Ready (still warming up or unhealthy)
+
+**Response Format**:
+```json
+{
+  "status": "ready",
+  "timestamp": "2026-03-27T20:00:00Z",
+  "message": "Ready - warmup complete and checks passing",
+  "checks": {
+    "warmup_complete": true,
+    "check_sequence": 10,
+    "staleness_seconds": 15.2
+  }
+}
+```
+
+**Status Determination**:
+- **READY** (200): Warmup complete + recent successful checks
+- **NOT_READY** (503): Warmup in progress or no recent successes
+
+**Usage**:
+```bash
+# Check readiness
+curl http://localhost:8000/ready
+
+# Use in Kubernetes
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+```
+
+### Endpoint Comparison
+
+| Endpoint | Purpose | Use Case |
+|----------|---------|----------|
+| `/metrics` | Prometheus metrics exposition | Monitoring, alerting, dashboards |
+| `/health` | Liveness check | Detect dead/stuck processes, restart unhealthy containers |
+| `/ready` | Readiness check | Control traffic routing, prevent requests during startup |
 
 ---
 

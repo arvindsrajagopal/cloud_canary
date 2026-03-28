@@ -21,12 +21,12 @@ MAX_PRODUCER_RETRIES = 2147483647
 # leader elections without blocking indefinitely.
 PRODUCER_DELIVERY_TIMEOUT_MS = 120000  # 2 minutes
 
-# Producer flush timeout in seconds (wall-clock guard).
-# This is a safety timeout that prevents flush() from blocking indefinitely
-# if librdkafka's internal state machine gets stuck. The actual delivery
+# Producer poll timeout in seconds (wall-clock guard for delivery callback).
+# This is a safety timeout that prevents waiting indefinitely for delivery
+# callbacks if librdkafka's internal state machine gets stuck. The actual delivery
 # timeout is controlled by PRODUCER_DELIVERY_TIMEOUT_MS.
-# Reduced from 15s to 2s - sufficient for most broker acks while minimizing
-# blocking time on the produce path (15s was excessive).
+# Set to 2s - sufficient for most broker acks while minimizing blocking time.
+# Note: produce_canary() uses poll() instead of flush() to avoid global blocking.
 PRODUCER_FLUSH_TIMEOUT_SECONDS = 2
 
 # Maximum number of in-flight requests per broker connection.
@@ -139,13 +139,20 @@ LOG_HANDLER_FLUSH_TIMEOUT_SECONDS = 10
 # Concurrency Configuration Constants
 # ---------------------------------------------------------------------------
 
-# Maximum number of worker threads in the check executor pool.
-# Capped at 20 to prevent excessive memory usage and context switching overhead
-# on large clusters. Each thread uses ~8MB stack memory, so 100 threads would
-# consume ~800MB. With 20 workers, the pool can still process 20 partitions
-# concurrently, which is sufficient for most deployments.
-# Performance testing shows diminishing returns beyond 20 workers due to
-# context switching overhead.
+# Default maximum number of worker threads in the check executor pool.
+# This value is used as the default for config.ini [app].max.workers setting.
+# Can be overridden via configuration to tune for specific cluster sizes.
+#
+# Tuning guidance:
+#   - Each thread uses ~8MB stack memory (20 threads = ~160MB, 100 threads = ~800MB)
+#   - Typical range: 10-50 workers depending on cluster size and available resources
+#   - Diminishing returns beyond ~50 workers due to context switching overhead
+#   - Formula: actual_workers = min(partition_count, max_workers)
+#
+# Recommended values:
+#   - Small clusters (<50 partitions): 20 (default)
+#   - Large clusters (100-500 partitions): 30-50
+#   - Huge clusters (500+ partitions): 50-100 (consider memory constraints)
 MAX_WORKERS = 20
 
 # Default Prometheus metrics port.

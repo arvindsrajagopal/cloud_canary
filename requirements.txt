@@ -1,2 +1,9 @@
-confluent-kafka[avro]>=2.3.0
-prometheus_client>=0.20.0
+# Production dependencies with pinned versions for security and reproducibility
+# Update with: pip install --upgrade <package> && pip freeze | grep <package>
+# Then regenerate hashes: pip hash <package>==<version>
+
+# Confluent Kafka Python client with Avro support
+confluent-kafka[avro]==2.13.2
+
+# Prometheus metrics client
+prometheus_client==0.24.1
