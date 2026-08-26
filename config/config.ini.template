@@ -16,7 +16,7 @@ sasl.password=YOUR_KAFKA_API_SECRET
 #ssl.ca.location=/app/certs/ca-bundle.pem
 
 # Enable strict hostname verification (prevents MITM attacks)
-# Default: true (recommended for production, made explicit here)
+# Default: true (recommended for all environments, made explicit here)
 enable.ssl.certificate.verification=true
 
 # Optional: Mutual TLS (mTLS) - client certificate authentication
@@ -58,7 +58,7 @@ metrics.ssl.enabled=false
 # When partition count > threshold, metrics use aggregated labels to prevent
 # Prometheus cardinality explosion (100 partitions = 2,200+ time series per host)
 # Default: 100 (good for most deployments)
-# Set to 0 to always use per-partition labels (not recommended for >100 partitions)
+# Set to 0 to always aggregate counters and gauges with partition="*"
 # Set higher (e.g., 500) to keep granularity on larger clusters (requires more Prometheus memory)
 metrics.partition.threshold=100
 

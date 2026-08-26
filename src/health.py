@@ -3,9 +3,9 @@
 #
 # Provides HTTP endpoints for monitoring application health and readiness:
 #
-#   /health  — Liveness probe: Is the application running properly?
-#              Returns 200 if healthy, 503 if unhealthy/degraded
-#              Based on staleness of successful checks
+#   /health  — Dependency-health summary based on canary check metrics.
+#              Returns 200 if healthy, 503 if unhealthy/degraded. It is not a
+#              process-only liveness signal.
 #
 #   /ready   — Readiness probe: Is the application ready to serve?
 #              Returns 200 only after warmup period completes
@@ -17,30 +17,26 @@
 # Health Status Logic
 # -------------------
 # HEALTHY (200):
-#   - All partitions have succeeded within check interval
-#   - Schema Registry reachable
-#   - No critical errors
+#   - The freshest recorded partition success is less than 60 seconds old
+#   - Process-lifetime check failure rate is at most 50 percent
 #
 # DEGRADED (503):
-#   - Some partitions failing but not all
-#   - Last success within 5 minutes
-#   - Temporary issues, may recover
+#   - Freshest recorded success is 60 to 300 seconds old, or
+#   - Process-lifetime check failure rate is greater than 50 percent
 #
 # UNHEALTHY (503):
-#   - No successful checks in 5+ minutes
-#   - All partitions failing
-#   - Application unable to monitor cluster
+#   - No successful check has been recorded, or
+#   - Freshest recorded success is more than 300 seconds old
 #
 # Readiness Logic
 # ---------------
 # NOT_READY (503):
-#   - Warmup period not yet complete
-#   - Initial checks still running
+#   - Fewer than 10 check cycles have completed, or
+#   - No success has been recorded in the last 60 seconds
 #
 # READY (200):
-#   - Warmup complete
-#   - At least one successful check recorded
-#   - Application is stable
+#   - At least 10 check cycles have completed
+#   - A success has been recorded in the last 60 seconds
 # ---------------------------------------------------------------------------
 
 import logging
@@ -150,13 +146,15 @@ def _get_metric_value(metric_name: str, label_values: Optional[Dict[str, str]] =
 
 def _get_max_staleness() -> Optional[float]:
     """
-    Calculate maximum staleness across all partitions (with caching).
+    Calculate staleness from the most recent successful partition (with caching).
 
     Caches result for 5 seconds to reduce CPU overhead on large clusters.
     On a 1000-partition cluster, this reduces health check time from 50ms
     to 0.1ms (500x faster) with 95% CPU savings.
 
-    Returns seconds since last successful check for the worst partition.
+    Despite the legacy function name, the current implementation selects the
+    largest success timestamp and therefore reports the freshest partition.
+    It does not report the worst partition.
     Returns None if metric not available.
     """
     now = time.time()
@@ -228,10 +226,10 @@ def _get_total_checks() -> int:
 
 def _get_failure_rate() -> Optional[float]:
     """
-    Calculate recent failure rate (with caching).
+    Calculate the process-lifetime failure rate (with caching).
 
     Caches result for 5 seconds to reduce iteration overhead.
-    Returns fraction of checks that failed (0.0-1.0).
+    Returns the fraction of all checks since process start that failed (0.0-1.0).
     Returns None if insufficient data.
     """
     now = time.time()

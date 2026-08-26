@@ -12,8 +12,8 @@
 # What it does:
 #   1. Starts Prometheus + Grafana via docker compose (detached)
 #   2. Launches the canary app in the foreground
-#   3. Tears down the monitoring stack on exit — including SIGKILL and crashes,
-#      because the trap fires in the shell process even when the child is killed.
+#   3. Tears down the monitoring stack on normal exit and trappable termination
+#      signals. SIGKILL cannot be trapped and therefore cannot trigger cleanup.
 #
 # Prometheus : http://localhost:9090
 # Grafana    : http://localhost:3000  (admin / admin)

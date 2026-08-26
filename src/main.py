@@ -7,13 +7,14 @@
 # Kafka cluster by producing a small Avro-encoded message and consuming it back,
 # recording the round-trip latency and any errors that occur.
 #
-# Three independent check cadences run in a single-threaded loop:
+# Three check cadences are coordinated by one control loop:
 #
 #   Canary check          (check.interval.seconds, default 15 s)
 #       The core measurement: seek → produce → consume.  One check per
-#       partition runs concurrently via a ThreadPoolExecutor so that every
-#       broker leader is exercised in every cycle.  Per-partition latency
-#       and errors are recorded to Prometheus metrics after each attempt.
+#       partition is submitted to a ThreadPoolExecutor. At most max.workers
+#       checks run concurrently, and Kafka leader placement means distinct
+#       coverage of every broker is not guaranteed. Results are recorded to
+#       Prometheus metrics after each attempt.
 #
 #   Partition sync        (partition.sync.interval.seconds, default 86400 s)
 #       Detects broker count changes (cluster scale-up/down) and reconciles
@@ -43,9 +44,9 @@
 #             replication lag.  The explicit partition pin ensures the message
 #             lands on the broker leader for that partition.
 #
-#   CONSUME — Poll for the specific message by UUID.  A timeout here means
-#             the broker accepted the write but is not serving it back —
-#             possible ISR or replication issue.
+#   CONSUME — Poll for the specific message by UUID. A timeout occurs after
+#             a successful produce acknowledgement, but can still reflect a
+#             broker/read-path problem or a client connectivity problem.
 #
 # Per-partition concurrency
 # -------------------------
@@ -309,7 +310,7 @@ def check_kafka(
         category = classify_kafka_error(exc.args[0]) if exc.args else ErrorCategory.UNKNOWN
         raise CanaryError(Phase.PRODUCE, category, str(exc))
     except RuntimeError as exc:
-        # flush() wall-clock timeout — broker did not ack within 2s.
+        # Local delivery-callback wait expired after 2s.
         # delivery.timeout.ms has not expired so the cause is unknown;
         # UNKNOWN is more honest than NETWORK or BROKER here.
         raise CanaryError(Phase.PRODUCE, ErrorCategory.UNKNOWN, str(exc))
@@ -325,7 +326,7 @@ def check_kafka(
     # Poll until the message we just produced is received back.  Because the
     # produce already succeeded (broker acked), a timeout here means the
     # broker is not serving the message — possible replication lag or ISR
-    # issue causing the follower serving this consumer to be behind.
+    # issue on the broker or consume path.
     #
     # Note: CONSUME phase has no duration histogram because the consume
     # latency is already captured by E2E_LATENCY (which measures the full

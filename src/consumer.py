@@ -57,13 +57,13 @@ from src.schema import (
 )
 
 # Import metrics.HOST to use the configurable instance ID.
-# This respects CANARY_INSTANCE_ID env var and instance.id config setting.
+# This respects the CANARY_INSTANCE_ID environment variable.
 from src import metrics
 
 # ---------------------------------------------------------------------------
 # Default librdkafka consumer configuration.
 # Implemented as a function to pick up the current metrics.HOST value, which
-# may be updated after config loading (via instance.id setting).
+# is established when the metrics module is imported.
 # Merged with connection/auth settings from config.ini in create_partition_consumer().
 # ---------------------------------------------------------------------------
 def _get_consumer_defaults() -> dict:
@@ -75,7 +75,7 @@ def _get_consumer_defaults() -> dict:
     """
     return {
         # ---- Identification ----
-        # Uses metrics.HOST which respects CANARY_INSTANCE_ID env var and instance.id config.
+        # Uses metrics.HOST, which respects the CANARY_INSTANCE_ID environment variable.
         "client.id": metrics.HOST,
 
         # ---- Group membership & rebalance ----

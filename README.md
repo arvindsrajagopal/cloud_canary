@@ -1,12 +1,21 @@
 # cloud_canary
 
-A production-grade Kafka canary that continuously measures the end-to-end health
-of a [Confluent Cloud](https://confluent.cloud) cluster. It produces a small
+A prototype Kafka canary for monitoring the end-to-end health of a
+[Confluent Cloud](https://confluent.cloud) cluster. It produces a small
 Avro-encoded message, consumes it back, and records the round-trip latency and any
 errors as Prometheus metrics — giving you an always-on signal of cluster availability,
 replication health, and network connectivity.
 
-> **📢 Recent Migration (2026-03-27):** Cloud Canary has been migrated from the experimental `SerializingProducer`/`DeserializingConsumer` classes to the stable `Producer`/`Consumer` API with manual serialization. This ensures long-term stability and prevents breaking changes in future `confluent-kafka-python` versions. See [MIGRATION_STABLE_API.md](MIGRATION_STABLE_API.md) for details. **No configuration changes required.**
+> [!WARNING]
+> Cloud Canary is an experimental prototype, not a Confluent-supported product.
+> It is provided without warranties or support commitments. If you download or
+> deploy it in a production environment, you do so at your own risk and should
+> first perform sufficient security, reliability, scale, failure-mode, and
+> operational testing for your environment.
+
+The implementation uses the stable `Producer` and `Consumer` APIs with manual
+Avro serialization rather than the experimental `SerializingProducer` and
+`DeserializingConsumer` APIs.
 
 ---
 
@@ -27,9 +36,9 @@ cp config/config.ini.template config/config.ini
 # 4. Run the canary (from project root)
 python -m src.main
 
-# 5. (Optional) Start Prometheus + Grafana monitoring stack alongside the canary
-#    run.sh starts Colima if needed, brings up the monitoring stack, runs the canary,
-#    and tears the stack down cleanly on exit.
+# 5. (Optional, macOS + Colima) Start Prometheus + Grafana alongside the canary.
+#    run.sh starts Colima if needed, brings up the monitoring stack, runs the
+#    canary, and tears the stack down on normal exit or trappable signals.
 ./run.sh
 # Prometheus: http://localhost:9090   Grafana: http://localhost:3000 (admin/admin)
 ```
@@ -62,7 +71,7 @@ python -m src.main
 | Capability | Detail |
 |---|---|
 | **End-to-end latency** | Measures produce → broker ack → consumer receive round-trip in ms, per partition |
-| **Per-broker coverage** | One check per partition runs concurrently every cycle — every broker leader is exercised |
+| **Per-partition coverage** | One check per topic partition runs concurrently, up to the configured worker limit. Partition count is reconciled to broker count, but Kafka leader placement is not controlled or verified, so distinct coverage of every broker is not guaranteed. |
 | **Phase attribution** | Distinguishes failures in the SEEK, PRODUCE, and CONSUME phases |
 | **Error classification** | Labels failures as NETWORK (client-side) or BROKER (server-side) |
 | **Topic management** | Auto-creates the canary topic; resizes partitions when the cluster scales |
@@ -78,7 +87,8 @@ python -m src.main
 
 ### Main Loop
 
-The canary runs three independent check cadences in a single-threaded loop:
+The canary uses a single control loop for three check cadences. Per-partition
+Kafka checks run in a worker pool, up to `max.workers` at a time:
 
 ```mermaid
 flowchart TD
@@ -157,10 +167,11 @@ flowchart TD
     GC -- yes --> GM["Calculate total round-trip time\nReceive time minus send time"]
 ```
 
-> **Why a receive timeout indicates a broker problem:** By the time we try to receive
-> the message, we already know the send was successful. The broker confirmed it saved
-> the message to all backup copies. So if we can't read it back, that means the broker
-> isn't serving messages properly — not that the message was lost.
+> **How receive timeouts are reported:** By the time the consume phase starts, the
+> producer has received a successful acknowledgement for the message. The prototype
+> currently classifies a later receive timeout as a broker-side failure. In practice,
+> a consume-path network problem can also cause this symptom, so investigate both the
+> cluster and client connectivity.
 
 ### Error Classification
 
@@ -338,7 +349,7 @@ These keys are passed directly to the librdkafka client. Key names must match
 |---|---|---|
 | `topic` | `cloud-canary` | Kafka topic used for canary messages. Created automatically at startup. |
 | `consumer.timeout.seconds` | `5` | Max seconds to wait for the canary message before treating the consume phase as failed. |
-| `check.interval.seconds` | `15` | Seconds between consecutive end-to-end checks. |
+| `check.interval.seconds` | `15` | Seconds to wait after one complete check cycle before starting the next. A cycle can take longer than this value, especially when partition count exceeds `max.workers`. |
 | `partition.sync.interval.seconds` | `86400` | How often to check for broker count changes and resize the topic. |
 | `sr.check.interval.seconds` | `60` | How often to run an independent Schema Registry health probe. |
 | `metrics.port` | `8000` | TCP port for the Prometheus `/metrics` HTTP endpoint. |
@@ -351,7 +362,7 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `log.topic.retention.ms` | `604800000` | Log topic retention period in milliseconds (default: 7 days). |
 | `warmup.checks` | `2` | Number of initial checks whose E2E latency is measured but not recorded to `canary_e2e_latency_ms`. Suppresses cold-start inflation (TCP/TLS, metadata fetch, SR schema registration). Set to `0` to disable warmup and record all observations. |
 | `max.workers` | `20` | Maximum number of concurrent worker threads for partition checks. Each thread uses ~8MB stack memory. Formula: `actual_workers = min(partition_count, max.workers)`. Increase for large clusters (100+ partitions) to reduce check cycle time. Typical values: 10-20 (small), 30-50 (large), 50-100 (huge clusters with spare memory). |
-| `metrics.partition.threshold` | `100` | **Cardinality control for large clusters.** When partition count exceeds this threshold, metrics use aggregated labels (`partition="*"`) instead of per-partition labels to prevent Prometheus memory explosion. 100 partitions with per-partition labels = ~2,200 time series per host. Set to `0` to always use per-partition labels (not recommended for >100 partitions). Increase (e.g., `500`) to keep granularity on larger clusters if Prometheus has sufficient memory. |
+| `metrics.partition.threshold` | `100` | **Cardinality control for large clusters.** When partition count exceeds this threshold, counters and gauges use `partition="*"` instead of per-partition labels. Set to `0` to always aggregate; increase the value (for example, `500`) to retain per-partition labels on larger clusters if Prometheus has sufficient memory. Latency histograms are always aggregated by host. |
 
 > **Canary topic retention** is fixed at **1 day (86400000 ms)** and is not configurable via `config.ini`. It is set at topic creation time. If the topic already exists, update it manually:
 > ```bash
@@ -369,7 +380,8 @@ These keys are passed directly to the librdkafka client. Key names must match
 python -m src.main
 ```
 
-Alternatively, `run.sh` starts the monitoring stack and the canary together, and tears down the stack on exit:
+On macOS with Colima installed, `run.sh` starts the monitoring stack and the
+canary together, then tears down the stack on normal exit or a trappable signal:
 
 ```bash
 # Use default instance ID (hostname)
@@ -382,7 +394,11 @@ Alternatively, `run.sh` starts the monitoring stack and the canary together, and
 CANARY_INSTANCE_ID=my-canary ./run.sh
 ```
 
-### Docker Deployment (Recommended for Production)
+### Docker Deployment
+
+The container is a convenient evaluation and deployment format; it does not make
+the prototype production-ready. Apply the warning at the top of this README and
+validate the image and operating model before using it in a production environment.
 
 ```bash
 # Build the Docker image
@@ -439,48 +455,39 @@ services:
       retries: 3
 ```
 
-> **DNS Troubleshooting:** If you encounter DNS resolution issues connecting to Confluent Cloud from Docker, see [DNS_TROUBLESHOOTING.md](DNS_TROUBLESHOOTING.md) for diagnostic tools and solutions. Quick fix: use the provided `docker-compose.yml` which includes DNS configuration, or run with `--dns 8.8.8.8 --dns 8.8.4.4`.
+> **DNS troubleshooting:** Run the image with the `diagnose` command to inspect
+> container DNS, or configure DNS with Docker's `--dns` option or the Compose
+> service's `dns` setting. The example Compose file does not set custom DNS servers.
 
 ### Log output format
 
-```
-2024-06-10T12:00:00 [INFO] cloud_canary started | topic=cloud-canary check.interval=15s ... warmup.checks=2
-2024-06-10T12:00:00 [INFO] Metrics available at http://0.0.0.0:8000/metrics
-2024-06-10T12:00:00 [INFO] Cluster has 3 broker(s).
-2024-06-10T12:00:00 [INFO] Topic 'cloud-canary' already exists (3 partition(s)) — skipping creation.
-2024-06-10T12:00:00 [INFO] Running initial partition sync...
-2024-06-10T12:00:01 [INFO] Per-partition consumers ready: 3 partition(s) → [0, 1, 2]
-2024-06-10T12:00:01 [INFO] SR OK
-2024-06-10T12:00:01 [INFO] Produced  | seq=1 partition=0 id=3f2a1c7e-... host=my-host
-2024-06-10T12:00:01 [INFO] Produced  | seq=1 partition=1 id=9a4b2d1f-... host=my-host
-2024-06-10T12:00:01 [INFO] Produced  | seq=1 partition=2 id=c7e3a8b2-... host=my-host
-2024-06-10T12:00:01 [INFO] WARMUP    | seq=1 partition=0 latency=312ms (not recorded)
-2024-06-10T12:00:01 [INFO] WARMUP    | seq=1 partition=1 latency=298ms (not recorded)
-2024-06-10T12:00:01 [INFO] WARMUP    | seq=1 partition=2 latency=341ms (not recorded)
-2024-06-10T12:00:16 [INFO] WARMUP    | seq=2 partition=0 latency=94ms (not recorded)
-2024-06-10T12:00:16 [INFO] WARMUP    | seq=2 partition=1 latency=88ms (not recorded)
-2024-06-10T12:00:16 [INFO] WARMUP    | seq=2 partition=2 latency=91ms (not recorded)
-2024-06-10T12:00:16 [INFO] Warmup complete — latency metrics enabled from the next check.
-2024-06-10T12:00:31 [INFO] Consumed  | seq=3 partition=0 latency=87ms
-2024-06-10T12:00:31 [INFO] Consumed  | seq=3 partition=1 latency=92ms
-2024-06-10T12:00:31 [INFO] Consumed  | seq=3 partition=2 latency=85ms
-2024-06-10T12:00:31 [INFO] Next check in 15s
+Text mode emits messages like the following. JSON mode uses the same message
+names and adds structured fields such as `host`, `version`, `partition`,
+`check_sequence`, and `latency_ms`.
 
-# On failure (partition 1 only — broker 1 degraded):
-2024-06-10T12:02:02 [ERROR] FAIL [1] | seq=5 partition=1 phase=PRODUCE category=NETWORK detail=...
-2024-06-10T12:02:02 [INFO]  Next check in 15s
+```
+2026-03-27T12:00:00 [INFO] cloud_canary started
+2026-03-27T12:00:00 [INFO] Metrics server started
+2026-03-27T12:00:00 [INFO] Cluster has 3 broker(s).
+2026-03-27T12:00:00 [INFO] Topic 'cloud-canary' already exists (3 partition(s)) — skipping creation.
+2026-03-27T12:00:00 [INFO] Running initial partition sync
+2026-03-27T12:00:01 [INFO] Per-partition consumers ready
+2026-03-27T12:00:01 [INFO] Schema Registry check succeeded
+2026-03-27T12:00:01 [INFO] Warmup check succeeded (latency not recorded)
+2026-03-27T12:00:16 [INFO] Warmup complete, latency metrics enabled
+2026-03-27T12:00:31 [INFO] Check succeeded
+2026-03-27T12:02:02 [ERROR] Check failed
 ```
 
 | Log line | Meaning |
 |---|---|
-| `Per-partition consumers ready: N partition(s) → [0..N-1]` | Startup complete; one consumer assigned per partition |
-| `Produced \| seq=K partition=P id=...` | Canary message sent to partition P |
-| `WARMUP \| seq=N partition=P latency=Xms (not recorded)` | Warmup check succeeded; latency measured but not recorded to Prometheus |
-| `Warmup complete — latency metrics enabled from the next check.` | Warmup period finished; all subsequent E2E latency observations are recorded |
-| `Consumed \| seq=N partition=P latency=Xms` | Check succeeded; latency recorded to Prometheus for this partition |
-| `FAIL [N] \| seq=M partition=P phase=PH category=C` | Check failed on partition P; `N` = consecutive failure count for that partition |
-| `SR OK` | Schema Registry probe succeeded |
-| `SR FAIL \| ...` | Schema Registry probe failed |
+| `Per-partition consumers ready` | Startup complete; one consumer is assigned per partition |
+| `Warmup check succeeded (latency not recorded)` | Warmup check succeeded; E2E latency was not recorded |
+| `Warmup complete, latency metrics enabled` | Configured warmup period finished |
+| `Check succeeded` | Check succeeded and E2E latency was recorded |
+| `Check failed` | A check failed; structured fields identify partition, phase, category, and streak |
+| `Schema Registry check succeeded` | Schema Registry probe succeeded |
+| `Schema Registry check failed` | Schema Registry probe failed |
 
 ### Graceful shutdown
 
@@ -648,9 +655,12 @@ canary_consecutive_failures >= 3
 
 In addition to `/metrics`, the canary provides health check endpoints for load balancers, Kubernetes, and monitoring systems:
 
-### `/health` — Liveness Probe
+### `/health` — Dependency Health
 
-**Purpose**: Determine if the application is running and healthy.
+**Purpose**: Report the prototype's current view of Kafka check health. Because
+dependency degradation returns HTTP 503, do not use this endpoint as a
+process-only liveness probe unless restarting on an external Kafka outage is the
+behavior you explicitly want.
 
 **Returns**:
 - `200 OK` — Healthy (all checks passing, recent successes)
@@ -690,8 +700,8 @@ healthcheck:
   timeout: 5s
   retries: 3
 
-# Use in Kubernetes
-livenessProbe:
+# Use in Kubernetes as a readiness-style dependency check
+readinessProbe:
   httpGet:
     path: /health
     port: 8000
@@ -744,8 +754,8 @@ readinessProbe:
 | Endpoint | Purpose | Use Case |
 |----------|---------|----------|
 | `/metrics` | Prometheus metrics exposition | Monitoring, alerting, dashboards |
-| `/health` | Liveness check | Detect dead/stuck processes, restart unhealthy containers |
-| `/ready` | Readiness check | Control traffic routing, prevent requests during startup |
+| `/health` | Kafka dependency-health summary | Monitoring and alerting; returns 503 for degraded dependencies |
+| `/ready` | Prototype readiness check | Reports ready after 10 check cycles and a recent success |
 
 ---
 
@@ -806,7 +816,9 @@ sets up the equivalent alias.
 
 ## Securing the Metrics Endpoint
 
-The metrics endpoint can be configured for security in production environments:
+The metrics endpoint can be configured with controls that may be useful when
+evaluating a production deployment. It does not provide application-level
+authentication or authorization.
 
 ### Bind to Localhost Only
 
@@ -848,7 +860,8 @@ scrape_configs:
       - targets: ['canary-host:8000']
 ```
 
-**Production:** Use certificates from a trusted CA (Let's Encrypt, internal CA, etc.) and set `insecure_skip_verify: false`.
+For any production evaluation, use certificates from a trusted CA (Let's Encrypt,
+an internal CA, etc.) and set `insecure_skip_verify: false`.
 
 ---
 

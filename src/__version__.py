@@ -11,4 +11,4 @@ __version_info__ = (1, 2, 3)
 
 # Human-readable build metadata (optional)
 __author__ = "Cloud Canary Team"
-__description__ = "Production-grade Kafka canary for Confluent Cloud monitoring"
+__description__ = "Prototype Kafka canary for monitoring Confluent Cloud health"

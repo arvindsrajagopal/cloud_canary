@@ -54,13 +54,14 @@ log = logging.getLogger(__name__)
 # Hostname of this canary instance.  Embedded as a constant label on every
 # metric so that dashboards and alerts can filter or group by instance without
 # relying on Prometheus scrape-target configuration.
-# Can be overridden via CANARY_INSTANCE_ID environment variable or instance.id
-# in config.ini for multi-instance deployments on the same host.
+# Can be overridden via the CANARY_INSTANCE_ID environment variable for
+# multi-instance deployments on the same host.
 HOST = os.getenv("CANARY_INSTANCE_ID") or socket.gethostname()
 
 # ---------------------------------------------------------------------------
 # Latency histograms — labeled per host AND partition at call time.
-# Each partition maps to a distinct broker leader, giving per-broker latency.
+# Checks target individual partitions. Kafka controls leader placement, so multiple
+# partitions may share a leader and distinct coverage of every broker is not guaranteed.
 # ---------------------------------------------------------------------------
 
 E2E_LATENCY = Histogram(
@@ -222,7 +223,7 @@ def start_metrics_server(
 
     Spawns a background daemon thread that serves multiple endpoints:
     - /metrics — Prometheus metrics exposition format
-    - /health  — Liveness probe (healthy/degraded/unhealthy)
+    - /health  — Kafka dependency-health summary (healthy/degraded/unhealthy)
     - /ready   — Readiness probe (ready/not_ready)
 
     The thread exits automatically when the main process exits.
@@ -283,7 +284,7 @@ def start_metrics_server(
                     self.send_error(500, f"Error generating metrics: {e}")
 
             elif self.path == "/health":
-                # Liveness probe endpoint
+                # Kafka dependency-health endpoint
                 try:
                     health = get_health_status()
                     self.send_response(health.http_code)

@@ -58,13 +58,13 @@ from src.schema import (
 log = logging.getLogger(__name__)
 
 # Import metrics.HOST to use the configurable instance ID.
-# This respects CANARY_INSTANCE_ID env var and instance.id config setting.
+# This respects the CANARY_INSTANCE_ID environment variable.
 from src import metrics
 
 # ---------------------------------------------------------------------------
 # Default librdkafka producer configuration.
 # Implemented as a function to pick up the current metrics.HOST value, which
-# may be updated after config loading (via instance.id setting).
+# is established when the metrics module is imported.
 # These are merged with the user-supplied connection/auth settings from
 # config.ini (which take precedence via the dict merge order in create_producer).
 # ---------------------------------------------------------------------------
@@ -78,11 +78,11 @@ def _get_producer_defaults() -> dict:
     return {
         # ---- Identification ----
         # Used in broker logs to identify which client produced a message.
-        # Uses metrics.HOST which respects CANARY_INSTANCE_ID env var and instance.id config.
+        # Uses metrics.HOST, which respects the CANARY_INSTANCE_ID environment variable.
         "client.id": metrics.HOST,
 
         # ---- Durability ----
-        # Require all in-sync replicas to ack before flush() returns.
+        # Require all in-sync replicas to ack before the delivery callback succeeds.
         # This exercises the full replication pipeline on every canary check.
         "acks": "all",
 
@@ -152,8 +152,8 @@ def create_producer(kafka_config: dict, sr_client) -> tuple[Producer, AvroSerial
     Returns
     -------
     tuple[Producer, AvroSerializer]
-        Producer instance and AvroSerializer.  Call produce() with manually
-        serialized values, then flush() to send messages.
+        Producer instance and AvroSerializer. Call produce() with manually
+        serialized values and poll the producer to serve delivery callbacks.
     """
     producer = Producer({
         **_get_producer_defaults(),  # get defaults with current instance ID
@@ -204,8 +204,9 @@ def produce_canary(
 
     partition : int
         Target partition index.  Pinning the message to a specific partition
-        ensures each check exercises a distinct broker leader, giving
-        per-broker latency attribution.
+        provides per-partition latency attribution. Distinct broker coverage
+        depends on Kafka's current partition-leader placement and is not
+        guaranteed.
 
     Returns
     -------
@@ -217,8 +218,8 @@ def produce_canary(
     Raises
     ------
     KafkaException
-        If the broker does not acknowledge the message within
-        delivery.timeout.ms (120 s), or if any other produce error occurs.
+        If librdkafka reports a delivery failure before the local callback wait
+        expires, or if any other produce error occurs.
 
     RuntimeError
         If the delivery callback does not fire within the timeout period

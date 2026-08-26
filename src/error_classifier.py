@@ -33,9 +33,8 @@ class Phase(str, Enum):
         would also prevent new schema registrations by producers.
 
     ASSIGNMENT
-        Waiting for the Kafka consumer group coordinator to assign topic
-        partitions after subscribe().  Failure here typically indicates a
-        broker connectivity problem at startup.
+        Retained as a taxonomy value for compatibility. The current consumer
+        implementation uses manual assign() and does not emit this phase.
 
     SEEK
         Fetching high-watermark offsets from the broker and seeking the

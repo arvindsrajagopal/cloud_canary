@@ -52,7 +52,7 @@ FROM python:3.11-slim@sha256:9358444059ed78e2975ada2c189f1c1a3144a5dab6f35bff8c9
 ARG VERSION=1.2.3
 
 LABEL org.opencontainers.image.title="Cloud Canary"
-LABEL org.opencontainers.image.description="Production-grade Kafka canary for Confluent Cloud monitoring"
+LABEL org.opencontainers.image.description="Prototype Kafka canary for monitoring Confluent Cloud health"
 LABEL org.opencontainers.image.source="https://github.com/yourusername/cloud_canary"
 LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.vendor="Cloud Canary Team"

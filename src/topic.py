@@ -18,10 +18,9 @@
 #
 # Why partition count = broker count?
 # ------------------------------------
-# Each partition is served by a distinct broker leader.  Matching partitions to
-# brokers ensures that every broker participates in canary traffic, so a single
-# unhealthy broker will surface as a failure rather than being silently avoided
-# by the round-robin partition assignment.
+# Matching partition count to broker count increases the opportunity for broad
+# leader coverage, but Kafka controls leader placement. Multiple partitions can
+# share a leader, so this code does not guarantee that every broker is exercised.
 #
 # Multi-instance safety
 # ---------------------
@@ -323,9 +322,9 @@ def ensure_topic(kafka_config: dict, topic: str, admin: AdminClient | None = Non
     If the topic already exists, this is a no-op (the function logs the
     existing partition count and returns immediately).
 
-    Partition count is set to the number of brokers so that every broker
-    holds a leader partition and is exercised by the canary.  Replication
-    factor is capped at 3 to avoid redundant replicas on large clusters.
+    Partition count is set to the number of brokers as a coverage heuristic.
+    Kafka controls leader placement, so this does not guarantee one distinct
+    leader partition per broker. Replication factor is capped at 3.
 
     Parameters
     ----------
