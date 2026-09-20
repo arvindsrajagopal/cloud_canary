@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import unittest
 from unittest import mock
@@ -148,6 +149,10 @@ class ContextControlTests(unittest.TestCase):
         ):
             with self.assertRaises(ralph.HumanIntervention):
                 ralph._assert_repository_state(state, "test")
+
+    def test_codex_approval_flag_precedes_exec_subcommand(self):
+        source = inspect.getsource(ralph._invoke_codex)
+        self.assertLess(source.index('"-a"'), source.index('"exec"'))
 
 
 class PlanAndPromptTests(unittest.TestCase):

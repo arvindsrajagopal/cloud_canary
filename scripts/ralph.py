@@ -585,14 +585,14 @@ def _invoke_codex(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
         codex_executable,
+        "-a",
+        "never",
         "exec",
         "--ephemeral",
         "-C",
         str(ROOT),
         "-s",
         "read-only" if read_only else "workspace-write",
-        "-a",
-        "never",
         "-o",
         str(output_path),
     ]
