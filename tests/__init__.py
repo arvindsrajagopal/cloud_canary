@@ -1,0 +1,1 @@
+"""Cloud Canary test harness."""

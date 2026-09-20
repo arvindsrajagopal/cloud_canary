@@ -1,0 +1,281 @@
+{
+  "schema_version": 4,
+  "specification": "SPEC.md",
+  "development_reference": "ralph/confluent-development-reference.md",
+  "completion_criteria_count": 119,
+  "execution_order": ["R01", "R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09", "R10", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
+  "default_max_iterations": 36,
+  "default_max_attempts_per_task": 3,
+  "context_limits": {
+    "max_feedback_characters": 8000,
+    "max_changed_files": 12,
+    "max_diff_lines": 1200,
+    "max_review_findings_forwarded": 20
+  },
+  "tasks": [
+    {
+      "id": "R01",
+      "depends_on": [],
+      "title": "Partition health and rolling failure windows",
+      "criteria_range": [1, 5],
+      "spec_sections": ["5", "7.1", "7.2"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/unit/test_partition_health.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R02",
+      "depends_on": ["R01"],
+      "title": "Schema Registry health and post-warmup readiness",
+      "criteria_range": [6, 10],
+      "spec_sections": ["6.2", "7.3", "10"],
+      "development_reference_sections": ["5", "6", "7"],
+      "test_files": ["tests/unit/test_schema_registry_health.py", "tests/unit/test_readiness.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R03",
+      "depends_on": ["R02"],
+      "title": "Verified topic reconciliation and aggregate metrics",
+      "criteria_range": [11, 15],
+      "spec_sections": ["11.3", "11.4", "11.5", "12"],
+      "development_reference_sections": ["2", "7"],
+      "test_files": ["tests/unit/test_topic_reconciliation.py", "tests/contract/test_aggregate_metrics.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "monitoring/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R04",
+      "depends_on": ["R03"],
+      "title": "Metric cardinality, HTTPS, and configuration validation",
+      "criteria_range": [16, 20],
+      "spec_sections": ["5", "9.1", "12", "13.1"],
+      "development_reference_sections": ["6", "7"],
+      "test_files": ["tests/contract/test_partition_metrics.py", "tests/unit/test_config_validation.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "monitoring/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R05",
+      "depends_on": ["R04"],
+      "title": "Fair scheduling and bounded worker ownership",
+      "criteria_range": [21, 25],
+      "spec_sections": ["9.1", "9.2"],
+      "development_reference_sections": ["2", "4", "7"],
+      "test_files": ["tests/unit/test_scheduler.py", "tests/unit/test_worker_pool.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R06",
+      "depends_on": ["R05"],
+      "title": "Independent execution lanes, monotonic timing, and shutdown",
+      "criteria_range": [26, 30],
+      "spec_sections": ["8.4", "9.3"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/unit/test_execution_lanes.py", "tests/unit/test_shutdown.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": true
+    },
+    {
+      "id": "R07",
+      "depends_on": ["R06"],
+      "title": "Liveness and readiness transition contract",
+      "criteria_range": [31, 35],
+      "spec_sections": ["6.1", "6.2", "10"],
+      "development_reference_sections": [],
+      "test_files": ["tests/contract/test_liveness.py", "tests/contract/test_readiness_endpoint.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "Dockerfile", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R08",
+      "depends_on": ["R07"],
+      "title": "Recreation transitions, dependency health, and restart reset",
+      "criteria_range": [36, 40],
+      "spec_sections": ["6.2", "6.3", "7.6", "7.7", "11.5"],
+      "development_reference_sections": ["3", "4", "5", "7"],
+      "test_files": ["tests/contract/test_dependency_health.py", "tests/unit/test_restart_state.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "Dockerfile", "docker-entrypoint.sh", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R09",
+      "depends_on": ["R08"],
+      "title": "Topic generations, immutable state, and invariant failure",
+      "criteria_range": [41, 45],
+      "spec_sections": ["7.5", "7.6", "7.8", "11"],
+      "development_reference_sections": ["2", "7"],
+      "test_files": ["tests/unit/test_state_store.py", "tests/unit/test_topic_generations.py"],
+      "allowed_paths": ["src/", "tests/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R10",
+      "depends_on": ["R09"],
+      "title": "Failure classification and recovery policy",
+      "criteria_range": [46, 50],
+      "spec_sections": ["8.1", "8.2", "8.3"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/unit/test_error_classification.py", "tests/unit/test_recovery_policy.py"],
+      "allowed_paths": ["src/", "tests/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R11",
+      "depends_on": ["R10"],
+      "title": "HTTP concurrency, saturation, and sanitized failures",
+      "criteria_range": [51, 55],
+      "spec_sections": ["6.4"],
+      "development_reference_sections": [],
+      "test_files": ["tests/integration/test_http_concurrency.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R12",
+      "depends_on": ["R11"],
+      "title": "HTTP lifecycle and private endpoint exposure",
+      "criteria_range": [56, 60],
+      "spec_sections": ["6.4", "6.5"],
+      "development_reference_sections": [],
+      "test_files": ["tests/integration/test_http_lifecycle.py", "tests/contract/test_endpoint_methods.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "Dockerfile", "README.md"],
+      "milestone": true
+    },
+    {
+      "id": "R13",
+      "depends_on": ["R12"],
+      "title": "Endpoint security and enterprise monitoring integration",
+      "criteria_range": [61, 65],
+      "spec_sections": ["6.5", "6.6"],
+      "development_reference_sections": ["6", "7"],
+      "test_files": ["tests/contract/test_endpoint_security.py", "tests/contract/test_monitoring_stack.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "monitoring/", "Dockerfile", "docker-compose.example.yml", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R14",
+      "depends_on": ["R13"],
+      "title": "Long-lived startup clients and deterministic failures",
+      "criteria_range": [66, 70],
+      "spec_sections": ["8.4"],
+      "development_reference_sections": ["2", "3", "4", "5", "7"],
+      "test_files": ["tests/unit/test_startup_clients.py", "tests/unit/test_startup_failures.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R15",
+      "depends_on": ["R14"],
+      "title": "Startup retry policy, cleanup, and warmup proof",
+      "criteria_range": [71, 75],
+      "spec_sections": ["8.4", "10"],
+      "development_reference_sections": ["3", "4", "5", "7"],
+      "test_files": ["tests/unit/test_startup_retry.py", "tests/unit/test_startup_cleanup.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R16",
+      "depends_on": ["R15"],
+      "title": "Portable application and local monitoring workflows",
+      "criteria_range": [76, 80],
+      "spec_sections": ["6.7"],
+      "development_reference_sections": ["2", "6", "7"],
+      "test_files": ["tests/contract/test_runtime_workflows.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "Dockerfile", "docker-entrypoint.sh", "docker-compose.example.yml", "monitoring/", "README.md", "run.sh"],
+      "milestone": false
+    },
+    {
+      "id": "R17",
+      "depends_on": ["R16"],
+      "title": "File-backed secret resolution and redaction",
+      "criteria_range": [81, 85],
+      "spec_sections": ["13.2"],
+      "development_reference_sections": ["6"],
+      "test_files": ["tests/unit/test_secret_resolution.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R18",
+      "depends_on": ["R17"],
+      "title": "Secret rotation and minimal production image",
+      "criteria_range": [86, 90],
+      "spec_sections": ["6.8", "13.2"],
+      "development_reference_sections": ["6"],
+      "test_files": ["tests/contract/test_container_security.py", "tests/contract/test_dependency_lock.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "Dockerfile", "docker-entrypoint.sh", "docker-compose.example.yml", "README.md", "requirements.txt"],
+      "milestone": true
+    },
+    {
+      "id": "R19",
+      "depends_on": ["R18"],
+      "title": "Supply-chain metadata and architecture validation",
+      "criteria_range": [91, 95],
+      "spec_sections": ["6.8"],
+      "development_reference_sections": ["2", "7"],
+      "test_files": ["tests/contract/test_supply_chain.py"],
+      "allowed_paths": ["src/", "tests/", "Dockerfile", "docker-entrypoint.sh", "README.md", "requirements.txt"],
+      "milestone": false
+    },
+    {
+      "id": "R20",
+      "depends_on": ["R19"],
+      "title": "Topic manager and observer behavior",
+      "criteria_range": [96, 100],
+      "spec_sections": ["11.1", "11.2", "11.3"],
+      "development_reference_sections": ["2", "7"],
+      "test_files": ["tests/unit/test_topic_roles.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R21",
+      "depends_on": ["R20"],
+      "title": "Role metrics, dashboards, and manager alerting",
+      "criteria_range": [101, 105],
+      "spec_sections": ["6.6", "11.2", "12"],
+      "development_reference_sections": ["7"],
+      "test_files": ["tests/contract/test_role_observability.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "monitoring/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R22",
+      "depends_on": ["R21"],
+      "title": "Broker-derived topology, capacity, and bounded diagnostics",
+      "criteria_range": [106, 110],
+      "spec_sections": ["6.3", "7", "9.1", "11.1"],
+      "development_reference_sections": ["2", "7"],
+      "test_files": ["tests/unit/test_topology_policy.py", "tests/contract/test_health_diagnostics.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R23",
+      "depends_on": ["R22"],
+      "title": "Metric enums, optional Kafka logging, and bounded histories",
+      "criteria_range": [111, 115],
+      "spec_sections": ["7.9", "11.6", "12"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/contract/test_metric_enums.py", "tests/unit/test_kafka_log_handler.py", "tests/longevity/test_history_bounds.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "monitoring/", "README.md"],
+      "milestone": false
+    },
+    {
+      "id": "R24",
+      "depends_on": ["R23"],
+      "title": "Topology churn and native-client memory containment",
+      "criteria_range": [116, 119],
+      "spec_sections": ["7.9", "9", "11.5", "12"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/longevity/test_topology_churn.py", "tests/longevity/test_resource_bounds.py"],
+      "allowed_paths": ["src/", "tests/", "config/", "monitoring/", "README.md"],
+      "milestone": true
+    }
+  ]
+}
