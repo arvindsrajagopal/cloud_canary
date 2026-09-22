@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import hashlib
 import json
@@ -768,7 +769,44 @@ def _declared_tests_exist(task: Dict[str, Any]) -> Tuple[bool, str]:
     missing = [path for path in task["test_files"] if not (ROOT / path).is_file()]
     if missing:
         return False, "Missing declared test files: " + ", ".join(missing)
-    return True, "all declared task test files exist"
+
+    empty = []
+    for relative in task["test_files"]:
+        path = ROOT / relative
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError) as exc:
+            return False, "Invalid declared test file {}: {}".format(relative, exc)
+        if not any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+            for node in ast.walk(tree)
+        ):
+            empty.append(relative)
+    if empty:
+        return False, "Declared test files contain no tests: " + ", ".join(empty)
+    return True, "all declared task test files contain discoverable tests"
+
+
+def _run_declared_tests(
+    task: Dict[str, Any], python_executable: str, timeout_seconds: int
+) -> Tuple[bool, str]:
+    """Execute each declared file and reject unittest's successful zero-test run."""
+    results = []
+    for relative in task["test_files"]:
+        completed = _run(
+            [python_executable, "-m", "unittest", "-v", relative],
+            timeout_seconds=timeout_seconds,
+        )
+        match = re.search(r"Ran (\d+) tests?", completed.stdout)
+        count = int(match.group(1)) if match else 0
+        if completed.returncode != 0 or count == 0:
+            detail = completed.stdout.strip()
+            return False, "Declared test file {} did not execute tests:\n{}".format(
+                relative, detail or "no unittest result"
+            )
+        results.append("{} ({})".format(relative, count))
+    return True, "declared tests executed: " + ", ".join(results)
 
 
 def _record_event(state: Dict[str, Any], event: Dict[str, Any]) -> None:
@@ -1145,14 +1183,24 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     continue
 
                 tests_exist, test_detail = _declared_tests_exist(task)
+                if tests_exist:
+                    declared_tests_passed, declared_test_detail = _run_declared_tests(
+                        task, args.python, args.test_timeout_seconds
+                    )
+                else:
+                    declared_tests_passed = False
+                    declared_test_detail = "declared tests were not run"
                 quality_passed, quality_detail = _quality_gate(
                     args.python, args.test_timeout_seconds, feedback_limit
                 )
-                if not tests_exist or not quality_passed:
+                if not tests_exist or not declared_tests_passed or not quality_passed:
                     feedback = _persist_feedback(
                         state,
                         task["id"],
-                        "{}\n{}".format(test_detail, quality_detail), feedback_limit
+                        "{}\n{}\n{}".format(
+                            test_detail, declared_test_detail, quality_detail
+                        ),
+                        feedback_limit,
                     )
                     _record_event(
                         state,

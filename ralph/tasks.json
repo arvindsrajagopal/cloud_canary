@@ -1,13 +1,13 @@
 {
-  "schema_version": 32,
+  "schema_version": 33,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
   "development_reference": "ralph/confluent-development-reference.md",
   "decision_ledger": "ralph/decisions.json",
   "completion_criteria_count": 119,
-  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R93", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
-  "default_max_iterations": 41,
+  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R96", "R93", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
+  "default_max_iterations": 42,
   "default_max_attempts_per_task": 2,
   "review_policy": {
     "max_review_cycles_per_task": 2,
@@ -563,25 +563,45 @@
       "milestone": false
     },
     {
-      "id": "R93",
+      "id": "R96",
       "depends_on": ["R95"],
-      "title": "Runtime recovery-policy boundary integration",
+      "title": "Runtime failure descriptor propagation",
       "criteria_range": null,
       "acceptance_conditions": [
-        "Kafka operation failures retain their bounded FailureDescriptor through the runtime completion boundary.",
+        "Kafka operation failures retain one bounded FailureDescriptor through the runtime completion boundary.",
+        "Schema Registry runtime failures retain the same bounded descriptor model without carrying raw exception text in CanaryError.",
+        "Existing success, transient-failure recording, and consumer-replacement behavior remains unchanged while failure transport is migrated.",
+        "Integration tests exercise the production check and completion call sites and reject raw exception retention."
+      ],
+      "ownership_boundary": "Failure representation and propagation through production Kafka and Schema Registry runtime boundaries without executing recovery policy actions.",
+      "explicit_exclusions": ["Recovery-action dispatch owned by R93", "Health-state transitions", "Recovery classification tables", "Startup retry timing", "HTTP concurrency", "Worker-pool redesign"],
+      "failure_mode_checklist": ["No raw exception content crosses the completion boundary", "Typed component, phase, category, recoverability, code, and safe summary are preserved", "Consumer replacement remains partition-local", "Transient failures cannot be reported as success", "Production call sites are directly tested"],
+      "budget": {"max_changed_files": 3, "max_diff_lines": 325},
+      "spec_sections": ["8.1", "8.3"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/integration/test_failure_descriptor_propagation.py"],
+      "allowed_paths": ["src/error_classifier.py", "src/main.py", "tests/integration/test_failure_descriptor_propagation.py"],
+      "milestone": false
+    },
+    {
+      "id": "R93",
+      "depends_on": ["R96"],
+      "title": "Runtime recovery-action execution",
+      "criteria_range": null,
+      "acceptance_conditions": [
         "The runtime invokes the centralized recovery policy instead of independently deciding every CanaryError outcome.",
         "Deterministic runtime security and configuration failures call the R94 partition-local unhealthy transition and continue bounded probes.",
         "Serialization and unknown internal failures terminate through bounded fatal cleanup, consumer-state failures replace only the affected worker-owned consumer, and transient external failures record and continue.",
         "Integration tests exercise real runtime call sites rather than only the pure mapping function."
       ],
-      "ownership_boundary": "Propagation and execution of bounded recovery decisions at Kafka runtime operation boundaries.",
-      "explicit_exclusions": ["Recovery classification tables", "Health-state internals owned by R94", "Consumer failure propagation owned by R95", "Startup retry timing", "HTTP concurrency", "Broad consumer-pool redesign"],
-      "failure_mode_checklist": ["No raw exception content enters retained state", "Fatal action reaches existing bounded shutdown lifecycle", "Deterministic unhealthy state is partition-local", "Replacement is partition-local", "Transient failures cannot be reported as success", "Production call sites are directly tested"],
-      "budget": {"max_changed_files": 3, "max_diff_lines": 450},
-      "spec_sections": ["8.1", "8.2", "8.3"],
+      "ownership_boundary": "Execution of centralized recovery decisions after R96 has propagated bounded runtime descriptors.",
+      "explicit_exclusions": ["Failure descriptor propagation owned by R96", "Recovery classification tables", "Health-state internals owned by R94", "Consumer failure propagation owned by R95", "Startup retry timing", "HTTP concurrency", "Broad consumer-pool redesign"],
+      "failure_mode_checklist": ["Fatal action reaches existing bounded shutdown lifecycle", "Deterministic unhealthy state is partition-local", "Replacement is partition-local", "Transient failures cannot be reported as success", "Production action call sites are directly tested"],
+      "budget": {"max_changed_files": 2, "max_diff_lines": 300},
+      "spec_sections": ["8.2", "8.3"],
       "development_reference_sections": ["3", "4", "7"],
       "test_files": ["tests/integration/test_recovery_integration.py"],
-      "allowed_paths": ["src/error_classifier.py", "src/main.py", "tests/integration/test_recovery_integration.py"],
+      "allowed_paths": ["src/main.py", "tests/integration/test_recovery_integration.py"],
       "milestone": false
     },
     {

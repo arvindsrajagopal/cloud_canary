@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import ralph
@@ -276,6 +278,61 @@ class PlanAndPromptTests(unittest.TestCase):
         passed, detail = ralph._declared_tests_exist(task)
         self.assertFalse(passed)
         self.assertIn(missing_test, detail)
+
+    def test_task_cannot_pass_with_placeholder_declared_test(self):
+        runtime_directory = ralph.ROOT / ".ralph-state" / "test-runtime"
+        runtime_directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=runtime_directory) as temporary:
+            root = Path(temporary)
+            test_path = root / "tests" / "test_placeholder.py"
+            test_path.parent.mkdir(parents=True)
+            test_path.write_text('"""Scaffold only."""\n', encoding="utf-8")
+            with mock.patch.object(ralph, "ROOT", root):
+                passed, detail = ralph._declared_tests_exist(
+                    {"test_files": ["tests/test_placeholder.py"]}
+                )
+        self.assertFalse(passed)
+        self.assertIn("contain no tests", detail)
+
+    def test_declared_test_requires_a_discoverable_test_symbol(self):
+        runtime_directory = ralph.ROOT / ".ralph-state" / "test-runtime"
+        runtime_directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=runtime_directory) as temporary:
+            root = Path(temporary)
+            test_path = root / "tests" / "test_real.py"
+            test_path.parent.mkdir(parents=True)
+            test_path.write_text(
+                "import unittest\n\n"
+                "class ExampleTests(unittest.TestCase):\n"
+                "    def test_behavior(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(ralph, "ROOT", root):
+                passed, detail = ralph._declared_tests_exist(
+                    {"test_files": ["tests/test_real.py"]}
+                )
+        self.assertTrue(passed)
+        self.assertIn("discoverable tests", detail)
+
+    def test_declared_test_execution_rejects_zero_tests(self):
+        completed = mock.Mock(returncode=0, stdout="Ran 0 tests in 0.000s\nOK")
+        with mock.patch.object(ralph, "_run", return_value=completed):
+            passed, detail = ralph._run_declared_tests(
+                {"test_files": ["tests/test_placeholder.py"]}, "python", 30
+            )
+        self.assertFalse(passed)
+        self.assertIn("did not execute tests", detail)
+
+    def test_declared_test_execution_reports_each_file(self):
+        completed = mock.Mock(returncode=0, stdout="Ran 2 tests in 0.001s\nOK")
+        task = {"test_files": ["tests/test_one.py", "tests/test_two.py"]}
+        with mock.patch.object(ralph, "_run", return_value=completed) as run:
+            passed, detail = ralph._run_declared_tests(task, "python", 30)
+        self.assertTrue(passed)
+        self.assertEqual(2, run.call_count)
+        self.assertIn("tests/test_one.py (2)", detail)
+        self.assertIn("tests/test_two.py (2)", detail)
 
 
 if __name__ == "__main__":
