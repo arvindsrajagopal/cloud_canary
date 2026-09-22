@@ -111,7 +111,7 @@ from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from confluent_kafka import KafkaError, KafkaException, Consumer, Producer
+from confluent_kafka import KafkaException, Consumer, Producer
 from confluent_kafka.admin import AdminClient
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserializer
@@ -128,6 +128,7 @@ from src.consumer import (
     seek_to_end,
 )
 from src.worker_pool import (
+    ConsumerFailure,
     ConsumerInvalidError,
     WorkerPool,
     WorkerPoolInvariantError,
@@ -136,6 +137,7 @@ from src.error_classifier import (
     CanaryError,
     ErrorCategory,
     Phase,
+    classify_consumer_error,
     classify_kafka_error,
     classify_sr_error,
     is_deterministic_sr_error,
@@ -417,22 +419,10 @@ def check_kafka(
     try:
         seek_to_end(consumer)
     except (RuntimeError, KafkaException) as exc:
-        category = (
-            classify_kafka_error(exc.args[0], phase=Phase.SEEK).category
-            if isinstance(exc, KafkaException) and exc.args
-            else ErrorCategory.BROKER
-        )
-        failure = CanaryError(Phase.SEEK, category, str(exc))
-        kafka_error = exc.args[0] if isinstance(exc, KafkaException) and exc.args else None
-        if isinstance(exc, RuntimeError) or (
-            kafka_error is not None
-            and (
-                kafka_error.code() == KafkaError._STATE
-                or kafka_error.fatal()
-            )
-        ):
-            raise ConsumerInvalidError(failure) from exc
-        raise failure from exc
+        descriptor = classify_consumer_error(exc, phase=Phase.SEEK)
+        if descriptor.category is ErrorCategory.CLIENT_STATE:
+            raise ConsumerInvalidError(descriptor) from None
+        raise CanaryError(Phase.SEEK, descriptor.category, str(exc)) from exc
     finally:
         # Record seek duration regardless of success or failure so the
         # histogram captures partial attempts (e.g. successful on some
@@ -502,17 +492,10 @@ def check_kafka(
             "(possible replication lag or ISR issue)",
         )
     except KafkaException as exc:
-        category = (
-            classify_kafka_error(exc.args[0], phase=Phase.CONSUME).category
-            if exc.args else ErrorCategory.UNKNOWN
-        )
-        failure = CanaryError(Phase.CONSUME, category, str(exc))
-        kafka_error = exc.args[0] if exc.args else None
-        if kafka_error is not None and (
-            kafka_error.code() == KafkaError._STATE or kafka_error.fatal()
-        ):
-            raise ConsumerInvalidError(failure) from exc
-        raise failure from exc
+        descriptor = classify_consumer_error(exc, phase=Phase.CONSUME)
+        if descriptor.category is ErrorCategory.CLIENT_STATE:
+            raise ConsumerInvalidError(descriptor) from None
+        raise CanaryError(Phase.CONSUME, descriptor.category, str(exc)) from exc
 
     # End-to-end latency: consumer receive time minus the timestamp captured
     # by the producer just before calling produce().  Both timestamps are
@@ -1764,6 +1747,32 @@ def _run_lifecycle() -> None:
                     # Fail closed so the centralized finalizer performs bounded
                     # cleanup instead of dispatching against an incomplete pool.
                     raise
+
+                except ConsumerFailure as exc:
+                    failure = exc.failure
+                    accepted = _record_failed_partition_attempt(
+                        health_store,
+                        p,
+                        completed_sequence,
+                        consecutive_failures,
+                        failure.phase,
+                        failure.category,
+                        failure=f"{failure.phase.value}:{failure.category.value}",
+                        generation=completed_generation,
+                    )
+                    if accepted:
+                        log.error(
+                            "Consumer check failed after replacement",
+                            extra={
+                                "consecutive_failures": consecutive_failures[p],
+                                "check_sequence": completed_sequence,
+                                "partition": p,
+                                "phase": failure.phase,
+                                "category": failure.category,
+                                "code": failure.code,
+                                "detail": failure.safe_summary,
+                            },
+                        )
 
                 except CanaryError as exc:
                     # Classified failure — phase and category are known

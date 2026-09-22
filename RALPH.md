@@ -99,7 +99,7 @@ order. The normal loop and `--task` use the same selector; `--task` cannot skip
 ahead or reopen a completed task.
 
 The ordered stages cover core health and scheduling through R43,
-R44-R46 for failure classification and recovery, R91-R94 for checkpoint review
+R44-R46 for failure classification and recovery, R91-R95 for checkpoint review
 integrity and recovery-boundary correction, R11-R12 for HTTP lifecycle, R13-R18 for secure
 operation, startup, portability, and secrets, and R19-R24 for supply-chain,
 multi-instance ownership, topology, observability, and resource containment.

@@ -86,6 +86,12 @@ class ReviewGateTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("HIGH", detail)
 
+    def test_runner_stops_after_major_review_instead_of_retrying(self):
+        source = inspect.getsource(ralph.run)
+        marker = "major review finding requires approval"
+        self.assertIn(marker, source)
+        self.assertLess(source.index(marker), source.index("milestone_result = None"))
+
     def test_medium_current_task_finding_is_auto_accepted(self):
         review = _review("FAIL")
         review["categories"]["performance"] = _category(

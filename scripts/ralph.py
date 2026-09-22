@@ -316,6 +316,7 @@ def _load_plan() -> Dict[str, Any]:
         != NON_BLOCKING_FINDING_CLASSES
         or review_policy.get("require_novelty_explanation_after_first_review")
         is not True
+        or review_policy.get("major_findings_require_human_approval") is not True
     ):
         raise RalphError("task plan has an invalid review policy")
     if plan.get("development_reference") != str(
@@ -1228,7 +1229,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                             "detail": review_detail,
                         },
                     )
-                    continue
+                    raise HumanIntervention(
+                        "major review finding requires approval:\n" + review_detail
+                    )
 
                 _assert_repository_state(state, "after read-only task review")
 

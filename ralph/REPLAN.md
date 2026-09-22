@@ -160,8 +160,10 @@ because draft code exists.
 R10 was replaced by R90 and R44–R46 after R43 completed. The active sequence
 separates the descriptor model, bounded Kafka classification, Schema Registry
 HTTP classification, and central recovery-policy decisions. The criterion-50
-checkpoint review then added R91–R94 to harden review ownership, correct
+checkpoint review then added R91–R95 to harden review ownership, correct
 transient Schema Registry recovery, add the missing partition-local unhealthy
-state transition, and connect the recovery policy to runtime Kafka operation
-boundaries. Startup retry timing remains owned by R15.
+state transition, preserve consumer failure propagation, and connect the
+recovery policy to runtime Kafka operation boundaries. Startup retry timing
+remains owned by R15. Major review findings now stop for human approval instead
+of automatically starting a correction attempt.
 Execution stops at R11 for the next broad-phase replan.

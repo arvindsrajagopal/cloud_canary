@@ -35,9 +35,12 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(53, len(plan["tasks"]))
+        self.assertEqual(54, len(plan["tasks"]))
         self.assertEqual("active", plan["execution_status"])
         self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
+        self.assertTrue(
+            plan["review_policy"]["major_findings_require_human_approval"]
+        )
         expected_count = plan["completion_criteria_count"]
         covered = []
         for task in plan["tasks"]:
@@ -177,6 +180,8 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertIsNone(tasks["R92"]["criteria_range"])
         self.assertIsNone(tasks["R93"]["criteria_range"])
         self.assertIsNone(tasks["R94"]["criteria_range"])
+        self.assertIsNone(tasks["R95"]["criteria_range"])
+        self.assertEqual(["R95"], tasks["R93"]["depends_on"])
         self.assertEqual(["R93"], tasks["R11"]["depends_on"])
         self.assertTrue(tasks["R11"]["requires_replan"])
 

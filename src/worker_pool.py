@@ -9,6 +9,12 @@ from typing import Callable, Generic, TypeVar
 
 from confluent_kafka import TopicPartition
 
+from src.error_classifier import (
+    FailureDescriptor,
+    Phase,
+    classify_consumer_error,
+)
+
 
 T = TypeVar("T")
 
@@ -16,9 +22,19 @@ T = TypeVar("T")
 class ConsumerInvalidError(Exception):
     """Signal that a check left its borrowed consumer unsafe for reuse."""
 
-    def __init__(self, cause: Exception) -> None:
+    def __init__(self, cause: Exception | FailureDescriptor) -> None:
         self.cause = cause
         super().__init__(str(cause))
+
+
+class ConsumerFailure(Exception):
+    """Bounded consumer failure safe to propagate through a Future."""
+
+    def __init__(self, failure: FailureDescriptor) -> None:
+        self.failure = failure
+        super().__init__(
+            f"{failure.phase.value}:{failure.category.value}:{failure.safe_summary}"
+        )
 
 
 class WorkerPoolInvariantError(RuntimeError):
@@ -153,17 +169,30 @@ class WorkerPool(Generic[T]):
                 raise self._fail_pool(worker, "worker has no owned consumer")
             consumer = worker.consumer
             deserializer = worker.deserializer
+            assignment_failure = None
             try:
                 consumer.assign([TopicPartition(self._topic, partition)])
             except Exception as exc:
+                assignment_failure = classify_consumer_error(
+                    exc, phase=Phase.ASSIGNMENT
+                )
+            if assignment_failure is not None:
                 self._replace_invalid(worker)
-                raise exc
+                raise ConsumerFailure(assignment_failure)
 
+            invalid_failure = None
+            legacy_cause = None
             try:
                 return operation(consumer, deserializer)
             except ConsumerInvalidError as exc:
-                self._replace_invalid(worker)
-                raise exc.cause from exc
+                if isinstance(exc.cause, FailureDescriptor):
+                    invalid_failure = exc.cause
+                else:  # Compatibility for callers not yet descriptor-aware.
+                    legacy_cause = exc.cause
+            self._replace_invalid(worker)
+            if invalid_failure is not None:
+                raise ConsumerFailure(invalid_failure)
+            raise legacy_cause
         except WorkerPoolInvariantError:
             return_to_pool = False
             raise

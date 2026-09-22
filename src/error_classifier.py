@@ -315,6 +315,47 @@ def classify_kafka_error(
     )
 
 
+def classify_consumer_error(exc: Exception, *, phase: Phase) -> FailureDescriptor:
+    """Classify a consumer-boundary failure without retaining the exception."""
+    if (
+        isinstance(exc, KafkaException)
+        and exc.args
+        and isinstance(exc.args[0], KafkaError)
+    ):
+        descriptor = classify_kafka_error(exc.args[0], phase=phase)
+        # A fatal client flag is only a fallback indication of invalid state;
+        # stronger typed causes must retain their deterministic semantics.
+        if (
+            exc.args[0].fatal()
+            and descriptor.category
+            not in {
+                ErrorCategory.AUTHENTICATION,
+                ErrorCategory.AUTHORIZATION,
+                ErrorCategory.TLS_CERTIFICATE,
+                ErrorCategory.CONFIGURATION,
+                ErrorCategory.SERIALIZATION,
+            }
+        ):
+            return FailureDescriptor(
+                component=descriptor.component,
+                phase=descriptor.phase,
+                category=ErrorCategory.CLIENT_STATE,
+                recoverability=Recoverability.TRANSIENT,
+                code=descriptor.code,
+                safe_summary=FailureSummary.OPERATION_FAILED,
+            )
+        return descriptor
+
+    return FailureDescriptor(
+        component=FailureComponent.KAFKA_PARTITION,
+        phase=phase,
+        category=ErrorCategory.CLIENT_STATE,
+        recoverability=Recoverability.TRANSIENT,
+        code=None,
+        safe_summary=FailureSummary.OPERATION_FAILED,
+    )
+
+
 _SR_CONFIGURATION_HTTP_STATUSES = frozenset((400, 405, 409, 422))
 _SR_TRANSIENT_HTTP_STATUSES = frozenset((408, 425, 429))
 

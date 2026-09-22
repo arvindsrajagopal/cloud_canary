@@ -1,13 +1,13 @@
 {
-  "schema_version": 31,
+  "schema_version": 32,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
   "development_reference": "ralph/confluent-development-reference.md",
   "decision_ledger": "ralph/decisions.json",
   "completion_criteria_count": 119,
-  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R93", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
-  "default_max_iterations": 40,
+  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R93", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
+  "default_max_iterations": 41,
   "default_max_attempts_per_task": 2,
   "review_policy": {
     "max_review_cycles_per_task": 2,
@@ -16,7 +16,8 @@
     "auto_accept_severities": ["LOW", "MEDIUM"],
     "human_finding_class": "SPEC_GAP",
     "non_blocking_finding_classes": ["FUTURE_TASK", "NON_BLOCKING_IMPROVEMENT"],
-    "require_novelty_explanation_after_first_review": true
+    "require_novelty_explanation_after_first_review": true,
+    "major_findings_require_human_approval": true
   },
   "context_limits": {
     "max_feedback_characters": 4000,
@@ -541,19 +542,40 @@
       "milestone": false
     },
     {
-      "id": "R93",
+      "id": "R95",
       "depends_on": ["R94"],
+      "title": "Consumer failure classification and replacement propagation",
+      "criteria_range": null,
+      "acceptance_conditions": [
+        "Typed authentication, authorization, TLS, and configuration categories retain deterministic recoverability even when librdkafka also reports the client as fatal.",
+        "Actual consumer-state and assignment failures replace only the affected worker-owned consumer.",
+        "After replacement, a bounded structured descriptor crosses the completion boundary instead of a raw Kafka exception.",
+        "Assignment failure records and continues without being reclassified as an unknown internal fatal failure."
+      ],
+      "ownership_boundary": "Classification precedence and bounded propagation for worker-owned consumer invalidation and assignment failure.",
+      "explicit_exclusions": ["General runtime recovery-action dispatch owned by R93", "Health-state internals", "HTTP concurrency", "Worker-pool redesign beyond failure propagation"],
+      "failure_mode_checklist": ["Security classification wins over fatal client flag", "Consumer-state errors remain replaceable", "Raw assignment exceptions do not cross completion", "Only the borrowed consumer is replaced", "Failure remains observable and non-successful"],
+      "budget": {"max_changed_files": 4, "max_diff_lines": 400},
+      "spec_sections": ["8.1", "8.2", "8.3"],
+      "development_reference_sections": ["3", "4"],
+      "test_files": ["tests/integration/test_consumer_failure_propagation.py"],
+      "allowed_paths": ["src/error_classifier.py", "src/main.py", "src/worker_pool.py", "tests/integration/test_consumer_failure_propagation.py"],
+      "milestone": false
+    },
+    {
+      "id": "R93",
+      "depends_on": ["R95"],
       "title": "Runtime recovery-policy boundary integration",
       "criteria_range": null,
       "acceptance_conditions": [
         "Kafka operation failures retain their bounded FailureDescriptor through the runtime completion boundary.",
         "The runtime invokes the centralized recovery policy instead of independently deciding every CanaryError outcome.",
-        "Deterministic runtime security and configuration failures call the R93 partition-local unhealthy transition and continue bounded probes.",
+        "Deterministic runtime security and configuration failures call the R94 partition-local unhealthy transition and continue bounded probes.",
         "Serialization and unknown internal failures terminate through bounded fatal cleanup, consumer-state failures replace only the affected worker-owned consumer, and transient external failures record and continue.",
         "Integration tests exercise real runtime call sites rather than only the pure mapping function."
       ],
       "ownership_boundary": "Propagation and execution of bounded recovery decisions at Kafka runtime operation boundaries.",
-      "explicit_exclusions": ["Recovery classification tables", "Health-state internals owned by R93", "Startup retry timing", "HTTP concurrency", "Broad consumer-pool redesign"],
+      "explicit_exclusions": ["Recovery classification tables", "Health-state internals owned by R94", "Consumer failure propagation owned by R95", "Startup retry timing", "HTTP concurrency", "Broad consumer-pool redesign"],
       "failure_mode_checklist": ["No raw exception content enters retained state", "Fatal action reaches existing bounded shutdown lifecycle", "Deterministic unhealthy state is partition-local", "Replacement is partition-local", "Transient failures cannot be reported as success", "Production call sites are directly tested"],
       "budget": {"max_changed_files": 3, "max_diff_lines": 450},
       "spec_sections": ["8.1", "8.2", "8.3"],
