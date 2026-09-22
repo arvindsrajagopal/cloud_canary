@@ -47,6 +47,8 @@
 import json
 import logging
 import socket
+import time
+from collections.abc import Callable
 
 from confluent_kafka import KafkaException, Producer
 
@@ -83,7 +85,15 @@ class KafkaLogHandler(logging.Handler):
         }
     """
 
-    def __init__(self, kafka_config: dict, topic: str) -> None:
+    def __init__(
+        self,
+        kafka_config: dict,
+        topic: str,
+        *,
+        shutdown_requested: Callable[[], bool] | None = None,
+        shutdown_deadline: Callable[[], float | None] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         """
         Parameters
         ----------
@@ -97,6 +107,9 @@ class KafkaLogHandler(logging.Handler):
         """
         super().__init__()
         self._topic = topic
+        self._shutdown_requested = shutdown_requested or (lambda: False)
+        self._shutdown_deadline = shutdown_deadline or (lambda: None)
+        self._monotonic = monotonic
         # Use metrics.HOST to respect configurable instance ID
         self._host = metrics.HOST
         # Cache JSON encoder instance to avoid recreating on every log call.
@@ -128,6 +141,9 @@ class KafkaLogHandler(logging.Handler):
             the handler's Formatter (set by the caller) to produce the final
             message string.
         """
+        if self._shutdown_requested():
+            return
+
         try:
             log_dict = {
                 "timestamp_ms": int(record.created * 1000),  # record.created is float seconds
@@ -138,7 +154,10 @@ class KafkaLogHandler(logging.Handler):
             }
             # Use cached encoder for better performance
             payload = self._encoder.encode(log_dict)
-            self._producer.produce(
+            producer = self._producer
+            if producer is None:
+                return
+            producer.produce(
                 topic=self._topic,
                 value=payload.encode("utf-8"),
             )
@@ -146,7 +165,7 @@ class KafkaLogHandler(logging.Handler):
             # process delivery callbacks from previously produced messages without
             # waiting for new ones.  This prevents the internal callback queue
             # from growing unbounded during a burst of log output.
-            self._producer.poll(0)
+            producer.poll(0)
         except (KafkaException, json.JSONEncodeError, UnicodeEncodeError, BufferError) as exc:
             # Catch specific exceptions that can occur during log publishing:
             # - KafkaException: broker connectivity or quota issues
@@ -163,21 +182,25 @@ class KafkaLogHandler(logging.Handler):
         Flush all buffered log records to Kafka and release resources.
 
         Called automatically when the handler is removed from a logger or when
-        the logging system shuts down.  flush(timeout=10) blocks until all
-        buffered records are delivered or the timeout expires, ensuring no
-        log records are silently dropped on clean shutdown.
+        the logging system shuts down. The flush is capped by both its normal
+        timeout and any process shutdown deadline supplied by the caller.
 
         Explicitly releases the producer to close TCP connections and free
         resources immediately rather than waiting for garbage collection.
         """
         try:
-            # Block until all buffered messages are delivered or the timeout expires.
-            self._producer.flush(timeout=const.LOG_HANDLER_FLUSH_TIMEOUT_SECONDS)
+            # Claim the producer before flushing.  logging.shutdown() may call
+            # close() again during interpreter teardown; that later call must
+            # be a no-op rather than starting a fresh timeout.
+            producer = self._producer
+            self._producer = None
+            if producer is None:
+                return
 
-            # Explicitly release producer resources.
-            # confluent_kafka.Producer doesn't have a close() method, but we can
-            # trigger cleanup by deleting the reference, which invokes __del__.
-            # This closes TCP connections and releases internal buffers immediately.
-            del self._producer
+            timeout = const.LOG_HANDLER_FLUSH_TIMEOUT_SECONDS
+            deadline = self._shutdown_deadline()
+            if deadline is not None:
+                timeout = min(timeout, max(0.0, deadline - self._monotonic()))
+            producer.flush(timeout=timeout)
         finally:
             super().close()   # always call the parent to mark the handler as closed

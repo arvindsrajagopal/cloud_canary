@@ -19,10 +19,14 @@
 
 import configparser
 import logging
+import math
 import os
 import sys
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
+
+SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 
 def validate_config(config: dict) -> None:
@@ -91,11 +95,11 @@ def validate_config(config: dict) -> None:
             kafka['sasl.mechanisms']
         )
 
-    # Validate Schema Registry URL format
-    if not sr['url'].startswith(('http://', 'https://')):
+    # Schema Registry credentials must never be sent over plaintext transport.
+    parsed_sr_url = urlsplit(sr['url'])
+    if parsed_sr_url.scheme.lower() != 'https' or not parsed_sr_url.hostname:
         raise ValueError(
-            "[schema_registry].url must start with 'http://' or 'https://' "
-            f"(got: '{sr['url']}')"
+            "[schema_registry].url must be a valid HTTPS URL"
         )
 
     # Validate basic.auth.user.info format (KEY:SECRET)
@@ -149,7 +153,6 @@ def validate_config(config: dict) -> None:
         'warmup.checks': (0, 100),
         'max.workers': (1, 200),  # Thread pool size
         'metrics.port': (1024, 65535),
-        'metrics.partition.threshold': (0, 10000),  # Cardinality control
         'log.topic.retention.ms': (60000, 2592000000),  # 1 min to 30 days
     }
 
@@ -166,6 +169,83 @@ def validate_config(config: dict) -> None:
                 raise ValueError(
                     f"[app].{key} must be a valid number (got: '{app[key]}')"
                 ) from exc
+
+    def positive_integer(key: str, default: str) -> int:
+        raw_value = app.get(key, default)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[app].{key} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"[app].{key} must be a positive integer")
+        return value
+
+    def finite_number(key: str, default: str) -> float:
+        raw_value = app.get(key, default)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[app].{key} must be a valid number") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"[app].{key} must be a finite number")
+        return value
+
+    window_checks = positive_integer("health.failure.window.checks", "20")
+    minimum_checks = positive_integer("health.failure.minimum.checks", "4")
+    if minimum_checks > window_checks:
+        raise ValueError(
+            "[app].health.failure.minimum.checks must be no greater than "
+            "[app].health.failure.window.checks"
+        )
+
+    failure_threshold = finite_number("health.failure.threshold", "0.5")
+    if not 0 < failure_threshold <= 1:
+        raise ValueError(
+            "[app].health.failure.threshold must be greater than 0 and at most 1"
+        )
+    positive_integer("health.max.diagnostic.components", "20")
+
+    kafka_degraded = finite_number("health.kafka.degraded.after.seconds", "60")
+    kafka_unhealthy = finite_number("health.kafka.unhealthy.after.seconds", "300")
+    kafka_interval = finite_number("check.interval.seconds", "15")
+    liveness_staleness = finite_number(
+        "liveness.scheduler.max.staleness.seconds", "10"
+    )
+    if liveness_staleness <= SCHEDULER_HEARTBEAT_INTERVAL_SECONDS:
+        raise ValueError(
+            "[app].liveness.scheduler.max.staleness.seconds must be greater "
+            "than the scheduler heartbeat interval"
+        )
+    if kafka_degraded <= kafka_interval:
+        raise ValueError(
+            "[app].health.kafka.degraded.after.seconds must be greater than "
+            "[app].check.interval.seconds"
+        )
+    if kafka_unhealthy <= kafka_degraded:
+        raise ValueError(
+            "[app].health.kafka.unhealthy.after.seconds must be greater than "
+            "[app].health.kafka.degraded.after.seconds"
+        )
+
+    sr_degraded = finite_number("health.sr.degraded.after.seconds", "120")
+    sr_unhealthy = finite_number("health.sr.unhealthy.after.seconds", "300")
+    sr_interval = finite_number("sr.check.interval.seconds", "60")
+    sr_timeout = finite_number("sr.check.timeout.seconds", "10")
+    if not 0 < sr_timeout < sr_interval:
+        raise ValueError(
+            "[app].sr.check.timeout.seconds must be greater than 0 and less than "
+            "[app].sr.check.interval.seconds"
+        )
+    if sr_degraded <= sr_interval:
+        raise ValueError(
+            "[app].health.sr.degraded.after.seconds must be greater than "
+            "[app].sr.check.interval.seconds"
+        )
+    if sr_unhealthy <= sr_degraded:
+        raise ValueError(
+            "[app].health.sr.unhealthy.after.seconds must be greater than "
+            "[app].health.sr.degraded.after.seconds"
+        )
 
     # Validate boolean settings (if present)
     boolean_settings = ['log.topic.enabled', 'metrics.ssl.enabled']

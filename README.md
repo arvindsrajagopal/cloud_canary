@@ -352,6 +352,7 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `check.interval.seconds` | `15` | Seconds to wait after one complete check cycle before starting the next. A cycle can take longer than this value, especially when partition count exceeds `max.workers`. |
 | `partition.sync.interval.seconds` | `86400` | How often to check for broker count changes and resize the topic. |
 | `sr.check.interval.seconds` | `60` | How often to run an independent Schema Registry health probe. |
+| `sr.check.timeout.seconds` | `10` | Maximum duration of startup and periodic Schema Registry probes. Must be greater than `0` and less than `sr.check.interval.seconds`. |
 | `metrics.port` | `8000` | TCP port for the Prometheus `/metrics` HTTP endpoint. |
 | `metrics.bind.address` | `0.0.0.0` | IP address to bind the metrics HTTP server to. Use `0.0.0.0` for all interfaces (default), `127.0.0.1` for localhost only, or a specific IP to bind to a single network interface. |
 | `metrics.ssl.enabled` | `false` | Enable HTTPS/TLS for the metrics endpoint. Requires `metrics.ssl.cert` and `metrics.ssl.key` to be configured. Useful for production environments where metrics contain sensitive labels. |
@@ -360,9 +361,8 @@ These keys are passed directly to the librdkafka client. Key names must match
 | `log.topic.enabled` | `false` | Set to `true` to publish all canary logs as JSON to a Kafka topic. |
 | `log.topic` | `cloud-canary-logs` | Topic name for log capture. Created automatically if enabled. |
 | `log.topic.retention.ms` | `604800000` | Log topic retention period in milliseconds (default: 7 days). |
-| `warmup.checks` | `2` | Number of initial checks whose E2E latency is measured but not recorded to `canary_e2e_latency_ms`. Suppresses cold-start inflation (TCP/TLS, metadata fetch, SR schema registration). Set to `0` to disable warmup and record all observations. |
+| `warmup.checks` | `2` | Number of initial completed attempts per partition treated as warmup and omitted from `canary_e2e_latency_ms`. After warmup, every expected partition must record a successful check before initial readiness. With `0`, each partition's first check is eligible as its post-warmup success and all observations are recorded. |
 | `max.workers` | `20` | Maximum number of concurrent worker threads for partition checks. Each thread uses ~8MB stack memory. Formula: `actual_workers = min(partition_count, max.workers)`. Increase for large clusters (100+ partitions) to reduce check cycle time. Typical values: 10-20 (small), 30-50 (large), 50-100 (huge clusters with spare memory). |
-| `metrics.partition.threshold` | `100` | **Cardinality control for large clusters.** When partition count exceeds this threshold, counters and gauges use `partition="*"` instead of per-partition labels. Set to `0` to always aggregate; increase the value (for example, `500`) to retain per-partition labels on larger clusters if Prometheus has sufficient memory. Latency histograms are always aggregated by host. |
 
 > **Canary topic retention** is fixed at **1 day (86400000 ms)** and is not configurable via `config.ini`. It is set at topic creation time. If the topic already exists, update it manually:
 > ```bash
@@ -547,10 +547,10 @@ aggregate by instance using this label:
 
 ```promql
 # Show only instance on host "us-east-canary"
-canary_consecutive_failures{host="us-east-canary"}
+canary_partition_consecutive_failures{host="us-east-canary"}
 
 # Compare consecutive failures across all instances
-canary_consecutive_failures
+canary_partition_consecutive_failures
 ```
 
 If multiple instances run on the same physical host with the same hostname, set a unique
@@ -599,26 +599,23 @@ metrics and rely on broker-level monitoring for partition-specific troubleshooti
 
 ### Counters
 
-**Cardinality Control**: When partition count exceeds `metrics.partition.threshold` (default: 100),
-the `partition` label uses `"*"` (aggregated) instead of individual partition numbers to prevent
-Prometheus cardinality explosion. Set `metrics.partition.threshold=0` to always use per-partition
-labels (not recommended for >100 partitions).
+Per-partition counters use numeric partition labels at every topology size. Their
+label sets are deliberately bounded so series count grows linearly.
 
 | Metric | Labels | Description |
 |---|---|---|
-| `canary_checks_total` | `result` (`success`\|`failure`), `host`, `partition` | Total check attempts. `partition` is per-partition number or `"*"` when count exceeds threshold |
-| `canary_failures_total` | `phase`, `category`, `host`, `partition` | Failed checks by phase, error category. `partition` is per-partition number or `"*"` when count exceeds threshold |
+| `canary_checks_total` | `host`, `result` (`success`\|`failure`) | Aggregate check attempts |
+| `canary_partition_checks_total` | `host`, `partition`, `result` (`success`\|`failure`) | Per-partition check attempts with bounded result values |
+| `canary_failures_total` | `host`, `phase`, `category`, `recoverability` | Aggregate failures by bounded classification |
 | `canary_sr_checks_total` | `result` (`success`\|`failure`), `host` | Schema Registry health check attempts |
 
 ### Gauges
 
-**Cardinality Control**: When partition count exceeds `metrics.partition.threshold` (default: 100),
-the `partition` label uses `"*"` (aggregated) instead of individual partition numbers.
-
 | Metric | Labels | Description |
 |---|---|---|
-| `canary_consecutive_failures` | `host`, `partition` | Current streak of consecutive failures. `partition` is per-partition number or `"*"` when count exceeds threshold — **primary alerting signal** |
-| `canary_last_success_timestamp_seconds` | `host`, `partition` | Unix timestamp of the last successful check. `partition` is per-partition number or `"*"` when count exceeds threshold — **staleness detection**. Alert when `(now - value) > threshold` to detect broken monitoring |
+| `canary_partition_consecutive_failures` | `host`, `partition` | Current streak of consecutive failures |
+| `canary_partition_last_success_timestamp_seconds` | `host`, `partition` | Unix timestamp of the last successful check |
+| `canary_partition_current_state` | `host`, `partition`, `state` | Current bounded health state; obsolete state children are removed |
 | `canary_broker_count` | `host` | Broker count as of the last partition sync |
 | `canary_topic_partition_count` | `host` | Canary topic partition count as of the last partition sync |
 | `canary_uptime_seconds` | `host` | Seconds since the canary process started |
@@ -631,22 +628,22 @@ the `partition` label uses `"*"` (aggregated) instead of individual partition nu
 sum(rate(canary_checks_total{result="success", host="my-host"}[5m]))
   / sum(rate(canary_checks_total{host="my-host"}[5m])) * 100
 
-# Check success rate across all instances (by partition if count < threshold)
-sum by (host, partition) (rate(canary_checks_total{result="success"}[5m]))
-  / sum by (host, partition) (rate(canary_checks_total[5m])) * 100
+# Check success rate across all instances by partition
+sum by (host, partition) (rate(canary_partition_checks_total{result="success"}[5m]))
+  / sum by (host, partition) (rate(canary_partition_checks_total[5m])) * 100
 
 # p95 end-to-end latency per host (partition labels not available on histograms)
 histogram_quantile(0.95, sum by (host, le) (rate(canary_e2e_latency_ms_bucket[5m])))
 
-# Failure rate by phase and category (by partition if count < threshold)
-sum by (host, partition, phase, category) (rate(canary_failures_total[5m]))
+# Aggregate failure rate by phase and category
+sum by (host, phase, category) (rate(canary_failures_total[5m]))
 
 # Alert: 3 or more consecutive failures on any partition of any instance
-canary_consecutive_failures >= 3
+canary_partition_consecutive_failures >= 3
 
 # Alert: Canary monitoring is stale (no successful check in 5+ minutes)
 # Detects when the canary process itself is stuck or stopped
-(time() - canary_last_success_timestamp_seconds) > 300
+(time() - canary_partition_last_success_timestamp_seconds) > 300
 ```
 
 ---
@@ -711,29 +708,41 @@ readinessProbe:
 
 ### `/ready` — Readiness Probe
 
-**Purpose**: Determine if the application is ready to serve traffic.
+**Purpose**: Determine whether initial Schema Registry validation and
+per-partition warmup are complete.
 
 **Returns**:
-- `200 OK` — Ready (warmup complete, checks passing)
-- `503 Service Unavailable` — Not Ready (still warming up or unhealthy)
+- `200 OK` — Ready (initial Schema Registry validation and partition checks completed)
+- `503 Service Unavailable` — Not ready (initialization is incomplete)
 
 **Response Format**:
 ```json
 {
   "status": "ready",
   "timestamp": "2026-03-27T20:00:00Z",
-  "message": "Ready - warmup complete and checks passing",
+  "message": "Ready - all partitions passed a post-warmup check",
   "checks": {
-    "warmup_complete": true,
-    "check_sequence": 10,
-    "staleness_seconds": 15.2
+    "schema_registry_validated": true,
+    "incomplete_partitions": [],
+    "warmup_remaining": {}
   }
 }
 ```
 
 **Status Determination**:
-- **READY** (200): Warmup complete + recent successful checks
-- **NOT_READY** (503): Warmup in progress or no recent successes
+- Before readiness is first achieved, **READY** requires successful initial
+  Schema Registry validation and a successful post-warmup check from every
+  expected Kafka partition. Exactly the first
+  `warmup.checks` completed attempts for each partition are warmup; completing
+  them alone is not sufficient. With `warmup.checks=0`, that partition's first
+  successful check can satisfy the post-warmup requirement.
+- `incomplete_partitions` and `warmup_remaining` identify initialization work
+  still outstanding. A failed eligible check leaves its
+  partition incomplete until a later check succeeds.
+- Once achieved, readiness remains latched across external Kafka or Schema
+  Registry failures; those failures are reported by `/health`. Adding an
+  expected partition makes readiness incomplete until that partition succeeds
+  after its own warmup attempts.
 
 **Usage**:
 ```bash
@@ -755,7 +764,7 @@ readinessProbe:
 |----------|---------|----------|
 | `/metrics` | Prometheus metrics exposition | Monitoring, alerting, dashboards |
 | `/health` | Kafka dependency-health summary | Monitoring and alerting; returns 503 for degraded dependencies |
-| `/ready` | Prototype readiness check | Reports ready after 10 check cycles and a recent success |
+| `/ready` | Initialization probe | Gates startup on initial Schema Registry validation and every partition's successful post-warmup check; external dependency failures are reported by `/health` after readiness latches |
 
 ---
 

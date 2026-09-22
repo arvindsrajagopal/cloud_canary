@@ -35,13 +35,26 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(24, len(plan["tasks"]))
+        self.assertEqual(53, len(plan["tasks"]))
+        self.assertEqual("active", plan["execution_status"])
+        self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
         expected_count = plan["completion_criteria_count"]
         covered = []
         for task in plan["tasks"]:
-            start, end = task["criteria_range"]
-            self.assertLessEqual(start, end, task["id"])
-            self.assertLessEqual(end - start + 1, 5, task["id"])
+            criteria_range = task["criteria_range"]
+            if criteria_range is None:
+                conditions = task.get("acceptance_conditions")
+                self.assertIsInstance(conditions, list, task["id"])
+                self.assertTrue(conditions, task["id"])
+                self.assertTrue(
+                    all(isinstance(condition, str) and condition.strip() for condition in conditions),
+                    task["id"],
+                )
+            else:
+                start, end = criteria_range
+                self.assertLessEqual(start, end, task["id"])
+                self.assertLessEqual(end - start + 1, 5, task["id"])
+                covered.extend(range(start, end + 1))
             self.assertTrue(task["spec_sections"], task["id"])
             self.assertIn("development_reference_sections", task, task["id"])
             self.assertTrue(
@@ -51,7 +64,6 @@ class SpecificationCoverageTests(unittest.TestCase):
                 ),
                 task["id"],
             )
-            covered.extend(range(start, end + 1))
         self.assertEqual(list(range(1, expected_count + 1)), sorted(covered))
         self.assertEqual(len(covered), len(set(covered)))
 
@@ -101,6 +113,73 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertIn("does not add or change Cloud Canary requirements", reference)
         self.assertIn("https://docs.confluent.io/", reference)
 
+    def test_shutdown_policy_distinguishes_cooperative_and_wedged_workers(self):
+        specification = (ROOT / "SPEC.md").read_text(encoding="utf-8")
+        normalized_specification = " ".join(specification.split())
+        self.assertIn(
+            "releases ownership by the shutdown deadline", normalized_specification
+        )
+        self.assertIn(
+            "must not have its consumer closed concurrently", normalized_specification
+        )
+        self.assertIn("daemon execution boundary", normalized_specification)
+
+    def test_shutdown_publication_defines_atomic_claim_semantics(self):
+        specification = " ".join((ROOT / "SPEC.md").read_text(encoding="utf-8").split())
+        self.assertIn("atomic, first-write-wins publication claim", specification)
+        self.assertIn("state allocated before signal delivery", specification)
+        self.assertIn("is not considered published", specification)
+
+    def test_shutdown_task_defers_endpoint_availability_to_r28(self):
+        plan = _load_json("ralph/tasks.json")
+        r07 = next(task for task in plan["tasks"] if task["id"] == "R07")
+        r28 = next(task for task in plan["tasks"] if task["id"] == "R28")
+        self.assertNotIn("6.1", r07["spec_sections"])
+        self.assertIn("6.1", r28["spec_sections"])
+
+    def test_shutdown_integration_owns_two_phase_cleanup_regressions(self):
+        plan = _load_json("ralph/tasks.json")
+        r07 = next(task for task in plan["tasks"] if task["id"] == "R07")
+        self.assertEqual(
+            {
+                "src/main.py",
+                "tests/integration/test_bounded_shutdown.py",
+                "tests/unit/test_execution_lanes.py",
+                "tests/unit/test_topic_reconciliation.py",
+            },
+            set(r07["allowed_paths"]),
+        )
+
+    def test_liveness_phase_is_split_by_ownership_boundary(self):
+        plan = _load_json("ralph/tasks.json")
+        tasks = {task["id"]: task for task in plan["tasks"]}
+        self.assertIsNone(tasks["R85"]["criteria_range"])
+        self.assertIsNone(tasks["R86"]["criteria_range"])
+        self.assertIsNone(tasks["R87"]["criteria_range"])
+        self.assertIsNone(tasks["R88"]["criteria_range"])
+        self.assertEqual(["R88"], tasks["R28"]["depends_on"])
+        self.assertEqual([33, 34], tasks["R28"]["criteria_range"])
+        self.assertEqual([35, 35], tasks["R35"]["criteria_range"])
+        self.assertEqual([36, 37], tasks["R36"]["criteria_range"])
+        self.assertEqual([38, 38], tasks["R37"]["criteria_range"])
+        self.assertEqual([39, 39], tasks["R38"]["criteria_range"])
+        self.assertEqual([40, 40], tasks["R39"]["criteria_range"])
+        self.assertEqual([41, 42], tasks["R40"]["criteria_range"])
+        self.assertEqual([43, 43], tasks["R41"]["criteria_range"])
+        self.assertIsNone(tasks["R89"]["criteria_range"])
+        self.assertEqual([44, 44], tasks["R42"]["criteria_range"])
+        self.assertEqual([45, 45], tasks["R43"]["criteria_range"])
+        self.assertIsNone(tasks["R90"]["criteria_range"])
+        self.assertEqual([46, 47], tasks["R44"]["criteria_range"])
+        self.assertEqual([48, 48], tasks["R45"]["criteria_range"])
+        self.assertEqual([49, 50], tasks["R46"]["criteria_range"])
+        self.assertIsNone(tasks["R91"]["criteria_range"])
+        self.assertIsNone(tasks["R92"]["criteria_range"])
+        self.assertIsNone(tasks["R93"]["criteria_range"])
+        self.assertIsNone(tasks["R94"]["criteria_range"])
+        self.assertEqual(["R93"], tasks["R11"]["depends_on"])
+        self.assertTrue(tasks["R11"]["requires_replan"])
+
 
 class PromptAndReviewContractTests(unittest.TestCase):
     def test_implementation_prompt_has_required_tokens_and_safety_stops(self):
@@ -112,6 +191,7 @@ class PromptAndReviewContractTests(unittest.TestCase):
             "{{ATTEMPT}}",
             "{{MAX_ATTEMPTS}}",
             "{{FEEDBACK}}",
+            "{{DECISION_LEDGER}}",
         ):
             self.assertIn(token, prompt)
         for phrase in (
@@ -131,8 +211,37 @@ class PromptAndReviewContractTests(unittest.TestCase):
             "{{CHANGED_FILES}}",
             "{{PATCH_PATH}}",
             "{{QUALITY_EVIDENCE}}",
+            "{{DECISION_LEDGER}}",
+            "{{PRIOR_FINDINGS}}",
+            "{{REVIEW_CYCLE}}",
         ):
             self.assertIn(token, raw_prompt)
+
+    def test_review_prompts_enforce_full_patch_spec_and_ownership_review(self):
+        plan = _load_json("ralph/tasks.json")
+        self.assertEqual("active", plan["execution_status"])
+        active_task_ids = set(plan["execution_order"])
+        self.assertEqual(
+            active_task_ids,
+            {task["id"] for task in plan["tasks"]},
+        )
+
+        expected_patch_phrases = {
+            "ralph/review-prompt.md": "complete isolated patch",
+            "ralph/milestone-review-prompt.md": "complete cumulative patch",
+        }
+        for relative_path, patch_phrase in expected_patch_phrases.items():
+            prompt = " ".join((ROOT / relative_path).read_text(encoding="utf-8").split())
+            with self.subTest(prompt=relative_path):
+                self.assertIn(patch_phrase, prompt)
+                self.assertIn("latest correction", prompt)
+                self.assertIn("trace it to production callers", prompt)
+                self.assertIn("specific pending", prompt)
+                self.assertIn("active execution plan in `ralph/tasks.json`", prompt)
+                self.assertIn("independently", prompt)
+                self.assertIn("do not prove", prompt)
+                self.assertIn("`FUTURE_TASK`", prompt)
+                self.assertIn("pending task identifier", prompt)
 
     def test_milestone_review_prompt_requires_cumulative_integration_review(self):
         prompt = (ROOT / "ralph/milestone-review-prompt.md").read_text(
@@ -146,6 +255,9 @@ class PromptAndReviewContractTests(unittest.TestCase):
         ):
             self.assertIn(token, prompt)
         self.assertIn("conflicts between tasks", prompt)
+        self.assertIn("strictly limited", prompt)
+        self.assertIn("future acceptance criteria must not block", prompt)
+        self.assertIn("directly prevents a future criterion", prompt)
 
     def test_review_schema_requires_all_categories(self):
         schema = _load_json("ralph/review-schema.json")
@@ -156,6 +268,18 @@ class PromptAndReviewContractTests(unittest.TestCase):
             ["PASS", "FAIL", "HUMAN_REQUIRED"],
             schema["properties"]["verdict"]["enum"],
         )
+        finding = schema["$defs"]["category"]["properties"]["findings"]["items"]
+        self.assertIn("classification", finding["required"])
+        self.assertEqual(
+            {
+                "BLOCKER_CURRENT_TASK",
+                "INTRODUCED_REGRESSION",
+                "FUTURE_TASK",
+                "SPEC_GAP",
+                "NON_BLOCKING_IMPROVEMENT",
+            },
+            set(finding["properties"]["classification"]["enum"]),
+        )
 
     def test_implementation_schema_requires_bounded_structured_output(self):
         schema = _load_json("ralph/implementation-schema.json")
@@ -164,7 +288,7 @@ class PromptAndReviewContractTests(unittest.TestCase):
             {"COMPLETE", "HUMAN_REQUIRED", "BLOCKED"},
             set(schema["properties"]["status"]["enum"]),
         )
-        self.assertEqual(12, schema["properties"]["changed_files"]["maxItems"])
+        self.assertEqual(4, schema["properties"]["changed_files"]["maxItems"])
 
 
 if __name__ == "__main__":

@@ -23,6 +23,21 @@ def _review(verdict="PASS", human=False):
     }
 
 
+def _finding(classification="BLOCKER_CURRENT_TASK", severity="HIGH", **overrides):
+    finding = {
+        "classification": classification,
+        "severity": severity,
+        "file": "src/main.py",
+        "line": 1,
+        "message": "unsafe",
+        "recommendation": "fix it",
+        "future_task": None,
+        "novelty_explanation": None,
+    }
+    finding.update(overrides)
+    return finding
+
+
 class ScopeTests(unittest.TestCase):
     def test_allowed_paths_support_files_and_directories(self):
         self.assertTrue(ralph._path_allowed("src/main.py", ["src/"]))
@@ -58,24 +73,50 @@ class ReviewGateTests(unittest.TestCase):
     def test_failed_category_blocks_review(self):
         review = _review()
         review["verdict"] = "FAIL"
-        review["categories"]["security"] = _category("FAIL")
+        review["categories"]["security"] = _category("FAIL", [_finding()])
         passed, detail = ralph._validate_review(review)
         self.assertFalse(passed)
         self.assertIn("security", detail)
 
     def test_high_finding_blocks_even_if_category_is_warning(self):
-        finding = {
-            "severity": "HIGH",
-            "file": "src/main.py",
-            "line": 1,
-            "message": "unsafe",
-            "recommendation": "fix it",
-        }
+        finding = _finding()
         review = _review()
         review["categories"]["security"] = _category("WARN", [finding])
         passed, detail = ralph._validate_review(review)
         self.assertFalse(passed)
         self.assertIn("HIGH", detail)
+
+    def test_medium_current_task_finding_is_auto_accepted(self):
+        review = _review("FAIL")
+        review["categories"]["performance"] = _category(
+            "FAIL", [_finding(severity="MEDIUM")]
+        )
+        passed, detail = ralph._validate_review(review)
+        self.assertTrue(passed)
+        self.assertIn("Auto-accepted minor findings", detail)
+
+    def test_future_task_finding_does_not_block(self):
+        review = _review()
+        review["categories"]["architecture"] = _category(
+            "WARN",
+            [_finding("FUTURE_TASK", future_task="R28")],
+        )
+        passed, _detail = ralph._validate_review(review)
+        self.assertTrue(passed)
+
+    def test_specification_gap_requires_human(self):
+        review = _review("HUMAN_REQUIRED", human=True)
+        review["categories"]["architecture"] = _category(
+            "WARN", [_finding("SPEC_GAP")]
+        )
+        with self.assertRaises(ralph.HumanIntervention):
+            ralph._validate_review(review)
+
+    def test_second_review_blocker_requires_novelty_explanation(self):
+        review = _review("FAIL")
+        review["categories"]["architecture"] = _category("FAIL", [_finding()])
+        with self.assertRaises(ralph.HumanIntervention):
+            ralph._validate_review(review, review_cycle=2)
 
     def test_human_review_stops_loop(self):
         with self.assertRaises(ralph.HumanIntervention):
@@ -103,6 +144,15 @@ class ContextControlTests(unittest.TestCase):
         self.assertTrue(criteria.startswith("1. "))
         self.assertIn("5. ", criteria)
         self.assertNotIn("6. ", criteria)
+
+    def test_support_task_uses_explicit_acceptance_conditions(self):
+        task = next(
+            task for task in ralph._load_plan()["tasks"] if task["id"] == "R29"
+        )
+        criteria = ralph._criteria_text(task)
+        self.assertTrue(criteria.startswith("Support acceptance: "))
+        self.assertIn("first state-mutating operation", criteria)
+        self.assertIn("preallocated state", criteria)
 
     def test_implementation_report_requires_exact_structure(self):
         report = {
@@ -173,6 +223,11 @@ class PlanAndPromptTests(unittest.TestCase):
         with self.assertRaises(ralph.HumanIntervention):
             ralph._select_task(plan, state, "R02")
 
+    def test_next_broad_phase_is_an_explicit_replan_gate(self):
+        plan = ralph._load_plan()
+        task = next(task for task in plan["tasks"] if task["id"] == "R11")
+        self.assertTrue(task["requires_replan"])
+
     def test_state_completion_must_be_an_execution_order_prefix(self):
         plan = ralph._load_plan()
         state = {
@@ -210,10 +265,11 @@ class PlanAndPromptTests(unittest.TestCase):
         self.assertNotIn("{{TASK_JSON}}", rendered)
 
     def test_task_cannot_pass_before_declared_tests_exist(self):
-        task = ralph._load_plan()["tasks"][0]
+        missing_test = "tests/unit/definitely_missing_declared_test.py"
+        task = {"test_files": [missing_test]}
         passed, detail = ralph._declared_tests_exist(task)
         self.assertFalse(passed)
-        self.assertIn("tests/unit/test_partition_health.py", detail)
+        self.assertIn(missing_test, detail)
 
 
 if __name__ == "__main__":

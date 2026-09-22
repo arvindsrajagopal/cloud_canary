@@ -35,7 +35,21 @@ consumer.timeout.seconds=5
 check.interval.seconds=15
 partition.sync.interval.seconds=86400
 sr.check.interval.seconds=60
+sr.check.timeout.seconds=10
 warmup.checks=2
+
+# Current dependency health uses bounded, process-local rolling windows.
+health.failure.window.checks=20
+health.failure.minimum.checks=4
+health.failure.threshold=0.5
+health.max.diagnostic.components=20
+health.kafka.degraded.after.seconds=60
+health.kafka.unhealthy.after.seconds=300
+health.sr.degraded.after.seconds=120
+health.sr.unhealthy.after.seconds=300
+
+# Must exceed the scheduler's normal one-second heartbeat interval.
+liveness.scheduler.max.staleness.seconds=10
 
 # Instance identification — defaults to hostname if not set.
 # Set CANARY_INSTANCE_ID environment variable to override when running multiple
@@ -52,15 +66,6 @@ metrics.ssl.enabled=false
 #metrics.ssl.cert=/path/to/cert.pem
 # Path to SSL private key file (PEM format, required if ssl.enabled=true)
 #metrics.ssl.key=/path/to/key.pem
-
-# Metrics cardinality control for large clusters
-# metrics.partition.threshold controls when to disable per-partition labels
-# When partition count > threshold, metrics use aggregated labels to prevent
-# Prometheus cardinality explosion (100 partitions = 2,200+ time series per host)
-# Default: 100 (good for most deployments)
-# Set to 0 to always aggregate counters and gauges with partition="*"
-# Set higher (e.g., 500) to keep granularity on larger clusters (requires more Prometheus memory)
-metrics.partition.threshold=100
 
 # Concurrency configuration
 # max.workers controls the maximum number of concurrent threads for partition checks

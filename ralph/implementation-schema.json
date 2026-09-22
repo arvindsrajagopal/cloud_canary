@@ -6,7 +6,7 @@
   "properties": {
     "status": {"type": "string", "enum": ["COMPLETE", "HUMAN_REQUIRED", "BLOCKED"]},
     "summary": {"type": "string", "maxLength": 2000},
-    "changed_files": {"type": "array", "maxItems": 12, "items": {"type": "string", "maxLength": 500}},
+    "changed_files": {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 500}},
     "tests_added_or_updated": {"type": "array", "maxItems": 30, "items": {"type": "string", "maxLength": 500}},
     "tests_run": {"type": "array", "maxItems": 30, "items": {"type": "string", "maxLength": 1000}},
     "assumptions": {"type": "array", "maxItems": 20, "items": {"type": "string", "maxLength": 1000}},

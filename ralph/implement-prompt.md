@@ -27,6 +27,13 @@ Assigned acceptance criteria copied from `SPEC.md`:
 {{CRITERIA_TEXT}}
 ```
 
+Frozen decisions. Follow them unless they directly contradict `SPEC.md`, in
+which case stop with `HUMAN_REQUIRED` and cite the conflict:
+
+```json
+{{DECISION_LEDGER}}
+```
+
 Attempt: `{{ATTEMPT}}` of `{{MAX_ATTEMPTS}}`
 
 Previous failure or review feedback:
@@ -46,7 +53,7 @@ Required workflow:
 5. Preserve unrelated user changes and do not edit outside `allowed_paths`.
 6. Run the narrowest relevant tests. The outer Ralph runner will independently
    run the complete quality gate afterward.
-7. Keep the change within 12 files and 1,200 diff lines. If the coherent task
+7. Keep the change within 4 files and 500 diff lines. If the coherent task
    cannot fit, request that a human split or revise the task.
 8. If the task requires an architectural choice absent from `SPEC.md`, a secret,
    a dependency change, external network access, destructive action, or a scope

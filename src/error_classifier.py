@@ -13,14 +13,37 @@
 #   • BROKER errors (4xx/5xx from the broker) indicate cluster-side conditions
 #     such as ISR degradation, quota violations, or broker overload.
 #
-# The classification relies on librdkafka's error code sign convention:
-#   Negative codes  →  client-local / transport-level errors  →  NETWORK
-#   Positive codes  →  broker-returned protocol errors         →  BROKER
+# Classification starts with librdkafka's typed error code.  Negative codes
+# are client-local, but only a subset are transport failures; positive codes
+# are broker protocol responses unless they carry stronger security semantics.
 # ---------------------------------------------------------------------------
 
+import re
+import ssl
+from dataclasses import dataclass, fields
 from enum import Enum
+from typing import Optional
 
 from confluent_kafka import KafkaError, KafkaException
+
+_INVALID_SR_CONFIG_EXCEPTIONS: tuple[type[BaseException], ...] = ()
+_SR_TRANSPORT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    ConnectionError, TimeoutError,
+)
+try:
+    from requests.exceptions import InvalidSchema, InvalidURL, MissingSchema
+    _INVALID_SR_CONFIG_EXCEPTIONS += (InvalidSchema, InvalidURL, MissingSchema)
+except ImportError:  # pragma: no cover - requests is an SR client dependency
+    pass
+
+try:
+    from httpx import TransportError
+    from httpx import InvalidURL as HttpxInvalidURL
+    from httpx import UnsupportedProtocol
+    _INVALID_SR_CONFIG_EXCEPTIONS += (HttpxInvalidURL, UnsupportedProtocol)
+    _SR_TRANSPORT_EXCEPTIONS += (TransportError,)
+except ImportError:  # pragma: no cover - supported for older SR client releases
+    pass
 
 
 class Phase(str, Enum):
@@ -58,6 +81,19 @@ class Phase(str, Enum):
     SEEK            = "SEEK"
     PRODUCE         = "PRODUCE"
     CONSUME         = "CONSUME"
+    METADATA_FETCH  = "METADATA_FETCH"
+    TOPIC_CREATE    = "TOPIC_CREATE"
+    TOPIC_EXPAND    = "TOPIC_EXPAND"
+    TOPIC_DELETE    = "TOPIC_DELETE"
+    TOPIC_VERIFY    = "TOPIC_VERIFY"
+    CONSUMER_CREATE = "CONSUMER_CREATE"
+    CONSUMER_REPLACE = "CONSUMER_REPLACE"
+    SCHEDULER       = "SCHEDULER"
+    STATE_UPDATE    = "STATE_UPDATE"
+    HTTP_REQUEST    = "HTTP_REQUEST"
+    STARTUP         = "STARTUP"
+    SHUTDOWN        = "SHUTDOWN"
+    UNKNOWN         = "UNKNOWN"
 
 
 class ErrorCategory(str, Enum):
@@ -68,7 +104,7 @@ class ErrorCategory(str, Enum):
         The client could not reach the endpoint at the TCP/DNS/TLS layer.
         Examples: broker unreachable, DNS failure, expired TLS certificate.
 
-    BROKER
+    BROKER_SERVICE
         The broker received the request but returned an error response.
         Examples: leader not available, message too large, quota exceeded.
 
@@ -77,98 +113,321 @@ class ErrorCategory(str, Enum):
         avoid silently dropping classification data.
     """
     NETWORK = "NETWORK"
-    BROKER  = "BROKER"
+    BROKER_SERVICE = "BROKER_SERVICE"
+    AUTHENTICATION = "AUTHENTICATION"
+    AUTHORIZATION = "AUTHORIZATION"
+    TLS_CERTIFICATE = "TLS_CERTIFICATE"
+    CONFIGURATION = "CONFIGURATION"
+    SERIALIZATION = "SERIALIZATION"
+    CLIENT_STATE = "CLIENT_STATE"
+    CAPACITY = "CAPACITY"
+    INTERNAL = "INTERNAL"
+    UNKNOWN = "UNKNOWN"
+
+    # Compatibility for pre-descriptor call sites; aliases do not add a value
+    # when the enum is iterated or serialized.
+    BROKER = BROKER_SERVICE
+
+
+class FailureComponent(str, Enum):
+    KAFKA_PARTITION = "KAFKA_PARTITION"
+    SCHEMA_REGISTRY = "SCHEMA_REGISTRY"
+    TOPIC_ADMINISTRATION = "TOPIC_ADMINISTRATION"
+    SCHEDULER = "SCHEDULER"
+    HTTP_SERVER = "HTTP_SERVER"
+    INTERNAL_STATE = "INTERNAL_STATE"
+
+
+class Recoverability(str, Enum):
+    TRANSIENT = "TRANSIENT"
+    DETERMINISTIC = "DETERMINISTIC"
+    INTERNAL_FATAL = "INTERNAL_FATAL"
     UNKNOWN = "UNKNOWN"
 
 
-# Explicit set of librdkafka error codes that unambiguously indicate a
-# client-side / transport failure.  All of these have negative values.
-# Other negative codes (e.g. _TIMED_OUT) are also treated as NETWORK because
-# they originate on the client before any broker response is received.
-_NETWORK_CODES = frozenset({
-    KafkaError._TRANSPORT,        # TCP connection failure or loss
-    KafkaError._ALL_BROKERS_DOWN, # No bootstrap broker is reachable
-    KafkaError._RESOLVE,          # DNS resolution failed for the bootstrap address
-    KafkaError._SSL,              # TLS/SSL handshake failed
-})
+MAX_SAFE_SUMMARY_LENGTH = 512
+MAX_STABLE_CODE_LENGTH = 128
+
+_STABLE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
 
 
-def classify_kafka_error(err: KafkaError) -> ErrorCategory:
-    """
-    Map a librdkafka KafkaError to an ErrorCategory.
+class FailureSummary(str, Enum):
+    """Provenance-safe summaries that never incorporate dependency data."""
 
-    librdkafka uses a signed integer error code space:
-      Negative values  →  client-generated (local/transport)
-      Positive values  →  broker protocol error codes (Kafka protocol spec)
+    OPERATION_FAILED = "Operation failed"
+    OPERATION_TIMED_OUT = "Operation timed out"
+    DEPENDENCY_UNAVAILABLE = "Dependency unavailable"
+    INVALID_CONFIGURATION = "Invalid configuration"
+    CAPACITY_EXHAUSTED = "Capacity exhausted"
+    INTERNAL_FAILURE = "Internal failure"
 
-    Parameters
-    ----------
-    err : KafkaError
-        The error object extracted from a KafkaException or a message's
-        error() field.
 
-    Returns
-    -------
-    ErrorCategory
-        NETWORK for transport-level failures, BROKER for protocol errors.
-    """
+def sanitize_failure_summary(summary: FailureSummary) -> str:
+    """Render a deterministic bounded summary from an allowlisted template."""
+    if not isinstance(summary, FailureSummary):
+        raise TypeError("summary must be a FailureSummary template")
+    return " ".join(summary.value.split())[:MAX_SAFE_SUMMARY_LENGTH]
+
+
+@dataclass(frozen=True, slots=True)
+class FailureDescriptor:
+    component: FailureComponent
+    phase: Phase
+    category: ErrorCategory
+    recoverability: Recoverability
+    code: Optional[str]
+    safe_summary: FailureSummary
+
+    def __post_init__(self) -> None:
+        for field_name, enum_type in (
+            ("component", FailureComponent),
+            ("phase", Phase),
+            ("category", ErrorCategory),
+            ("recoverability", Recoverability),
+        ):
+            if not isinstance(getattr(self, field_name), enum_type):
+                raise TypeError(f"{field_name} must be a {enum_type.__name__}")
+
+        if self.code is not None:
+            if not isinstance(self.code, str):
+                raise TypeError("code must be a string or None")
+            if (
+                len(self.code) > MAX_STABLE_CODE_LENGTH
+                or _STABLE_CODE.fullmatch(self.code) is None
+            ):
+                raise ValueError("code must be a bounded stable identifier")
+
+        object.__setattr__(
+            self,
+            "safe_summary",
+            sanitize_failure_summary(self.safe_summary),
+        )
+
+        # Keep the retained descriptor schema explicit and closed.
+        if tuple(field.name for field in fields(self)) != (
+            "component",
+            "phase",
+            "category",
+            "recoverability",
+            "code",
+            "safe_summary",
+        ):  # pragma: no cover - guards future edits
+            raise TypeError("unexpected FailureDescriptor field")
+
+
+def _kafka_codes(*names: str) -> frozenset[int]:
+    """Resolve codes supported by the installed librdkafka binding."""
+    return frozenset(
+        value
+        for name in names
+        if isinstance((value := getattr(KafkaError, name, None)), int)
+    )
+
+
+_NETWORK_CODES = _kafka_codes(
+    "_TRANSPORT", "_ALL_BROKERS_DOWN", "_RESOLVE", "_TIMED_OUT",
+    "_TIMED_OUT_QUEUE", "_MSG_TIMED_OUT", "NETWORK_EXCEPTION",
+)
+_TLS_CODES = _kafka_codes("_SSL")
+_AUTHENTICATION_CODES = _kafka_codes(
+    "_AUTHENTICATION", "SASL_AUTHENTICATION_FAILED",
+    "UNACCEPTABLE_CREDENTIAL",
+)
+_AUTHORIZATION_CODES = _kafka_codes(
+    "CLUSTER_AUTHORIZATION_FAILED", "DELEGATION_TOKEN_AUTHORIZATION_FAILED",
+    "GROUP_AUTHORIZATION_FAILED", "TOPIC_AUTHORIZATION_FAILED",
+    "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+)
+_SERIALIZATION_CODES = _kafka_codes(
+    "_KEY_SERIALIZATION", "_VALUE_SERIALIZATION", "_KEY_DESERIALIZATION",
+    "_VALUE_DESERIALIZATION", "_BAD_MSG", "_BAD_COMPRESSION",
+)
+_CONFIGURATION_CODES = _kafka_codes(
+    "_INVALID_ARG", "_INVALID_TYPE", "_NOT_CONFIGURED",
+    "_UNKNOWN_PROTOCOL", "_UNSUPPORTED_FEATURE", "INVALID_CONFIG",
+)
+_CAPACITY_CODES = _kafka_codes("_QUEUE_FULL", "_CRIT_SYS_RESOURCE")
+_CLIENT_STATE_CODES = _kafka_codes(
+    "_STATE", "_ASSIGNMENT_LOST", "_EXISTING_SUBSCRIPTION", "_FENCED",
+    "_IN_PROGRESS", "_MAX_POLL_EXCEEDED", "_NO_OFFSET",
+    "_PREV_IN_PROGRESS", "_PURGE_INFLIGHT", "_PURGE_QUEUE",
+    "_READ_ONLY", "_REVOKE_PARTITIONS", "_UNKNOWN_GROUP",
+    "_UNKNOWN_PARTITION", "_UNKNOWN_TOPIC",
+)
+
+
+def _kafka_category(code: int) -> ErrorCategory:
+    """Map a typed librdkafka code without consulting exception text."""
+    for codes, category in (
+        (_NETWORK_CODES, ErrorCategory.NETWORK),
+        (_TLS_CODES, ErrorCategory.TLS_CERTIFICATE),
+        (_AUTHENTICATION_CODES, ErrorCategory.AUTHENTICATION),
+        (_AUTHORIZATION_CODES, ErrorCategory.AUTHORIZATION),
+        (_SERIALIZATION_CODES, ErrorCategory.SERIALIZATION),
+        (_CONFIGURATION_CODES, ErrorCategory.CONFIGURATION),
+        (_CAPACITY_CODES, ErrorCategory.CAPACITY),
+        (_CLIENT_STATE_CODES, ErrorCategory.CLIENT_STATE),
+    ):
+        if code in codes:
+            return category
+    if code >= 0:
+        return ErrorCategory.BROKER_SERVICE
+    return ErrorCategory.UNKNOWN
+
+
+def classify_kafka_error(
+    err: KafkaError,
+    *,
+    phase: Phase,
+    component: FailureComponent = FailureComponent.KAFKA_PARTITION,
+) -> FailureDescriptor:
+    """Build a bounded descriptor from a typed Kafka error at its boundary."""
     code = err.code()
+    category = _kafka_category(code)
+    recoverability = {
+        ErrorCategory.AUTHENTICATION: Recoverability.DETERMINISTIC,
+        ErrorCategory.AUTHORIZATION: Recoverability.DETERMINISTIC,
+        ErrorCategory.TLS_CERTIFICATE: Recoverability.DETERMINISTIC,
+        ErrorCategory.CONFIGURATION: Recoverability.DETERMINISTIC,
+        ErrorCategory.SERIALIZATION: Recoverability.INTERNAL_FATAL,
+        ErrorCategory.UNKNOWN: Recoverability.UNKNOWN,
+    }.get(category, Recoverability.TRANSIENT)
+    summary = {
+        ErrorCategory.NETWORK: FailureSummary.DEPENDENCY_UNAVAILABLE,
+        ErrorCategory.BROKER_SERVICE: FailureSummary.DEPENDENCY_UNAVAILABLE,
+        ErrorCategory.CONFIGURATION: FailureSummary.INVALID_CONFIGURATION,
+        ErrorCategory.CAPACITY: FailureSummary.CAPACITY_EXHAUSTED,
+        ErrorCategory.SERIALIZATION: FailureSummary.INTERNAL_FAILURE,
+    }.get(category, FailureSummary.OPERATION_FAILED)
+    try:
+        code_name = err.name()
+    except (AttributeError, TypeError):
+        code_name = str(code)
+    stable_code = f"KAFKA.{code_name}"
 
-    # Named network codes take priority for readability in logs/metrics.
-    if code in _NETWORK_CODES:
-        return ErrorCategory.NETWORK
+    return FailureDescriptor(
+        component=component,
+        phase=phase,
+        category=category,
+        recoverability=recoverability,
+        code=stable_code,
+        safe_summary=summary,
+    )
 
-    # Any other negative code is still a client-side (local) error.
-    # For example, _TIMED_OUT (-185) means the client gave up waiting
-    # for a broker response — this is still transport-level behaviour.
-    if code < 0:
-        return ErrorCategory.NETWORK
 
-    # Positive codes are sent by the broker in its response, meaning the
-    # message reached the broker but the broker rejected or failed to
-    # process it (e.g. UNKNOWN_TOPIC_OR_PART, NOT_LEADER_OR_FOLLOWER).
-    return ErrorCategory.BROKER
+_SR_CONFIGURATION_HTTP_STATUSES = frozenset((400, 405, 409, 422))
+_SR_TRANSIENT_HTTP_STATUSES = frozenset((408, 425, 429))
+
+
+def _sr_exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    """Return a bounded exception chain without inspecting exception text."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    while pending and len(chain) < 16:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        chain.append(current)
+        related = (current.__cause__, current.__context__,
+                   getattr(current, "reason", None), *current.args)
+        pending.extend(item for item in related if isinstance(item, BaseException))
+    return tuple(chain)
+
+
+def _sr_http_data(
+    chain: tuple[BaseException, ...],
+) -> tuple[Optional[int], Optional[int]]:
+    """Extract bounded typed HTTP and SR codes, preferring the nearest error."""
+    for current in chain:
+        status = getattr(current, "http_status_code", None)
+        if not isinstance(status, int):
+            status = getattr(current, "status_code", None)
+        if not isinstance(status, int):
+            response = getattr(current, "response", None)
+            status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 100 <= status <= 599:
+            error_code = getattr(current, "error_code", None)
+            return status, error_code if isinstance(error_code, int) else None
+    return None, None
+
+
+def classify_schema_registry_error(exc: Exception) -> FailureDescriptor:
+    """Build a bounded descriptor from typed Schema Registry failure data."""
+    chain = _sr_exception_chain(exc)
+    status, sr_code = _sr_http_data(chain)
+
+    if status is not None:
+        if status in (401, 403):
+            category = (
+                ErrorCategory.AUTHENTICATION if status == 401
+                else ErrorCategory.AUTHORIZATION
+            )
+            recoverability = Recoverability.DETERMINISTIC
+        elif status in _SR_CONFIGURATION_HTTP_STATUSES:
+            category = ErrorCategory.CONFIGURATION
+            recoverability = Recoverability.DETERMINISTIC
+        else:
+            category = ErrorCategory.BROKER_SERVICE
+            recoverability = (
+                Recoverability.TRANSIENT
+                if status >= 500 or status in _SR_TRANSIENT_HTTP_STATUSES
+                else Recoverability.UNKNOWN
+            )
+    else:
+        typed_categories = (
+            (ssl.SSLCertVerificationError, ErrorCategory.TLS_CERTIFICATE,
+             Recoverability.DETERMINISTIC),
+            (_INVALID_SR_CONFIG_EXCEPTIONS, ErrorCategory.CONFIGURATION,
+             Recoverability.DETERMINISTIC),
+            (_SR_TRANSPORT_EXCEPTIONS, ErrorCategory.NETWORK,
+             Recoverability.TRANSIENT),
+            (ssl.SSLError, ErrorCategory.NETWORK, Recoverability.TRANSIENT),
+        )
+        category, recoverability = ErrorCategory.UNKNOWN, Recoverability.UNKNOWN
+        for exception_types, typed_category, typed_recoverability in typed_categories:
+            if any(isinstance(item, exception_types) for item in chain):
+                category, recoverability = typed_category, typed_recoverability
+                break
+
+    code = None if status is None else f"SR.HTTP.{status}"
+    if code is not None and sr_code is not None:
+        detailed_code = f"SR.HTTP.{status}.{sr_code}"
+        if len(detailed_code) <= MAX_STABLE_CODE_LENGTH:
+            code = detailed_code
+
+    summary = {
+        ErrorCategory.NETWORK: FailureSummary.DEPENDENCY_UNAVAILABLE,
+        ErrorCategory.BROKER_SERVICE: FailureSummary.DEPENDENCY_UNAVAILABLE,
+        ErrorCategory.CONFIGURATION: FailureSummary.INVALID_CONFIGURATION,
+    }.get(category, FailureSummary.OPERATION_FAILED)
+    return FailureDescriptor(
+        component=FailureComponent.SCHEMA_REGISTRY,
+        phase=Phase.SCHEMA_REGISTRY,
+        category=category,
+        recoverability=recoverability,
+        code=code,
+        safe_summary=summary,
+    )
 
 
 def classify_sr_error(exc: Exception) -> ErrorCategory:
-    """
-    Map a Schema Registry exception to an ErrorCategory.
+    """Compatibility wrapper returning the descriptor's bounded category."""
+    return classify_schema_registry_error(exc).category
 
-    The confluent_kafka Schema Registry client surfaces errors as either
-    SchemaRegistryError (HTTP-level, has an http_status_code) or as
-    underlying requests-library exceptions when the SR is completely
-    unreachable.
 
-    Parameters
-    ----------
-    exc : Exception
-        The raw exception caught when calling sr_client.get_subjects() or
-        any other Schema Registry operation.
-
-    Returns
-    -------
-    ErrorCategory
-        BROKER  if the SR returned an HTTP 5xx response (server-side fault).
-        NETWORK if the SR was unreachable at the connection level.
-        UNKNOWN if the exception type doesn't fit either category.
-    """
-    try:
-        from confluent_kafka.schema_registry import SchemaRegistryError
-        if isinstance(exc, SchemaRegistryError):
-            # HTTP 5xx → the SR process is up but erroring server-side (BROKER).
-            # HTTP 4xx → client misconfiguration or auth failure (treat as NETWORK
-            #             because it's a config/connectivity issue, not a server fault).
-            return ErrorCategory.BROKER if exc.http_status_code >= 500 else ErrorCategory.NETWORK
-    except ImportError:
-        pass
-
-    # When the SR host is unreachable, the requests library raises connection-
-    # level exceptions whose class names contain "Connection", "Timeout", or "SSL".
-    name = type(exc).__name__
-    if any(kw in name for kw in ("Connection", "Timeout", "SSL")):
-        return ErrorCategory.NETWORK
-
-    return ErrorCategory.UNKNOWN
+def is_deterministic_sr_error(exc: Exception) -> bool:
+    """Retain the legacy health signal for explicit security/transport setup."""
+    chain = _sr_exception_chain(exc)
+    status, _ = _sr_http_data(chain)
+    if status is not None:
+        return status in (401, 403)
+    return (
+        classify_schema_registry_error(exc).recoverability
+        is Recoverability.DETERMINISTIC
+    )
 
 
 class CanaryError(Exception):
@@ -190,10 +449,18 @@ class CanaryError(Exception):
         log output.
     """
 
-    def __init__(self, phase: Phase, category: ErrorCategory, detail: str) -> None:
+    def __init__(
+        self,
+        phase: Phase,
+        category: ErrorCategory,
+        detail: str,
+        *,
+        deterministic: bool = False,
+    ) -> None:
         self.phase    = phase
         self.category = category
         self.detail   = detail
+        self.deterministic = deterministic
         super().__init__(str(self))
 
     def __str__(self) -> str:

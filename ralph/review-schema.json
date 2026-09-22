@@ -52,8 +52,12 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["severity", "file", "line", "message", "recommendation"],
+            "required": ["classification", "severity", "file", "line", "message", "recommendation", "future_task", "novelty_explanation"],
             "properties": {
+              "classification": {
+                "type": "string",
+                "enum": ["BLOCKER_CURRENT_TASK", "INTRODUCED_REGRESSION", "FUTURE_TASK", "SPEC_GAP", "NON_BLOCKING_IMPROVEMENT"]
+              },
               "severity": {
                 "type": "string",
                 "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -61,7 +65,9 @@
               "file": {"type": "string", "maxLength": 500},
               "line": {"type": ["integer", "null"], "minimum": 1},
               "message": {"type": "string", "maxLength": 2000},
-              "recommendation": {"type": "string", "maxLength": 2000}
+              "recommendation": {"type": "string", "maxLength": 2000},
+              "future_task": {"type": ["string", "null"], "maxLength": 100},
+              "novelty_explanation": {"type": ["string", "null"], "maxLength": 2000}
             }
           }
         }

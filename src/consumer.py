@@ -44,6 +44,7 @@
 import socket
 import time
 import uuid
+from typing import Callable
 
 from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
 from confluent_kafka.schema_registry.avro import AvroDeserializer
@@ -243,6 +244,8 @@ def consume_canary(
     avro_deserializer: AvroDeserializer,
     target_id: str,
     timeout: float = 30.0,
+    *,
+    monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> tuple[CanaryMessage, int]:
     """
     Poll until the canary message with the given message_id is received.
@@ -292,11 +295,11 @@ def consume_canary(
     KafkaException
         Propagated from consumer.consume() for non-EOF broker errors.
     """
-    deadline = time.time() + timeout
+    deadline = monotonic_clock() + timeout
 
     while True:
         # Calculate remaining time dynamically to avoid unnecessary busy-waiting
-        remaining = deadline - time.time()
+        remaining = deadline - monotonic_clock()
         if remaining <= 0:
             # Timeout exceeded
             break

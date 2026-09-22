@@ -19,7 +19,7 @@
 #   Partition sync        (partition.sync.interval.seconds, default 86400 s)
 #       Detects broker count changes (cluster scale-up/down) and reconciles
 #       the canary topic's partition count accordingly.  If the partition
-#       count changes, the per-partition consumer pool is rebuilt automatically.
+#       count changes, the bounded worker pool is resized automatically.
 #
 #   Schema Registry check (sr.check.interval.seconds, default 60 s)
 #       Independent health check against the Schema Registry, surfacing SR
@@ -28,7 +28,7 @@
 #
 # Long-lived clients
 # ------------------
-# The producer, per-partition consumers, and Schema Registry client are created
+# The producer, worker-owned consumers, and Schema Registry client are created
 # once at startup and reused across all check iterations.  Reuse eliminates the
 # TCP/TLS handshake, SASL authentication, and consumer group coordinator
 # round-trip that would otherwise inflate each check's latency measurement.
@@ -48,11 +48,11 @@
 #             a successful produce acknowledgement, but can still reflect a
 #             broker/read-path problem or a client connectivity problem.
 #
-# Per-partition concurrency
+# Worker concurrency
 # -------------------------
-# check_kafka() is called once per partition on every cycle via a
-# ThreadPoolExecutor.  Each partition has a dedicated Consumer
-# (created with assign() rather than subscribe() — no group coordinator needed).
+# check_kafka() is called once per partition on every cycle via a bounded
+# ThreadPoolExecutor. Each worker exclusively owns one Consumer and reassigns
+# it to the selected partition before each check.
 # The shared Producer is thread-safe in librdkafka; all metrics
 # writes are thread-safe in prometheus_client.
 #
@@ -71,7 +71,7 @@
 # Graceful shutdown
 # -----------------
 # SIGINT and SIGTERM set _shutdown=True, which causes the main loop to exit
-# after the current check completes.  All per-partition consumers are closed
+# after the current check completes.  All worker-owned consumers are closed
 # in the finally block to cleanly leave the consumer group and release resources.
 #
 # Multi-instance support
@@ -79,7 +79,7 @@
 # Multiple instances can run concurrently against the same Confluent Cloud
 # cluster without interfering:
 #
-#   Consumer groups — each per-partition consumer generates a UUID-based
+#   Consumer groups — each worker-owned consumer generates a UUID-based
 #       group_id at startup, so consumer groups are always distinct.  Canary
 #       messages are matched by the UUID embedded in each message, so a message
 #       produced by one instance is never accidentally consumed as a result by
@@ -98,26 +98,39 @@
 #       details of how each race condition is handled.
 # ---------------------------------------------------------------------------
 
+import concurrent.futures
 import logging
 import os
 import signal
+import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.error
+import urllib.request
+from concurrent.futures import FIRST_COMPLETED, wait
+from dataclasses import dataclass
+from urllib.parse import urlparse
 
-from confluent_kafka import KafkaException, Consumer, Producer
+from confluent_kafka import KafkaError, KafkaException, Consumer, Producer
 from confluent_kafka.admin import AdminClient
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserializer
 
 from src import constants as const
+from src import bounded_executor as startup_executor_module
 from src import metrics
 from src.__version__ import __version__
-from src.config import load_config
+from src.bounded_executor import DaemonThreadPoolExecutor
+from src.config import SCHEDULER_HEARTBEAT_INTERVAL_SECONDS, load_config
 from src.consumer import (
     consume_canary,
     create_partition_consumer,
     seek_to_end,
+)
+from src.worker_pool import (
+    ConsumerInvalidError,
+    WorkerPool,
+    WorkerPoolInvariantError,
 )
 from src.error_classifier import (
     CanaryError,
@@ -125,10 +138,18 @@ from src.error_classifier import (
     Phase,
     classify_kafka_error,
     classify_sr_error,
+    is_deterministic_sr_error,
 )
+from src.health import configure_health_state
+from src.health_state import HealthStateStore
 from src.kafka_log_handler import KafkaLogHandler
 from src.metrics import start_metrics_server
 from src.producer import create_producer, produce_canary
+from src.scheduler import (
+    OperationDeadlineExceeded,
+    PartitionScheduler,
+    ScheduledOperationLane,
+)
 from src.structured_logging import CanaryLoggerAdapter, setup_logging
 from src.topic import ensure_log_topic, ensure_topic, sync_topic_partitions
 
@@ -142,33 +163,144 @@ log = CanaryLoggerAdapter(_base_logger, {
     "version": "unknown",  # Updated in run() after loading config
 })
 
+
+class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow Schema Registry redirects only when transport remains HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            parsed_url = urlparse(newurl)
+            is_https = parsed_url.scheme.lower() == "https" and bool(
+                parsed_url.hostname
+            )
+        except ValueError:
+            is_https = False
+        if not is_https:
+            raise urllib.error.HTTPError(
+                newurl,
+                code,
+                "Schema Registry redirect must use HTTPS",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 # Path to the INI configuration file, relative to the working directory
 # from which the application is launched (typically the project root).
 # Can be overridden via CANARY_CONFIG_FILE environment variable.
 CONFIG_FILE = os.getenv("CANARY_CONFIG_FILE", "config/config.ini")
 
-# Shutdown event — set by the SIGINT/SIGTERM handler.
-# The main loop checks this at the top of each iteration and exits cleanly
-# after the current check completes.  Using threading.Event() provides
-# thread-safe signaling and prevents race conditions when multiple signals
-# arrive concurrently.
+# Legacy control-loop wakeup used outside the signal handler. Signal delivery
+# publishes _shutdown_request directly so its deadline cannot be delayed by an
+# Event implementation or dispatch-owned synchronization.
 _shutdown_event = threading.Event()
+_shutdown_timeout_seconds = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class ShutdownRequest:
+    """The first observed process-shutdown request and its fixed deadline."""
+
+    signal_number: int
+    requested_at: float
+    deadline: float
+
+
+_shutdown_request: ShutdownRequest | None = None
+_shutdown_claim_token = object()
+_shutdown_request_claim = [_shutdown_claim_token]
+_fatal_shutdown_request: ShutdownRequest | None = None
+_fatal_shutdown_request_claim = [_shutdown_claim_token]
+_dispatch_guard = threading.Lock()
+
+
+class _StartupDispatchRejected(RuntimeError):
+    """Shutdown won before a startup dependency could be submitted."""
+
+
+class _ReplacementDispatchRejected(RuntimeError):
+    """Shutdown won before a replacement runtime could be submitted."""
+
+
+def _shutdown_requested() -> bool:
+    """Return whether signal publication or an internal stop was requested."""
+    return (
+        _fatal_shutdown_request is not None
+        or not _shutdown_request_claim
+        or _shutdown_request is not None
+        or _shutdown_event.is_set()
+    )
+
+
+def _active_shutdown_request() -> ShutdownRequest | None:
+    """Return the published request with the earliest immutable deadline."""
+    requests = tuple(
+        request
+        for request in (_shutdown_request, _fatal_shutdown_request)
+        if request is not None
+    )
+    if not requests:
+        return None
+    return min(requests, key=lambda request: request.deadline)
+
+
+def _shutdown_deadline() -> float | None:
+    """Return the fixed deadline, or no remaining time during publication."""
+    request = _active_shutdown_request()
+    if request is not None:
+        return request.deadline
+    if not _shutdown_request_claim or _shutdown_event.is_set():
+        return time.monotonic()
+    return None
 
 
 def _handle_signal(sig, frame) -> None:
-    """
-    Signal handler for SIGINT (Ctrl-C) and SIGTERM (container stop).
+    """Publish the first shutdown request without locks or dependency work."""
+    global _shutdown_request
 
-    Sets the shutdown event so the main loop exits after the current check
-    rather than terminating mid-flight, which could leave a stale consumer
-    group registration on the broker.
+    try:
+        _shutdown_request_claim.pop()
+    except IndexError:
+        return
 
-    Multiple signals are handled safely — only the first signal triggers
-    the log message; subsequent signals are silently ignored.
-    """
-    if not _shutdown_event.is_set():
-        log.info("Shutdown signal received — finishing current check then exiting.")
-        _shutdown_event.set()
+    # The atomic pop above reserves publication before calling even the
+    # monotonic clock. The separate claim lets shutdown observers notice the
+    # request without exposing a partially initialized ShutdownRequest.
+    requested_at = time.monotonic()
+    _shutdown_request = ShutdownRequest(
+        signal_number=sig,
+        requested_at=requested_at,
+        deadline=requested_at + _shutdown_timeout_seconds,
+    )
+
+
+def _request_fatal_shutdown() -> None:
+    """Request bounded non-zero termination for an internal invariant failure."""
+    global _fatal_shutdown_request, _shutdown_request
+
+    requested_at = time.monotonic()
+    request = ShutdownRequest(
+        signal_number=0,
+        requested_at=requested_at,
+        deadline=requested_at + _shutdown_timeout_seconds,
+    )
+
+    # Publish a complete immutable fatal request before competing for the
+    # shared shutdown claim. This makes dispatch rejection and the original
+    # fatal deadline observable even while shared publication is interrupted.
+    try:
+        _fatal_shutdown_request_claim.pop()
+    except IndexError:
+        return
+    _fatal_shutdown_request = request
+
+    # Keep the fatal outcome distinct even when an earlier ordinary signal
+    # already owns the immutable first shutdown request and its deadline.
+    try:
+        _shutdown_request_claim.pop()
+    except IndexError:
+        return
+    _shutdown_request = request
 
 
 def check_sr(sr_client: SchemaRegistryClient) -> None:
@@ -192,7 +324,22 @@ def check_sr(sr_client: SchemaRegistryClient) -> None:
     try:
         sr_client.get_subjects()
     except Exception as exc:
-        raise CanaryError(Phase.SCHEMA_REGISTRY, classify_sr_error(exc), str(exc))
+        raise CanaryError(
+            Phase.SCHEMA_REGISTRY,
+            classify_sr_error(exc),
+            str(exc),
+            deterministic=is_deterministic_sr_error(exc),
+        )
+
+
+def _timed_sr_probe(sr_client: SchemaRegistryClient):
+    """Run one SR probe in its lane and retain its actual monotonic duration."""
+    started = time.monotonic()
+    try:
+        check_sr(sr_client)
+        return (time.monotonic() - started) * 1000, None
+    except CanaryError as exc:
+        return (time.monotonic() - started) * 1000, exc
 
 
 def check_kafka(
@@ -221,8 +368,8 @@ def check_kafka(
         Avro serializer for encoding CanaryMessage objects.
 
     consumer : Consumer
-        Per-partition consumer, manually assigned to `partition` via
-        assign() at startup.
+        Worker-owned consumer, manually assigned to `partition` immediately
+        before this check.
 
     avro_deserializer : AvroDeserializer
         Avro deserializer for decoding CanaryMessage objects.
@@ -240,7 +387,7 @@ def check_kafka(
 
     partition : int
         Partition index this check targets.  The producer pins the message to
-        this partition; the consumer is already assigned to it.
+        this partition; the worker has already assigned its consumer to it.
 
     Returns
     -------
@@ -271,11 +418,21 @@ def check_kafka(
         seek_to_end(consumer)
     except (RuntimeError, KafkaException) as exc:
         category = (
-            classify_kafka_error(exc.args[0])
+            classify_kafka_error(exc.args[0], phase=Phase.SEEK).category
             if isinstance(exc, KafkaException) and exc.args
             else ErrorCategory.BROKER
         )
-        raise CanaryError(Phase.SEEK, category, str(exc))
+        failure = CanaryError(Phase.SEEK, category, str(exc))
+        kafka_error = exc.args[0] if isinstance(exc, KafkaException) and exc.args else None
+        if isinstance(exc, RuntimeError) or (
+            kafka_error is not None
+            and (
+                kafka_error.code() == KafkaError._STATE
+                or kafka_error.fatal()
+            )
+        ):
+            raise ConsumerInvalidError(failure) from exc
+        raise failure from exc
     finally:
         # Record seek duration regardless of success or failure so the
         # histogram captures partial attempts (e.g. successful on some
@@ -307,7 +464,10 @@ def check_kafka(
             }
         )
     except KafkaException as exc:
-        category = classify_kafka_error(exc.args[0]) if exc.args else ErrorCategory.UNKNOWN
+        category = (
+            classify_kafka_error(exc.args[0], phase=Phase.PRODUCE).category
+            if exc.args else ErrorCategory.UNKNOWN
+        )
         raise CanaryError(Phase.PRODUCE, category, str(exc))
     except RuntimeError as exc:
         # Local delivery-callback wait expired after 2s.
@@ -342,8 +502,17 @@ def check_kafka(
             "(possible replication lag or ISR issue)",
         )
     except KafkaException as exc:
-        category = classify_kafka_error(exc.args[0]) if exc.args else ErrorCategory.UNKNOWN
-        raise CanaryError(Phase.CONSUME, category, str(exc))
+        category = (
+            classify_kafka_error(exc.args[0], phase=Phase.CONSUME).category
+            if exc.args else ErrorCategory.UNKNOWN
+        )
+        failure = CanaryError(Phase.CONSUME, category, str(exc))
+        kafka_error = exc.args[0] if exc.args else None
+        if kafka_error is not None and (
+            kafka_error.code() == KafkaError._STATE or kafka_error.fatal()
+        ):
+            raise ConsumerInvalidError(failure) from exc
+        raise failure from exc
 
     # End-to-end latency: consumer receive time minus the timestamp captured
     # by the producer just before calling produce().  Both timestamps are
@@ -356,38 +525,294 @@ def _build_consumer_pool(
     sr_client: SchemaRegistryClient,
     topic: str,
     partitions: list[int],
-) -> tuple[dict[int, Consumer], dict[int, AvroDeserializer]]:
+    max_workers: int,
+) -> WorkerPool:
     """
-    Create one Consumer per partition, each manually assigned.
-
-    Consumers are created in parallel (up to 10 concurrent connections) to reduce
-    startup time. Sequential creation can take 1+ second per consumer due to
-    TCP handshake, metadata fetch, and group join operations.
-
-    Returns a tuple of two dicts:
-        - consumers: partition index → Consumer
-        - deserializers: partition index → AvroDeserializer
+    Create exactly one exclusively owned consumer per active worker.
     """
-    # Use a temporary executor to parallelize consumer creation during startup.
-    # Cap at 10 workers to avoid overwhelming the broker with concurrent connections.
-    with ThreadPoolExecutor(max_workers=min(len(partitions), 10)) as pool:
-        futures = {
-            p: pool.submit(create_partition_consumer, kafka_config, sr_client, topic, p)
-            for p in partitions
-        }
-        # Wait for all consumers to be created, then return as dict
-        # If any consumer fails, the entire pool creation fails (fail-fast behavior)
-        consumers = {}
-        deserializers = {}
-        for p, future in futures.items():
-            try:
-                consumer, deserializer = future.result()
-                consumers[p] = consumer
-                deserializers[p] = deserializer
-            except Exception as exc:
-                log.error(f"Failed to create consumer for partition {p}: {exc}")
-                raise
-        return consumers, deserializers
+    worker_count = min(len(partitions), max_workers)
+    return WorkerPool(
+        size=worker_count,
+        topic=topic,
+        factory=lambda partition: create_partition_consumer(
+            kafka_config, sr_client, topic, partition
+        ),
+    )
+
+
+def _prepare_replacement_runtime(
+    kafka_config: dict[str, str],
+    sr_client: SchemaRegistryClient,
+    topic: str,
+    partitions: list[int],
+    max_workers: int,
+):
+    """Build a complete unpublished consumer/scheduler generation or clean it up."""
+    replacement_pool = _build_consumer_pool(
+        kafka_config, sr_client, topic, partitions, max_workers
+    )
+    try:
+        # Keep one executor for the lifetime of this runtime generation.  The
+        # scheduler limits active work to min(partitions, max_workers), while
+        # reserving max_workers here lets additive topology changes use new
+        # capacity without overlapping executor generations.
+        replacement_executor = DaemonThreadPoolExecutor(max_workers=max_workers)
+    except Exception:
+        replacement_pool.close()
+        raise
+    return replacement_pool, replacement_executor
+
+
+def _cleanup_unpublished_replacement(consumer_pool, executor) -> None:
+    """Best-effort bounded cleanup for a generation that was never published."""
+    try:
+        executor.shutdown(wait=True)
+    except Exception:
+        log.exception("Failed to stop unpublished replacement scheduler")
+    try:
+        consumer_pool.close()
+    except Exception:
+        log.exception("Failed to close unpublished replacement consumer pool")
+
+
+def _replace_recreated_runtime(
+    kafka_config: dict[str, str],
+    sr_client: SchemaRegistryClient,
+    topic: str,
+    old_partitions: list[int],
+    old_consumers,
+    replacement_partition_count: int,
+    max_workers: int,
+    health_store: HealthStateStore,
+    scheduler=None,
+):
+    """Build and publish one complete replacement generation or fail closed."""
+    replacement_partitions = list(range(replacement_partition_count))
+    try:
+        old_consumers.close()
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not retire every consumer from the replaced topic"
+        ) from exc
+
+    # Retire the old generation before constructing another one. This avoids a
+    # transient double-pool that would violate the configured consumer bound.
+    replacement_pool, replacement_executor = (
+        _prepare_replacement_runtime(
+            kafka_config,
+            sr_client,
+            topic,
+            replacement_partitions,
+            max_workers,
+        )
+    )
+
+    replacement_failures = {partition: 0 for partition in replacement_partitions}
+    try:
+        scheduler_oldest_overdue = 0.0
+        if scheduler is not None:
+            scheduler.replace_partitions(replacement_partitions)
+            scheduler_oldest_overdue = (
+                scheduler.snapshot().oldest_overdue_seconds
+            )
+        health_store.replace_expected_partitions(
+            replacement_partitions,
+            preserve_existing=False,
+            scheduler_oldest_overdue=scheduler_oldest_overdue,
+        )
+        metrics.reconcile_partition_metrics(replacement_partitions, reset=True)
+    except Exception:
+        _cleanup_unpublished_replacement(
+            replacement_pool, replacement_executor
+        )
+        raise
+    return (
+        replacement_pool,
+        replacement_executor,
+        replacement_partitions,
+        replacement_failures,
+    )
+
+
+def _log_reconciliation_failure(stage: str, exc: Exception) -> None:
+    """Report a fatal reconciliation stage without logging exception contents."""
+    log.error(
+        "Fatal topic reconciliation failure",
+        extra={"stage": stage, "error": type(exc).__name__},
+    )
+
+
+def _cleanup_runtime_resources(executor, consumers, producer) -> None:
+    """Best-effort cleanup that is safe for a partially constructed runtime."""
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            log.exception("Failed to stop scheduler during final cleanup")
+
+    consumer_items = ()
+    if consumers is not None:
+        try:
+            consumers.close()
+        except AttributeError:
+            consumer_items = consumers.items()
+        except Exception:
+            log.exception("Failed to close consumer pool during final cleanup")
+
+    for partition, consumer in consumer_items:
+        try:
+            consumer.close()
+        except Exception:
+            log.exception(
+                "Failed to close consumer during final cleanup",
+                extra={"partition": partition},
+            )
+
+    if executor is not None:
+        try:
+            # WorkerPool.close() marks borrowed consumers for owner-thread
+            # cleanup.  Give those cooperative workers the remainder of the
+            # process shutdown window; the lifecycle daemon boundary abandons
+            # this wait at the already-published absolute deadline if a native
+            # dependency call never returns.
+            executor.shutdown(wait=True)
+        except Exception:
+            log.exception("Failed to drain scheduler during final cleanup")
+
+    if producer is not None:
+        try:
+            producer.flush(timeout=5)
+        except Exception:
+            log.exception("Failed to flush producer during final cleanup")
+
+
+def _submit_due_checks(
+    scheduler,
+    executor,
+    active_futures,
+    worker_limit,
+    check_sequence,
+    submit_check,
+    generation=None,
+) -> tuple[int, ...]:
+    """Fill free worker slots in one shutdown-linearized transaction."""
+    with _dispatch_guard:
+        if _shutdown_requested():
+            return ()
+        available = max(0, worker_limit - len(active_futures))
+        selected = scheduler.acquire_due(available)
+        for partition in selected:
+            identity = (partition, check_sequence)
+            if generation is not None:
+                identity = (*identity, generation)
+            active_futures[executor.submit(submit_check, partition)] = identity
+        return selected
+
+
+def _dispatch_scheduled_operation(lane, operation) -> bool:
+    """Dispatch an SR or reconciliation occurrence before shutdown only."""
+    with _dispatch_guard:
+        if _shutdown_requested():
+            return False
+        return lane.dispatch_if_due(operation)
+
+
+def _run_guarded_daemon_dependency(
+    operation, *, thread_name_prefix, rejection_type, rejection_message
+):
+    """Authorize one dependency call and run it on an abandonable daemon lane.
+
+    The start gate prevents a fast worker from entering native client code
+    before the dispatch guard has been released. A rejected submission raises
+    immediately so callers cannot advance to a later dependency stage.
+    """
+    executor = startup_executor_module.DaemonThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix=thread_name_prefix,
+    )
+    start_native_work = threading.Event()
+
+    def invoke():
+        start_native_work.wait()
+        return operation()
+
+    try:
+        with _dispatch_guard:
+            if _shutdown_requested():
+                raise rejection_type(rejection_message)
+            future = executor.submit(invoke)
+        start_native_work.set()
+        return future.result()
+    finally:
+        # Never join a native call here. The lifecycle daemon boundary owns
+        # the fixed shutdown deadline and may abandon this daemon worker.
+        start_native_work.set()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _run_startup_dependency(operation):
+    """Run one startup dependency call through guarded daemon dispatch."""
+    return _run_guarded_daemon_dependency(
+        operation,
+        thread_name_prefix="cloud-canary-startup",
+        rejection_type=_StartupDispatchRejected,
+        rejection_message="shutdown rejected startup dependency submission",
+    )
+
+
+def _run_replacement_runtime_transaction(operation):
+    """Run replacement runtime construction through guarded daemon dispatch."""
+    return _run_guarded_daemon_dependency(
+        operation,
+        thread_name_prefix="cloud-canary-replacement",
+        rejection_type=_ReplacementDispatchRejected,
+        rejection_message="shutdown rejected replacement runtime submission",
+    )
+
+
+def _publish_scheduler_observability(scheduler, health_store) -> None:
+    """Refresh constant-time scheduling metrics from one current snapshot."""
+    snapshot = scheduler.snapshot()
+    health_store.record_scheduler_heartbeat()
+    health_store.record_scheduler_capacity(snapshot.oldest_overdue_seconds)
+    metrics.update_scheduler_metrics(snapshot)
+
+
+def _publish_shutdown_state(health_store) -> None:
+    """Publish an observed stop request outside the signal handler."""
+    if _shutdown_requested():
+        health_store.begin_shutdown()
+
+
+def _close_kafka_log_handler(handler) -> None:
+    """Detach an optional Kafka handler without masking a fatal exception."""
+    if handler is None:
+        return
+    try:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    except Exception:
+        log.exception("Failed to close Kafka log handler during final cleanup")
+
+
+def _register_kafka_log_handler(handler) -> bool:
+    """Attach before shutdown, disarming a handler if shutdown wins the race."""
+    root_logger = logging.getLogger()
+    should_close = False
+    with _dispatch_guard:
+        if _shutdown_requested():
+            should_close = True
+        else:
+            root_logger.addHandler(handler)
+            if _shutdown_requested():
+                root_logger.removeHandler(handler)
+                should_close = True
+    if should_close:
+        # Kafka flush is dependency I/O and must remain outside the dispatch
+        # guard. The handler's shutdown predicate already disarms emit().
+        handler.close()
+        return False
+    return True
 
 
 def _update_success_metrics(
@@ -396,8 +821,7 @@ def _update_success_metrics(
     latency_ms: int,
     consecutive_failures: dict[int, int],
     is_warming_up: bool,
-    num_partitions: int,
-    partition_threshold: int,
+    *_legacy_cardinality_args,
 ) -> None:
     """
     Update Prometheus metrics after a successful check.
@@ -415,30 +839,97 @@ def _update_success_metrics(
         This partition's count will be reset to 0.
     is_warming_up : bool
         Whether this check is part of the warmup period (latency not recorded).
-    num_partitions : int
-        Total number of partitions in the cluster.
-    partition_threshold : int
-        Threshold above which partition labels are aggregated to prevent
-        metric cardinality explosion.
+    Additional positional arguments are accepted for compatibility with older
+    in-process callers; cardinality is no longer threshold-dependent.
     """
     consecutive_failures[partition] = 0
 
-    # Cardinality control: Use per-partition labels only if under threshold
-    # When partition count exceeds threshold, use aggregated label to prevent
-    # Prometheus memory explosion (100 partitions = 2,200+ series per host)
-    if num_partitions <= partition_threshold:
-        partition_label = str(partition)
-    else:
-        partition_label = "*"  # Aggregated - all partitions combined
-
-    metrics.CHECKS_TOTAL.labels(result="success", host=metrics.HOST, partition=partition_label).inc()
-    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_label).set(0)
-    metrics.LAST_SUCCESS_TIMESTAMP.labels(host=metrics.HOST, partition=partition_label).set(time.time())
+    metrics.CHECKS_TOTAL.labels(
+        host=metrics.HOST, result="success"
+    ).inc()
+    metrics.record_partition_check(
+        partition, "success", consecutive_failures[partition], last_success=time.time()
+    )
     metrics.CHECK_SEQUENCE.set(check_sequence)
 
     if not is_warming_up:
         # Note: Partition label removed to prevent metrics cardinality explosion.
         metrics.E2E_LATENCY.labels(host=metrics.HOST).observe(latency_ms)
+
+
+def _record_successful_partition_attempt(
+    health_store: HealthStateStore,
+    partition: int,
+    check_sequence: int,
+    latency_ms: int,
+    consecutive_failures: dict[int, int],
+    *_legacy_cardinality_args,
+    generation=None,
+) -> bool | None:
+    """Record a success using the partition's authoritative warmup state."""
+    is_warming_up = health_store.record_partition_result(
+        partition, success=True, generation=generation
+    )
+    if is_warming_up is None:
+        return None
+    _update_success_metrics(
+        partition,
+        check_sequence,
+        latency_ms,
+        consecutive_failures,
+        is_warming_up,
+    )
+
+    if is_warming_up:
+        log.info(
+            "Warmup check succeeded (latency not recorded)",
+            extra={
+                "check_sequence": check_sequence,
+                "partition": partition,
+                "latency_ms": latency_ms,
+                "warmup": True,
+            },
+        )
+    else:
+        log.info(
+            "Check succeeded",
+            extra={
+                "check_sequence": check_sequence,
+                "partition": partition,
+                "latency_ms": latency_ms,
+            },
+        )
+    return is_warming_up
+
+
+def _record_failed_partition_attempt(
+    health_store: HealthStateStore,
+    partition: int,
+    check_sequence: int,
+    consecutive_failures: dict[int, int],
+    phase: str,
+    category: str,
+    *,
+    failure: str,
+    generation=None,
+) -> bool:
+    """Publish a failed attempt only when its topic generation is current."""
+    accepted = health_store.record_partition_result(
+        partition,
+        success=False,
+        failure=failure,
+        generation=generation,
+    )
+    if accepted is None:
+        return False
+    _update_failure_metrics(
+        partition,
+        check_sequence,
+        consecutive_failures,
+        phase,
+        category,
+    )
+    return True
 
 
 def _update_failure_metrics(
@@ -447,8 +938,7 @@ def _update_failure_metrics(
     consecutive_failures: dict[int, int],
     phase: str,
     category: str,
-    num_partitions: int,
-    partition_threshold: int,
+    *_legacy_cardinality_args,
 ) -> None:
     """
     Update Prometheus metrics after a failed check.
@@ -465,33 +955,36 @@ def _update_failure_metrics(
     phase : str
         Phase where the failure occurred (SEEK, PRODUCE, CONSUME, etc.).
     category : str
-        Error category (NETWORK, BROKER, UNKNOWN).
-    num_partitions : int
-        Total number of partitions in the cluster.
-    partition_threshold : int
-        Threshold above which partition labels are aggregated to prevent
-        metric cardinality explosion.
+        Error category, normalized to the bounded metric vocabulary.
+    Additional positional arguments are accepted for compatibility with older
+    in-process callers; cardinality is no longer threshold-dependent.
     """
     consecutive_failures[partition] += 1
 
-    # Cardinality control: Use per-partition labels only if under threshold
-    if num_partitions <= partition_threshold:
-        partition_label = str(partition)
-    else:
-        partition_label = "*"  # Aggregated - all partitions combined
-
-    metrics.CHECKS_TOTAL.labels(result="failure", host=metrics.HOST, partition=partition_label).inc()
-    metrics.FAILURES_TOTAL.labels(
-        phase=phase, category=category,
-        host=metrics.HOST, partition=partition_label,
+    metrics.CHECKS_TOTAL.labels(
+        host=metrics.HOST, result="failure"
     ).inc()
-    metrics.CONSECUTIVE_FAILURES.labels(host=metrics.HOST, partition=partition_label).set(
-        consecutive_failures[partition]
+    bounded_phase = metrics.bounded_label(phase, metrics.FAILURE_PHASE_VALUES)
+    bounded_category = metrics.bounded_label(
+        category,
+        metrics.FAILURE_CATEGORY_VALUES,
+        aliases={"BROKER": "BROKER_SERVICE"},
+    )
+    metrics.FAILURES_TOTAL.labels(
+        host=metrics.HOST,
+        phase=bounded_phase,
+        category=bounded_category,
+        recoverability="TRANSIENT",
+    ).inc()
+    metrics.record_partition_check(
+        partition, "failure", consecutive_failures[partition]
     )
     metrics.CHECK_SEQUENCE.set(check_sequence)
 
 
-def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
+def validate_ssl_connectivity(
+    kafka_config: dict, sr_config: dict, sr_timeout: float = 10.0
+) -> None:
     """
     Verify SSL/TLS connectivity to Confluent Cloud before entering main loop.
 
@@ -510,12 +1003,30 @@ def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
         Kafka connection settings from [kafka] section.
     sr_config : dict
         Schema Registry connection settings from [schema_registry] section.
+    sr_timeout : float
+        Maximum seconds for the Schema Registry startup request.
 
     Raises
     ------
     SystemExit
         If SSL/TLS validation fails for either Kafka or Schema Registry.
     """
+    sr_url = sr_config.get("url", "")
+    try:
+        parsed_sr_url = urlparse(sr_url)
+        valid_https_url = (
+            parsed_sr_url.scheme.lower() == "https" and bool(parsed_sr_url.hostname)
+        )
+    except ValueError:
+        valid_https_url = False
+
+    # Enforce the transport invariant here as well as in configuration loading.
+    # This function may be called directly, so reject before creating either
+    # client or reading credentials that could otherwise be sent in plaintext.
+    if not valid_https_url:
+        log.error("Schema Registry URL must use HTTPS")
+        raise SystemExit(1)
+
     from confluent_kafka import Producer
 
     log.info("Validating SSL/TLS connectivity to Confluent Cloud...")
@@ -595,10 +1106,8 @@ def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
     # Test 2: Schema Registry SSL/TLS validation
     # ------------------------------------------------------------------
     try:
-        import urllib.request
         import ssl as ssl_module
 
-        sr_url = sr_config['url']
         auth_string = sr_config['basic.auth.user.info']
         username, password = auth_string.split(':', 1)
 
@@ -612,16 +1121,35 @@ def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
         password_mgr.add_password(None, sr_url, username, password)
         auth_handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
         https_handler = urllib.request.HTTPSHandler(context=ssl_context)
-        opener = urllib.request.build_opener(https_handler, auth_handler)
+        redirect_handler = _HTTPSOnlyRedirectHandler()
+        opener = urllib.request.build_opener(
+            https_handler, redirect_handler, auth_handler
+        )
 
         # Test connection to Schema Registry
         request = urllib.request.Request(f"{sr_url}/subjects")
-        response = opener.open(request, timeout=10)
+        response = opener.open(request, timeout=sr_timeout)
         response.read()
+
+        # Defense in depth: a custom opener/handler must not be able to make a
+        # downgraded final response look like successful TLS validation.
+        final_url = response.geturl()
+        try:
+            parsed_final_url = urlparse(final_url)
+            final_url_is_https = (
+                parsed_final_url.scheme.lower() == "https"
+                and bool(parsed_final_url.hostname)
+            )
+        except (TypeError, ValueError):
+            final_url_is_https = False
+        if not final_url_is_https:
+            raise urllib.error.URLError(
+                "Schema Registry response URL must use HTTPS"
+            )
 
         log.info(
             "SSL/TLS validation successful for Schema Registry",
-            extra={"url": sr_url}
+            extra={"endpoint": "configured_schema_registry"}
         )
 
     except urllib.error.URLError as exc:
@@ -629,8 +1157,8 @@ def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
             log.error(
                 "Schema Registry SSL/TLS certificate validation FAILED",
                 extra={
-                    "error": str(exc),
-                    "url": sr_config['url'],
+                    "error": type(exc).__name__,
+                    "endpoint": "configured_schema_registry",
                 }
             )
             log.error("")
@@ -647,21 +1175,21 @@ def validate_ssl_connectivity(kafka_config: dict, sr_config: dict) -> None:
         else:
             log.error(
                 "Schema Registry connection failed",
-                extra={"error": str(exc)}
+                extra={"error": type(exc).__name__}
             )
             sys.exit(1)
 
     except Exception as exc:
         log.error(
             "Schema Registry validation failed",
-            extra={"error": str(exc)}
+            extra={"error": type(exc).__name__}
         )
         sys.exit(1)
 
     log.info("SSL/TLS connectivity validation complete - all checks passed")
 
 
-def run() -> None:
+def _run_lifecycle() -> None:
     """
     Main entry point: load configuration, initialise all clients, then run the
     check loop until a shutdown signal is received.
@@ -672,10 +1200,10 @@ def run() -> None:
     2. Configure structured logging based on environment.
     3. Start the Prometheus HTTP metrics server.
     4. Ensure the canary topic exists (create if missing).
-    5. Optionally attach the Kafka log handler to the root logger.
-    6. Create the Schema Registry client, producer, and serializers.
-    7. Run an initial partition sync to get the current partition count.
-    8. Create one Consumer per partition (manual assignment).
+    5. Create the Schema Registry client, producer, and serializers.
+    6. Run an initial partition sync to get the current partition count.
+    7. Create the worker-owned Consumer pool.
+    8. Optionally attach the Kafka log handler after startup completes.
     9. Enter the main loop (canary checks, partition sync, SR checks).
 
     Shutdown sequence (finally block)
@@ -685,6 +1213,8 @@ def run() -> None:
     • ThreadPoolExecutor is shut down.
     • kafka_log_handler.close() flushes any buffered log records to Kafka.
     """
+    global _shutdown_timeout_seconds
+
     config = load_config(CONFIG_FILE)
     kafka_config  = config["kafka"]
     sr_config     = config["schema_registry"]
@@ -716,6 +1246,10 @@ def run() -> None:
     interval            = float(app.get("check.interval.seconds",               "15"))
     sync_interval       = float(app.get("partition.sync.interval.seconds",   "86400"))
     sr_check_interval   = float(app.get("sr.check.interval.seconds",            "60"))
+    sr_check_timeout    = float(app.get("sr.check.timeout.seconds",             "10"))
+    _shutdown_timeout_seconds = float(
+        app.get("http.shutdown.timeout.seconds", "10")
+    )
     metrics_port        = int(app.get("metrics.port",                          "8000"))
     metrics_bind_addr   = app.get("metrics.bind.address",                  "0.0.0.0")
     metrics_ssl_enabled = app.get("metrics.ssl.enabled", "false").lower() == "true"
@@ -726,12 +1260,26 @@ def run() -> None:
     log_topic_retention_ms = int(app.get("log.topic.retention.ms",        "604800000"))
     warmup_checks          = int(app.get("warmup.checks",                         "2"))
     max_workers            = int(app.get("max.workers",                str(const.MAX_WORKERS)))
-    partition_threshold    = int(app.get("metrics.partition.threshold",         "100"))
-
-    # Register signal handlers so SIGINT (Ctrl-C) and SIGTERM (container stop)
-    # cause a clean exit after the current check rather than a hard kill.
-    signal.signal(signal.SIGINT,  _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    kafka_degraded_after   = float(app.get("health.kafka.degraded.after.seconds", "60"))
+    liveness_scheduler_max_staleness = float(
+        app.get("liveness.scheduler.max.staleness.seconds", "10")
+    )
+    health_store = HealthStateStore(
+        window_checks=int(app.get("health.failure.window.checks", "20")),
+        minimum_checks=int(app.get("health.failure.minimum.checks", "4")),
+        failure_threshold=float(app.get("health.failure.threshold", "0.5")),
+        max_diagnostic_components=int(app.get("health.max.diagnostic.components", "20")),
+        kafka_check_interval=interval,
+        kafka_degraded_after=kafka_degraded_after,
+        kafka_unhealthy_after=float(app.get("health.kafka.unhealthy.after.seconds", "300")),
+        sr_check_interval=sr_check_interval,
+        sr_degraded_after=float(app.get("health.sr.degraded.after.seconds", "120")),
+        sr_unhealthy_after=float(app.get("health.sr.unhealthy.after.seconds", "300")),
+        warmup_checks=warmup_checks,
+        liveness_scheduler_max_staleness=liveness_scheduler_max_staleness,
+        invariant_failure_callback=_request_fatal_shutdown,
+    )
+    configure_health_state(health_store)
 
     # Set version info metric
     metrics.VERSION_INFO.info({
@@ -746,11 +1294,11 @@ def run() -> None:
             "check_interval_seconds": interval,
             "partition_sync_interval_seconds": sync_interval,
             "sr_check_interval_seconds": sr_check_interval,
+            "sr_check_timeout_seconds": sr_check_timeout,
             "consumer_timeout_seconds": timeout,
             "metrics_port": metrics_port,
             "warmup_checks": warmup_checks,
             "max_workers": max_workers,
-            "partition_threshold": partition_threshold,
             "log_format": log_format,
         }
     )
@@ -761,7 +1309,11 @@ def run() -> None:
     # This fail-fast check ensures certificates are valid and prevents
     # the application from running with compromised security.
     # Validates both Kafka broker and Schema Registry SSL/TLS connections.
-    validate_ssl_connectivity(kafka_config, sr_config)
+    _run_startup_dependency(
+        lambda: validate_ssl_connectivity(
+            kafka_config, sr_config, sr_check_timeout
+        )
+    )
 
     # Start the Prometheus metrics HTTP(S) server (background daemon thread).
     # The /metrics endpoint is available immediately, returning zeros for
@@ -796,37 +1348,51 @@ def run() -> None:
     # Reusing the AdminClient across topic operations eliminates repeated
     # TCP handshakes and metadata fetches, improving startup performance.
     # ------------------------------------------------------------------
-    admin = AdminClient(kafka_config)
+    admin = _run_startup_dependency(lambda: AdminClient(kafka_config))
 
     # ------------------------------------------------------------------
     # Startup: ensure the canary topic exists before creating clients.
     # ------------------------------------------------------------------
     try:
-        ensure_topic(kafka_config, topic, admin=admin)
+        _run_startup_dependency(
+            lambda: ensure_topic(kafka_config, topic, admin=admin)
+        )
     except RuntimeError as exc:
+        health_store.record_fatal_internal("topic_reconciliation")
         log.error("Startup failed during topic creation", extra={"error": str(exc)})
-        return
+        # Let the daemon lifecycle boundary turn failed reconciliation into a
+        # non-zero process exit. Unwinding this frame also releases the only
+        # startup resource created so far (the AdminClient).
+        raise
 
-    # Optionally attach the Kafka log handler so all subsequent log output
-    # is also published to the log topic.  This is done before creating the
-    # producer/consumer so those startup messages are captured too.
+    # Prepare the optional Kafka log handler, but do not attach it during
+    # startup. Once attached, ordinary logging performs Kafka dependency I/O
+    # directly and would bypass the guarded startup lane.
     kafka_log_handler = None
     if log_topic_enabled:
         try:
-            ensure_log_topic(kafka_config, log_topic, log_topic_retention_ms, admin=admin)
-            kafka_log_handler = KafkaLogHandler(kafka_config, log_topic)
+            _run_startup_dependency(
+                lambda: ensure_log_topic(
+                    kafka_config,
+                    log_topic,
+                    log_topic_retention_ms,
+                    admin=admin,
+                )
+            )
+            kafka_log_handler = _run_startup_dependency(
+                lambda: KafkaLogHandler(
+                    kafka_config,
+                    log_topic,
+                    shutdown_requested=_shutdown_requested,
+                    shutdown_deadline=_shutdown_deadline,
+                )
+            )
             kafka_log_handler.setFormatter(logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
             ))
-            logging.getLogger().addHandler(kafka_log_handler)
-            log.info(
-                "Log topic enabled",
-                extra={
-                    "log_topic": log_topic,
-                    "retention_ms": log_topic_retention_ms,
-                }
-            )
+        except _StartupDispatchRejected:
+            raise
         except RuntimeError as exc:
             log.error(
                 "Failed to set up log topic, continuing without it",
@@ -836,72 +1402,151 @@ def run() -> None:
     # Create the shared Schema Registry client.  The same instance is used by
     # both the producer's AvroSerializer and the consumer's AvroDeserializer,
     # and by check_sr() for independent SR health checks.
-    sr_client = SchemaRegistryClient(sr_config)
+    sr_client_config = dict(sr_config)
+    sr_client_config["timeout"] = sr_check_timeout
+    sr_client = _run_startup_dependency(
+        lambda: SchemaRegistryClient(sr_client_config)
+    )
+
+    # Resource placeholders make startup reconciliation and construction failures
+    # use the same bounded cleanup path as control-loop failures.
+    producer = None
+    consumers = {}
+    executor = None
 
     # Create the long-lived producer and serializer.  Thread-safe in librdkafka —
     # shared across all per-partition check threads.
-    producer, avro_serializer = create_producer(kafka_config, sr_client)
+    producer, avro_serializer = _run_startup_dependency(
+        lambda: create_producer(kafka_config, sr_client)
+    )
 
     # ------------------------------------------------------------------
-    # Initial partition sync — determines how many per-partition consumers
-    # to create.  Setting last_sync_time=now prevents a duplicate sync on
-    # the first main loop iteration. Reuse the AdminClient created earlier.
+    # Initial partition sync determines how many workers and consumers to
+    # create. Reuse the AdminClient created earlier.
     # ------------------------------------------------------------------
     log.info("Running initial partition sync")
-    result = sync_topic_partitions(kafka_config, topic, admin=admin)
-    if not result:
-        log.error("Startup failed, could not determine partition count")
-        return
+    try:
+        result = _run_startup_dependency(
+            lambda: sync_topic_partitions(kafka_config, topic, admin=admin)
+        )
+        if not result:
+            raise RuntimeError("partition reconciliation returned no verified state")
+    except Exception as exc:
+        health_store.record_fatal_internal("topic_reconciliation")
+        _log_reconciliation_failure("initial_reconciliation", exc)
+        _cleanup_runtime_resources(executor, consumers, producer)
+        producer = None
+        admin = None
+        _close_kafka_log_handler(kafka_log_handler)
+        raise
     num_brokers, num_partitions = result
     metrics.BROKER_COUNT.set(num_brokers)
     metrics.TOPIC_PARTITION_COUNT.set(num_partitions)
     partitions = list(range(num_partitions))
-    last_sync_time = time.time()
-
-    # Create one consumer per partition using manual assignment (assign()).
-    # No subscribe() or wait_for_assignment() needed — partitions are
-    # immediately available for seek_to_end() and poll().
-    consumers, deserializers = _build_consumer_pool(kafka_config, sr_client, topic, partitions)
+    health_store.replace_expected_partitions(
+        partitions, scheduler_oldest_overdue=0.0
+    )
+    metrics.reconcile_partition_metrics(partitions, reset=True)
+    # Create one exclusively owned consumer per active worker. The pool
+    # manually reassigns each consumer before every partition check.
+    try:
+        consumers = _run_startup_dependency(
+            lambda: _build_consumer_pool(
+                kafka_config, sr_client, topic, partitions, max_workers
+            )
+        )
+        # Retaining one executor with the configured upper bound allows safe
+        # additive scale-up while _submit_due_checks keeps active work at
+        # min(partitions, max_workers).
+        executor = DaemonThreadPoolExecutor(max_workers=max_workers)
+    except Exception as exc:
+        health_store.record_fatal_internal("internal_runtime_build")
+        _log_reconciliation_failure("initial_runtime_build", exc)
+        _cleanup_runtime_resources(executor, consumers, producer)
+        producer = None
+        admin = None
+        _close_kafka_log_handler(kafka_log_handler)
+        raise
     log.info(
-        "Per-partition consumers ready",
+        "Worker-owned consumers ready",
         extra={
             "num_brokers": num_brokers,
             "num_partitions": num_partitions,
+            "worker_count": len(consumers),
             "partitions": partitions,
         }
     )
 
-    # Warn if partition count exceeds threshold (cardinality control)
-    if num_partitions > partition_threshold:
-        log.warning(
-            "Partition count exceeds threshold - using aggregated partition labels",
-            extra={
-                "num_partitions": num_partitions,
-                "partition_threshold": partition_threshold,
-                "message": f"Metrics will use partition='*' instead of per-partition labels to prevent "
-                          f"Prometheus cardinality explosion ({num_partitions} partitions would create "
-                          f"~{num_partitions * 22} time series per host). Increase metrics.partition.threshold "
-                          f"in config.ini if you need per-partition granularity and have sufficient Prometheus memory."
-            }
-        )
+    # Startup dependency construction is now complete. Attach Kafka-backed
+    # logging only at this boundary so no startup log record can perform
+    # unguarded Kafka I/O.
+    if kafka_log_handler is not None:
+        if not _register_kafka_log_handler(kafka_log_handler):
+            kafka_log_handler = None
+        else:
+            log.info(
+                "Log topic enabled",
+                extra={
+                    "log_topic": log_topic,
+                    "retention_ms": log_topic_retention_ms,
+                },
+            )
 
     consecutive_failures = {p: 0 for p in partitions}
+    scheduler = PartitionScheduler(partitions, interval)
+    health_store.record_scheduler_capacity(
+        scheduler.snapshot().oldest_overdue_seconds
+    )
+    active_futures = {}
     check_sequence       = 0
-    start_time           = time.time()
-    last_sr_check_time   = 0.0   # set to 0 so the first iteration triggers an SR check immediately
+    start_time           = time.monotonic()
+    last_health_metrics_update = 0.0
+    sr_lane = ScheduledOperationLane(
+        sr_check_interval,
+        timeout=sr_check_timeout,
+        thread_name_prefix="cloud-canary-sr",
+    )
+    reconciliation_lane = ScheduledOperationLane(
+        sync_interval,
+        initial_delay=sync_interval,
+        thread_name_prefix="cloud-canary-reconciliation",
+    )
+    recreation_requested = threading.Event()
+    recreation_authorized = threading.Event()
+    recreation_cancelled = threading.Event()
 
-    # Cap max workers to prevent unbounded thread growth on large clusters.
-    # Each thread uses ~8MB stack memory (100 threads = ~800MB).
-    # max_workers is configurable via config.ini (default: 20).
-    # Formula: actual_workers = min(partition_count, max_workers)
-    executor = ThreadPoolExecutor(max_workers=min(num_partitions, max_workers))
+    def request_recreation_exclusivity() -> None:
+        """Ask the control-loop owner to drain Kafka work before deletion."""
+        health_store.begin_readiness_transition("topic_recreation")
+        recreation_requested.set()
+        while not recreation_authorized.wait(0.1):
+            if recreation_cancelled.is_set() or _shutdown_requested():
+                raise RuntimeError("topic recreation interrupted before authorization")
+        if recreation_cancelled.is_set():
+            raise RuntimeError("topic recreation interrupted before authorization")
+
+    def reconcile_topic():
+        """Reconcile topology and prepare additive capacity on its own lane."""
+        result = sync_topic_partitions(
+            kafka_config,
+            topic,
+            admin=admin,
+            before_recreate=request_recreation_exclusivity,
+        )
+        if (
+            result
+            and not result.recreated
+            and result.partition_count != len(partitions)
+        ):
+            health_store.begin_readiness_transition("worker_rebuild")
+            consumers.grow(min(result.partition_count, max_workers))
+        return result
 
     try:
-        while not _shutdown_event.is_set():
-
+        while not _shutdown_requested():
             # Update uptime gauge at the top of every iteration so it reflects
             # elapsed time even if a check takes a long time.
-            metrics.UPTIME_SECONDS.set(time.time() - start_time)
+            metrics.UPTIME_SECONDS.set(time.monotonic() - start_time)
 
             # ------------------------------------------------------------------
             # Partition sync — detect broker count changes (scale-up/down)
@@ -910,69 +1555,89 @@ def run() -> None:
             # of rebuilding the entire pool, preventing monitoring gaps.
             # Reuses the long-lived AdminClient to avoid connection overhead.
             # ------------------------------------------------------------------
-            if time.time() - last_sync_time >= sync_interval:
-                result = sync_topic_partitions(kafka_config, topic, admin=admin)
-                if result:
-                    metrics.BROKER_COUNT.set(result[0])
-                    metrics.TOPIC_PARTITION_COUNT.set(result[1])
-                    if result[1] != len(partitions):
-                        log.info(
-                            "Partition count changed, updating consumer pool incrementally",
-                            extra={
-                                "old_partition_count": len(partitions),
-                                "new_partition_count": result[1],
-                            }
-                        )
-                        new_partitions = set(range(result[1]))
-                        old_partitions = set(partitions)
-
-                        # Add new partitions (scale-up case)
-                        added = new_partitions - old_partitions
-                        if added:
-                            log.info(f"Adding {len(added)} new partition(s): {sorted(added)}")
-                            # Create new consumers in parallel to minimize downtime
-                            with ThreadPoolExecutor(max_workers=min(len(added), 10)) as pool:
-                                futures = {p: pool.submit(create_partition_consumer, kafka_config, sr_client, topic, p) for p in added}
-                                for p, future in futures.items():
-                                    consumer, deserializer = future.result()
-                                    consumers[p] = consumer
-                                    deserializers[p] = deserializer
-                                    consecutive_failures[p] = 0
-
-                        # Remove deleted partitions (scale-down case)
-                        removed = old_partitions - new_partitions
-                        if removed:
-                            log.info(f"Removing {len(removed)} partition(s): {sorted(removed)}")
-                            for p in removed:
-                                consumers[p].close()
-                                del consumers[p]
-                                del deserializers[p]
-                                del consecutive_failures[p]
-
-                        # Update partition list
-                        partitions = list(range(result[1]))
-
-                        # Resize executor only if needed (worker count changed significantly)
-                        new_max_workers_count = min(result[1], max_workers)
-                        old_max_workers_count = min(len(old_partitions), max_workers)
-                        if new_max_workers_count != old_max_workers_count:
-                            log.info(
-                                f"Resizing executor: {old_max_workers_count} → {new_max_workers_count} workers"
+            result = None
+            _dispatch_scheduled_operation(reconciliation_lane, reconcile_topic)
+            reconciliation_future = reconciliation_lane.take_completed()
+            if reconciliation_future is not None:
+                try:
+                    result = reconciliation_future.result()
+                except Exception as exc:
+                    health_store.record_fatal_internal("topic_reconciliation")
+                    _log_reconciliation_failure("periodic_reconciliation", exc)
+                    raise
+            if result:
+                if result.recreated:
+                    health_store.begin_readiness_transition("worker_rebuild")
+                    try:
+                        (
+                            consumers,
+                            executor,
+                            partitions,
+                            consecutive_failures,
+                        ) = _run_replacement_runtime_transaction(
+                            lambda: _replace_recreated_runtime(
+                                kafka_config,
+                                sr_client,
+                                topic,
+                                partitions,
+                                consumers,
+                                result.partition_count,
+                                max_workers,
+                                health_store,
+                                scheduler=scheduler,
                             )
-                            # Shut down old executor gracefully after in-flight checks complete
-                            executor.shutdown(wait=True)
-                            executor = ThreadPoolExecutor(max_workers=new_max_workers_count)
-
-                        log.info(
-                            "Consumer pool updated",
-                            extra={
-                                "num_partitions": result[1],
-                                "partitions": partitions,
-                                "added": len(added),
-                                "removed": len(removed),
-                            }
                         )
-                last_sync_time = time.time()
+                    except _ReplacementDispatchRejected:
+                        # Shutdown owns the lifecycle now. Leave the old
+                        # generation for the centralized cleanup path without
+                        # constructing any replacement Kafka clients.
+                        break
+                    except Exception as exc:
+                        health_store.record_fatal_internal("topic_reconciliation")
+                        _log_reconciliation_failure(
+                            "replacement_runtime_build", exc
+                        )
+                        raise
+                    num_partitions = result.partition_count
+                    health_store.end_readiness_transition()
+                    recreation_requested.clear()
+                    recreation_authorized.clear()
+                elif result.partition_count != len(partitions):
+                    log.info(
+                        "Partition count changed, updating consumer pool incrementally",
+                        extra={
+                            "old_partition_count": len(partitions),
+                            "new_partition_count": result.partition_count,
+                        }
+                    )
+                    partitions = list(range(result.partition_count))
+                    consecutive_failures.update(
+                        (partition, 0)
+                        for partition in partitions
+                        if partition not in consecutive_failures
+                    )
+                    scheduler.reconcile_partitions(partitions)
+                    scheduler_snapshot = scheduler.snapshot()
+                    health_store.replace_expected_partitions(
+                        partitions,
+                        scheduler_oldest_overdue=(
+                            scheduler_snapshot.oldest_overdue_seconds
+                        ),
+                    )
+                    metrics.reconcile_partition_metrics(partitions)
+                    health_store.end_readiness_transition()
+
+                    log.info(
+                        "Consumer pool updated",
+                        extra={
+                            "num_partitions": result.partition_count,
+                            "partitions": partitions,
+                            "worker_count": len(consumers),
+                        }
+                    )
+                    num_partitions = result.partition_count
+                metrics.BROKER_COUNT.set(result.broker_count)
+                metrics.TOPIC_PARTITION_COUNT.set(result.partition_count)
 
             # ------------------------------------------------------------------
             # Schema Registry health check — independent cadence and signal
@@ -980,145 +1645,336 @@ def run() -> None:
             # (the schema is cached after first use), so it must be probed
             # separately to surface SR outages as a distinct metric.
             # ------------------------------------------------------------------
-            if time.time() - last_sr_check_time >= sr_check_interval:
-                sr_start = time.time()
+            _dispatch_scheduled_operation(
+                sr_lane, lambda: _timed_sr_probe(sr_client)
+            )
+            sr_future = sr_lane.take_completed()
+            if sr_future is not None:
                 try:
-                    check_sr(sr_client)
-                    sr_duration_ms = (time.time() - sr_start) * 1000
+                    sr_duration_ms, sr_error = sr_future.result()
+                except OperationDeadlineExceeded as exc:
+                    sr_duration_ms = exc.timeout * 1000
+                    sr_error = CanaryError(
+                        Phase.SCHEMA_REGISTRY,
+                        ErrorCategory.NETWORK,
+                        "probe exceeded configured deadline",
+                    )
+                if sr_error is None:
+                    health_store.record_schema_registry_result(success=True)
                     metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
                     metrics.SR_CHECKS_TOTAL.labels(result="success", host=metrics.HOST).inc()
                     log.info("Schema Registry check succeeded", extra={"latency_ms": sr_duration_ms})
-                except CanaryError as exc:
-                    sr_duration_ms = (time.time() - sr_start) * 1000
+                else:
+                    health_store.record_schema_registry_result(
+                        success=False,
+                        deterministic_failure=sr_error.deterministic,
+                        failure=f"{sr_error.phase}:{sr_error.category}",
+                    )
                     metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
                     metrics.SR_CHECKS_TOTAL.labels(result="failure", host=metrics.HOST).inc()
                     log.error(
                         "Schema Registry check failed",
                         extra={
-                            "phase": exc.phase,
-                            "category": exc.category,
-                            "detail": exc.detail,
+                            "phase": sr_error.phase,
+                            "category": sr_error.category,
+                            "detail": sr_error.detail,
                             "latency_ms": sr_duration_ms,
                         }
                     )
-                last_sr_check_time = time.time()
 
             # ------------------------------------------------------------------
             # Canary check — the core measurement
-            # One check per partition runs concurrently via ThreadPoolExecutor.
-            # check_sequence is incremented once per cycle (not per partition)
-            # so it represents loop iterations; gaps indicate restarts.
+            # Select directly from the scheduler's single record per partition.
+            # No executor-side ready queue is built: at most max.workers oldest
+            # due checks are submitted, with deterministic partition tie breaks.
             # ------------------------------------------------------------------
-            check_sequence += 1
-            is_warming_up = check_sequence <= warmup_checks
+            worker_limit = min(len(partitions), max_workers)
+            next_sequence = check_sequence + 1
+            due_partitions = ()
+            if not recreation_requested.is_set():
+                dispatch_generation = health_store.topic_generation
+                due_partitions = _submit_due_checks(
+                    scheduler,
+                    executor,
+                    active_futures,
+                    worker_limit,
+                    next_sequence,
+                    lambda p, sequence=next_sequence: consumers.run(
+                        p,
+                        lambda consumer, deserializer: check_kafka(
+                            producer,
+                            avro_serializer,
+                            consumer,
+                            deserializer,
+                            topic,
+                            timeout,
+                            sequence,
+                            p,
+                        ),
+                    ),
+                    dispatch_generation,
+                )
+            if due_partitions:
+                check_sequence = next_sequence
+                _publish_scheduler_observability(scheduler, health_store)
 
-            futures = {
-                executor.submit(
-                    check_kafka, producer, avro_serializer, consumers[p], deserializers[p], topic, timeout, check_sequence, p
-                ): p
-                for p in partitions
-            }
+            if active_futures:
+                # Bound the wait so overdue ages continue to advance in metrics
+                # and /health while every worker remains occupied.
+                delay = SCHEDULER_HEARTBEAT_INTERVAL_SECONDS
+                sr_deadline_delay = sr_lane.seconds_until_deadline()
+                if sr_deadline_delay is not None:
+                    delay = min(delay, sr_deadline_delay)
+                for lane in (sr_lane, reconciliation_lane):
+                    lane_due_delay = lane.seconds_until_next_due()
+                    if lane_due_delay is not None:
+                        delay = min(delay, lane_due_delay)
+                if len(active_futures) < worker_limit:
+                    next_due_delay = scheduler.seconds_until_next_due()
+                    if next_due_delay is not None:
+                        delay = min(delay, next_due_delay)
+                completed, _ = wait(
+                    tuple(active_futures),
+                    timeout=max(0.0, delay),
+                    return_when=FIRST_COMPLETED,
+                )
+            else:
+                completed = set()
 
-            for future in as_completed(futures):
-                p = futures[future]
+            for future in sorted(
+                completed, key=lambda item: active_futures[item][0]
+            ):
+                p, completed_sequence, completed_generation = active_futures.pop(future)
                 try:
                     latency_ms = future.result()
 
                     # Success path — counters are always updated (even during warmup)
                     # so failure detection is never suppressed.
-                    _update_success_metrics(p, check_sequence, latency_ms, consecutive_failures, is_warming_up, num_partitions, partition_threshold)
+                    _record_successful_partition_attempt(
+                        health_store,
+                        p,
+                        completed_sequence,
+                        latency_ms,
+                        consecutive_failures,
+                        generation=completed_generation,
+                    )
 
-                    if is_warming_up:
-                        log.info(
-                            "Warmup check succeeded (latency not recorded)",
-                            extra={
-                                "check_sequence": check_sequence,
-                                "partition": p,
-                                "latency_ms": latency_ms,
-                                "warmup": True,
-                            }
-                        )
-                    else:
-                        log.info(
-                            "Check succeeded",
-                            extra={
-                                "check_sequence": check_sequence,
-                                "partition": p,
-                                "latency_ms": latency_ms,
-                            }
-                        )
+                except WorkerPoolInvariantError:
+                    # A missing worker-owned consumer creates a monitoring gap.
+                    # Fail closed so the centralized finalizer performs bounded
+                    # cleanup instead of dispatching against an incomplete pool.
+                    raise
 
                 except CanaryError as exc:
                     # Classified failure — phase and category are known
-                    _update_failure_metrics(p, check_sequence, consecutive_failures, exc.phase, exc.category, num_partitions, partition_threshold)
-                    log.error(
-                        "Check failed",
-                        extra={
-                            "consecutive_failures": consecutive_failures[p],
-                            "check_sequence": check_sequence,
-                            "partition": p,
-                            "phase": exc.phase,
-                            "category": exc.category,
-                            "detail": exc.detail,
-                        }
+                    accepted = _record_failed_partition_attempt(
+                        health_store,
+                        p,
+                        completed_sequence,
+                        consecutive_failures,
+                        exc.phase,
+                        exc.category,
+                        failure=f"{exc.phase}:{exc.category}",
+                        generation=completed_generation,
                     )
+                    if accepted:
+                        log.error(
+                            "Check failed",
+                            extra={
+                                "consecutive_failures": consecutive_failures[p],
+                                "check_sequence": completed_sequence,
+                                "partition": p,
+                                "phase": exc.phase,
+                                "category": exc.category,
+                                "detail": exc.detail,
+                            }
+                        )
 
                 except Exception as exc:
                     # Unexpected failure — not a CanaryError, so phase/category unknown.
                     # Still recorded in metrics so the failure is visible.
-                    _update_failure_metrics(p, check_sequence, consecutive_failures, "UNKNOWN", "UNKNOWN", num_partitions, partition_threshold)
-                    log.error(
-                        "Check failed (unexpected exception)",
-                        extra={
-                            "consecutive_failures": consecutive_failures[p],
-                            "check_sequence": check_sequence,
-                            "partition": p,
-                            "phase": "UNKNOWN",
-                            "category": "UNKNOWN",
-                            "detail": str(exc),
-                            "exception_type": type(exc).__name__,
-                        }
+                    accepted = _record_failed_partition_attempt(
+                        health_store,
+                        p,
+                        completed_sequence,
+                        consecutive_failures,
+                        "UNKNOWN",
+                        "UNKNOWN",
+                        failure="UNKNOWN:UNKNOWN",
+                        generation=completed_generation,
                     )
+                    if accepted:
+                        log.error(
+                            "Check failed (unexpected exception)",
+                            extra={
+                                "consecutive_failures": consecutive_failures[p],
+                                "check_sequence": completed_sequence,
+                                "partition": p,
+                                "phase": "UNKNOWN",
+                                "category": "UNKNOWN",
+                                "detail": str(exc),
+                                "exception_type": type(exc).__name__,
+                            }
+                        )
+                finally:
+                    scheduler.complete(p)
 
-            if is_warming_up and check_sequence == warmup_checks:
-                log.info(
-                    "Warmup complete, latency metrics enabled",
-                    extra={"warmup_checks": warmup_checks}
+                # Refill the freed worker immediately, even if another check
+                # from the previous dispatch remains blocked.
+                next_sequence = check_sequence + 1
+                refilled = ()
+                if not recreation_requested.is_set():
+                    dispatch_generation = health_store.topic_generation
+                    refilled = _submit_due_checks(
+                        scheduler,
+                        executor,
+                        active_futures,
+                        worker_limit,
+                        next_sequence,
+                        lambda partition, sequence=next_sequence: consumers.run(
+                            partition,
+                            lambda consumer, deserializer: check_kafka(
+                                producer,
+                                avro_serializer,
+                                consumer,
+                                deserializer,
+                                topic,
+                                timeout,
+                                sequence,
+                                partition,
+                            ),
+                        ),
+                        dispatch_generation,
+                    )
+                if refilled:
+                    check_sequence = next_sequence
+                _publish_scheduler_observability(scheduler, health_store)
+
+            # Destructive reconciliation is authorized only by the owner of
+            # Kafka dispatch, after every tracked future has been retired from
+            # both active_futures and PartitionScheduler.  The reconciliation
+            # worker cannot race submission or replace scheduler state early.
+            if (
+                recreation_requested.is_set()
+                and not recreation_authorized.is_set()
+                and not active_futures
+            ):
+                executor.shutdown(wait=True)
+                recreation_authorized.set()
+
+            if not completed:
+                _publish_scheduler_observability(scheduler, health_store)
+                if not active_futures:
+                    bounded_delay = SCHEDULER_HEARTBEAT_INTERVAL_SECONDS
+                    if not recreation_requested.is_set():
+                        delay = scheduler.seconds_until_next_due()
+                        if delay is not None:
+                            bounded_delay = min(bounded_delay, delay)
+                    for lane in (sr_lane, reconciliation_lane):
+                        lane_due_delay = lane.seconds_until_next_due()
+                        if lane_due_delay is not None:
+                            bounded_delay = min(bounded_delay, lane_due_delay)
+                    if bounded_delay > 0:
+                        sr_deadline_delay = sr_lane.seconds_until_deadline()
+                        if sr_deadline_delay is not None:
+                            bounded_delay = min(
+                                bounded_delay, sr_deadline_delay
+                            )
+                        log.debug(
+                            "Sleeping until next scheduler event",
+                            extra={"delay_seconds": bounded_delay},
+                        )
+                        _shutdown_event.wait(bounded_delay)
+
+            # Full partition-health aggregation is topology-linear, so keep it
+            # on a bounded cadence rather than repeating it per completion.
+            health_metrics_now = time.monotonic()
+            if health_metrics_now - last_health_metrics_update >= 1.0:
+                metrics.update_health_metrics(
+                    health_store.snapshot(), consecutive_failures
                 )
+                last_health_metrics_update = health_metrics_now
 
-            # Wait for the configured interval before the next check.
-            # Using Event.wait() instead of time.sleep() ensures that shutdown
-            # signals are detected immediately rather than waiting for the full
-            # interval. wait() returns True if shutdown was signaled, False on timeout.
-            log.debug("Sleeping until next check", extra={"interval_seconds": interval})
-            _shutdown_event.wait(interval)
-
+    except Exception:
+        # Runtime failures are terminal internal failures unless a more
+        # specific first-write-wins classification was already published.
+        health_store.record_fatal_internal("internal_runtime")
+        raise
     finally:
-        # Shut down executor gracefully, waiting for any in-flight checks to complete.
-        # This ensures all metrics are properly recorded before exit.
-        executor.shutdown(wait=True)
-
-        # Close all per-partition consumers so brokers remove them from their
-        # groups immediately rather than waiting for the session timeout.
-        for c in consumers.values():
-            c.close()
-
-        # Flush and release the producer to close connections immediately.
-        # confluent_kafka.Producer doesn't have a close() method, but flush()
-        # ensures all messages are delivered before the process exits and
-        # resources are cleaned up by __del__.
-        producer.flush(timeout=5)
+        # Signal publication remains lock-free; the lifecycle owner makes
+        # shutdown visible before any dependency cleanup can block.
+        _publish_shutdown_state(health_store)
+        # Release a reconciliation callback waiting for authorization without
+        # allowing it to begin deletion during exceptional shutdown.
+        recreation_cancelled.set()
+        recreation_authorized.set()
+        sr_lane.close()
+        reconciliation_lane.close()
+        _cleanup_runtime_resources(executor, consumers, producer)
 
         # Release the AdminClient to close connections immediately.
-        del admin
+        admin = None
 
         log.info("cloud_canary stopped")
 
         # Flush and detach the Kafka log handler so the last few log records
         # (including "cloud_canary stopped") reach the log topic before exit.
-        if kafka_log_handler:
-            logging.getLogger().removeHandler(kafka_log_handler)
-            kafka_log_handler.close()
+        _close_kafka_log_handler(kafka_log_handler)
+
+
+def _run_behind_daemon_boundary(
+    lifecycle,
+    *,
+    monotonic_clock=time.monotonic,
+    thread_factory=threading.Thread,
+    event_factory=threading.Event,
+) -> None:
+    """Run startup, runtime, and cleanup behind one abandonable boundary."""
+    completed = event_factory()
+    outcome = []
+
+    def invoke() -> None:
+        try:
+            lifecycle()
+        except BaseException as exc:
+            outcome.append(exc)
+        finally:
+            completed.set()
+
+    lifecycle_thread = thread_factory(
+        target=invoke,
+        name="cloud-canary-lifecycle",
+        daemon=True,
+    )
+    lifecycle_thread.start()
+
+    while not completed.is_set():
+        request = _active_shutdown_request()
+        if request is not None:
+            remaining = max(0.0, request.deadline - monotonic_clock())
+            if remaining == 0.0:
+                if _fatal_shutdown_request is not None:
+                    raise SystemExit(1)
+                return
+            completed.wait(min(0.05, remaining))
+        elif not _shutdown_request_claim:
+            # Publication has been claimed but its monotonic start has not yet
+            # been stored. Do not invent a fresh cleanup window.
+            return
+        else:
+            completed.wait(0.05)
+
+    if outcome:
+        raise outcome[0]
+    if _fatal_shutdown_request is not None:
+        raise SystemExit(1)
+
+
+def run() -> None:
+    """Own signals while the complete application lifecycle runs as a daemon."""
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    _run_behind_daemon_boundary(_run_lifecycle)
 
 
 if __name__ == "__main__":

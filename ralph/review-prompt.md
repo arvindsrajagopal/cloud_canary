@@ -11,6 +11,21 @@ Task:
 {{TASK_JSON}}
 ```
 
+Frozen decision ledger. These decisions are normative below reviewer advice. A
+decision may be challenged only with a direct conflicting citation from
+`SPEC.md`:
+
+```json
+{{DECISION_LEDGER}}
+```
+
+This is review cycle {{REVIEW_CYCLE}} of at most two. Prior findings and their
+known disposition:
+
+```text
+{{PRIOR_FINDINGS}}
+```
+
 Assigned acceptance criteria copied from `SPEC.md`:
 
 ```text
@@ -39,10 +54,24 @@ Deterministic quality-gate evidence:
 {{QUALITY_EVIDENCE}}
 ```
 
-Review the isolated patch first, then inspect only the changed files and the
-smallest necessary set of callers, configuration, and tests. Do not review
-unrelated changes accumulated from earlier accepted tasks. Evaluate all six
-categories independently:
+On every review cycle, including cycle 2, reassess the complete isolated patch
+at `{{PATCH_PATH}}` against the assigned acceptance criteria. Prior findings are
+context, not the review scope: do not limit review to those findings or to the
+latest correction. Then inspect only the changed files and the smallest
+necessary set of callers, configuration, and tests. Do not review unrelated
+changes accumulated from earlier accepted tasks.
+
+For every new centralized policy or architectural abstraction in the patch,
+trace it to production callers with concrete evidence. If production
+integration is intentionally deferred, name the specific pending task that owns
+integration and verify that its identifier exists in the active execution plan
+in `ralph/tasks.json`.
+
+Assess test expectations independently against the assigned `SPEC.md` text.
+Passing tests and quality-gate evidence support the review but do not prove
+that the implementation satisfies the specification.
+
+Evaluate all six categories independently:
 
 1. Consistency: configuration, naming, state transitions, endpoint semantics,
    metrics, documentation, and tests agree.
@@ -58,10 +87,26 @@ categories independently:
    behavior was weakened, silently reinterpreted, or expanded.
 
 Use concrete file and line evidence. A missing required test is a finding.
-Mark a category `FAIL` for any defect that must be corrected before accepting
-the iteration. Set `human_intervention` and verdict `HUMAN_REQUIRED` when the
-correct resolution needs a decision not present in `SPEC.md`. Otherwise verdict
-is `PASS` only when no category fails; warnings may remain only when they do not
-affect correctness, security, required behavior, or test adequacy.
+Classify every finding as exactly one of `BLOCKER_CURRENT_TASK`,
+`INTRODUCED_REGRESSION`, `FUTURE_TASK`, `SPEC_GAP`, or
+`NON_BLOCKING_IMPROVEMENT`. Only the first two classes may fail this task.
+`FUTURE_TASK` findings must name the owning pending task identifier, which must
+be present in the active execution plan in `ralph/tasks.json`; an undeclared,
+completed, or invented task is not a valid owner. Future-task work cannot block
+unless the current patch directly makes that future requirement impossible.
+`SPEC_GAP` requires `HUMAN_REQUIRED`; do not invent an implementation rule.
+Low- and medium-severity findings are automatically accepted and must be
+reported as warnings, even when they are in scope. Only high- or critical-
+severity `BLOCKER_CURRENT_TASK` or `INTRODUCED_REGRESSION` findings may fail the
+task.
+
+On review cycle 2, a newly reported blocker must say whether the correction
+introduced it or provide a concrete explanation of why it could not reasonably
+have been identified in cycle 1. Missing that explanation makes the finding a
+review-quality issue, not another implementation attempt.
+
+Mark a category `FAIL` only for a high/critical in-scope blocking finding. Reviewer
+recommendations are evidence and advice, not new requirements. Otherwise the
+verdict is `PASS`; future work and optional improvements may remain warnings.
 
 Return only the JSON object required by `ralph/review-schema.json`.

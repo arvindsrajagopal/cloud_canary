@@ -98,11 +98,11 @@ USER canary
 # Use JSON logging in Docker containers for log aggregators
 ENV CANARY_LOG_FORMAT=json
 
-# Health check - verify application is healthy
-# Uses /health endpoint which returns 200 only when healthy
+# Health check - verify the process is live
+# The probe reads metrics.port and metrics.ssl.enabled from config.ini.
 # start-period gives warmup time before first check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -f http://localhost:8000/health || exit 1
+  CMD ["python", "-m", "src.container_probe"]
 
 # Use entrypoint script to handle DNS configuration and diagnostics
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

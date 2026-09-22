@@ -43,6 +43,7 @@ import socket
 import threading
 import time
 import uuid
+from typing import Callable
 
 from confluent_kafka import KafkaException, Producer
 from confluent_kafka.schema_registry.avro import AvroSerializer
@@ -175,6 +176,8 @@ def produce_canary(
     topic: str,
     check_sequence: int,
     partition: int,
+    *,
+    monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> CanaryMessage:
     """
     Produce a single canary message to a specific partition and block until
@@ -286,7 +289,7 @@ def produce_canary(
     # causing serialization in multi-threaded environments (20 workers → 20x slowdown).
     # poll() processes delivery callbacks without waiting for other threads' messages,
     # enabling true parallelization of concurrent partition checks.
-    deadline = time.time() + const.PRODUCER_FLUSH_TIMEOUT_SECONDS
+    deadline = monotonic_clock() + const.PRODUCER_FLUSH_TIMEOUT_SECONDS
 
     while not callback_complete.is_set():
         # poll() drives librdkafka's event loop to process delivery callbacks.
@@ -295,7 +298,7 @@ def produce_canary(
         # allowing other threads to make progress.
         producer.poll(timeout=0.1)
 
-        if time.time() > deadline:
+        if monotonic_clock() >= deadline:
             # Timeout waiting for this message's callback.
             raise RuntimeError(
                 f"Produce timed out after {const.PRODUCER_FLUSH_TIMEOUT_SECONDS}s "

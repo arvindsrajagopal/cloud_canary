@@ -989,8 +989,33 @@ maximum concurrent partition checks = active workers
   before that worker accepts more work.
 - Pool exhaustion or backlog must not create additional workers or consumers
   beyond the configured bound.
-- Shutdown must stop dispatch, bound the wait for in-flight work, and close each
-  worker-owned consumer.
+- Shutdown must stop dispatch and bound the wait for in-flight work. Each worker
+  that releases ownership by the shutdown deadline must close its own consumer
+  before terminating.
+- Signal handling must attempt one atomic, first-write-wins publication claim as
+  its first state-mutating operation, using state allocated before signal
+  delivery. The signal that wins that atomic claim owns the shutdown request;
+  an earlier handler invocation that is re-entered before reaching the claim is
+  not considered published. After winning, the handler records the monotonic
+  start time and publishes one immutable request and deadline. The handler must
+  not acquire a dispatch-owned lock, log, access a `threading.Event`, or perform
+  dependency I/O. Later signals must not replace the winning request or extend
+  its deadline.
+- A dispatch transaction is linearized when it enters the dispatch guard. A
+  transaction that entered before the shutdown request is in-flight work and may
+  finish only its bounded in-memory scheduling and executor-queue submission. No
+  transaction entering after the shutdown request may submit work, and native or
+  dependency operations must never execute inside the dispatch guard.
+- A worker permanently blocked in a native or client call must not have its
+  consumer closed concurrently from another thread. After the shutdown deadline,
+  the process must terminate through the daemon execution boundary; operating
+  system process teardown releases resources owned by the wedged call. This is
+  an exceptional fatal-termination path, not graceful cleanup or permission to
+  resume dispatch.
+
+The effect of shutdown on `/live` and `/ready` is defined in Sections 6.1 and
+6.2 and is implemented with the endpoint contracts, independently of the
+bounded process-shutdown mechanism above.
 
 The producer remains shared across workers, subject to the Kafka client's
 documented thread-safety guarantees.

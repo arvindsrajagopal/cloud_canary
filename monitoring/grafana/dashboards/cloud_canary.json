@@ -86,7 +86,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "max(canary_consecutive_failures{host=~\"$host\"})",
+          "expr": "max(canary_partition_consecutive_failures{host=~\"$host\"})",
           "refId": "A",
           "legendFormat": ""
         }
@@ -217,7 +217,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "max(time() - canary_last_success_timestamp_seconds{host=~\"$host\"})",
+          "expr": "max(time() - canary_partition_last_success_timestamp_seconds{host=~\"$host\"})",
           "refId": "A",
           "legendFormat": ""
         }
@@ -929,7 +929,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "max(canary_consecutive_failures{host=~\"$host\"})",
+          "expr": "max(canary_partition_consecutive_failures{host=~\"$host\"})",
           "refId": "A",
           "legendFormat": "Consecutive Failures"
         }

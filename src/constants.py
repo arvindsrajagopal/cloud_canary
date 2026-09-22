@@ -115,6 +115,10 @@ DELETE_PROPAGATION_TIMEOUT_SECONDS = 30
 # Increased from 10s to 30s to accommodate cold-start latency on some networks.
 ADMIN_METADATA_TIMEOUT_SECONDS = 30
 
+# Hard bound for Kafka Admin API future completion. Metadata requests have
+# their own timeout; mutation futures must be bounded independently as well.
+ADMIN_FUTURE_TIMEOUT_SECONDS = 30
+
 # Sleep interval during deletion propagation wait loop in seconds.
 DELETE_PROPAGATION_POLL_INTERVAL_SECONDS = 1
 

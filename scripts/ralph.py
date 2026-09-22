@@ -25,6 +25,7 @@ MILESTONE_REVIEW_PROMPT_PATH = ROOT / "ralph" / "milestone-review-prompt.md"
 REVIEW_SCHEMA_PATH = ROOT / "ralph" / "review-schema.json"
 IMPLEMENTATION_SCHEMA_PATH = ROOT / "ralph" / "implementation-schema.json"
 DEVELOPMENT_REFERENCE_PATH = ROOT / "ralph" / "confluent-development-reference.md"
+DECISION_LEDGER_PATH = ROOT / "ralph" / "decisions.json"
 STATE_DIR = ROOT / ".ralph-state"
 STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "lock"
@@ -40,6 +41,9 @@ REVIEW_CATEGORIES = {
     "best_practices",
     "specification_deviation",
 }
+BLOCKING_FINDING_CLASSES = {"BLOCKER_CURRENT_TASK", "INTRODUCED_REGRESSION"}
+NON_BLOCKING_FINDING_CLASSES = {"FUTURE_TASK", "NON_BLOCKING_IMPROVEMENT"}
+MAJOR_FINDING_SEVERITIES = {"HIGH", "CRITICAL"}
 PROHIBITED_PATHS = {"config/config.ini"}
 PROHIBITED_SUFFIXES = {".jks", ".key", ".p12", ".pem", ".pfx"}
 CRITERION_PATTERN = re.compile(r"^(\d+)\.\s(.*)$")
@@ -201,6 +205,11 @@ def _spec_criteria() -> Dict[int, str]:
 
 
 def _criteria_text(task: Dict[str, Any]) -> str:
+    if task["criteria_range"] is None:
+        return "\n".join(
+            "Support acceptance: " + condition
+            for condition in task["acceptance_conditions"]
+        )
     criteria = _spec_criteria()
     start, end = task["criteria_range"]
     missing = [identifier for identifier in range(start, end + 1) if identifier not in criteria]
@@ -286,6 +295,29 @@ def _write_json(path: Path, payload: Any) -> None:
 
 def _load_plan() -> Dict[str, Any]:
     plan = _load_json(PLAN_PATH)
+    if plan.get("execution_status") not in {"active", "paused_for_replan"}:
+        raise RalphError("task plan has an invalid execution status")
+    if plan.get("decision_ledger") != str(DECISION_LEDGER_PATH.relative_to(ROOT)):
+        raise RalphError("task plan has an invalid decision ledger")
+    decisions = _load_json(DECISION_LEDGER_PATH)
+    if decisions.get("schema_version") != 1:
+        raise RalphError("decision ledger has an unsupported schema version")
+    review_policy = plan.get("review_policy", {})
+    if (
+        review_policy.get("max_review_cycles_per_task") != 2
+        or set(review_policy.get("blocking_finding_classes", []))
+        != BLOCKING_FINDING_CLASSES
+        or set(review_policy.get("blocking_severities", []))
+        != MAJOR_FINDING_SEVERITIES
+        or set(review_policy.get("auto_accept_severities", []))
+        != {"LOW", "MEDIUM"}
+        or review_policy.get("human_finding_class") != "SPEC_GAP"
+        or set(review_policy.get("non_blocking_finding_classes", []))
+        != NON_BLOCKING_FINDING_CLASSES
+        or review_policy.get("require_novelty_explanation_after_first_review")
+        is not True
+    ):
+        raise RalphError("task plan has an invalid review policy")
     if plan.get("development_reference") != str(
         DEVELOPMENT_REFERENCE_PATH.relative_to(ROOT)
     ):
@@ -313,9 +345,21 @@ def _load_plan() -> Dict[str, Any]:
         raise RalphError("task array must match the declared execution order")
     covered = []
     for index, task in enumerate(plan["tasks"]):
-        start, end = task["criteria_range"]
-        if end - start + 1 > 5:
-            raise RalphError("task {} exceeds five acceptance criteria".format(task["id"]))
+        criteria_range = task["criteria_range"]
+        if criteria_range is None:
+            conditions = task.get("acceptance_conditions")
+            if not isinstance(conditions, list) or not conditions or not all(
+                isinstance(condition, str) and condition.strip()
+                for condition in conditions
+            ):
+                raise RalphError(
+                    "support task {} has invalid acceptance conditions".format(task["id"])
+                )
+        else:
+            start, end = criteria_range
+            if end - start + 1 > 5:
+                raise RalphError("task {} exceeds five acceptance criteria".format(task["id"]))
+            covered.extend(range(start, end + 1))
         if not task.get("spec_sections"):
             raise RalphError("task {} has no targeted specification sections".format(task["id"]))
         development_sections = task.get("development_reference_sections")
@@ -339,7 +383,6 @@ def _load_plan() -> Dict[str, Any]:
             raise RalphError(
                 "task {} must depend on its immediate predecessor".format(task["id"])
             )
-        covered.extend(range(start, end + 1))
     expected = list(range(1, int(plan["completion_criteria_count"]) + 1))
     if sorted(covered) != expected or len(covered) != len(set(covered)):
         raise RalphError("task plan does not cover every criterion exactly once")
@@ -644,7 +687,8 @@ def _validate_implementation_report(report: Dict[str, Any]) -> None:
 
 
 def _validate_review(
-    review: Dict[str, Any], max_findings: int = 20, feedback_limit: int = 8000
+    review: Dict[str, Any], max_findings: int = 20, feedback_limit: int = 8000,
+    review_cycle: int = 1,
 ) -> Tuple[bool, str]:
     if review.get("verdict") not in {"PASS", "FAIL", "HUMAN_REQUIRED"}:
         raise RalphError("review has invalid verdict")
@@ -653,19 +697,36 @@ def _validate_review(
         raise RalphError("review does not contain the six required categories")
     blocking = []
     blocking_findings = []
+    auto_accepted_findings = []
+    specification_gaps = []
     for name, category in categories.items():
         if category.get("status") not in {"PASS", "WARN", "FAIL"}:
             raise RalphError("review category {} has invalid status".format(name))
-        if category["status"] == "FAIL":
-            blocking.append(name)
         for finding in category.get("findings", []):
-            if finding.get("severity") in {"HIGH", "CRITICAL"}:
+            classification = finding.get("classification")
+            if classification not in (
+                BLOCKING_FINDING_CLASSES
+                | NON_BLOCKING_FINDING_CLASSES
+                | {"SPEC_GAP"}
+            ):
+                raise RalphError("review finding has an invalid classification")
+            if classification == "FUTURE_TASK" and not finding.get("future_task"):
+                raise RalphError("future-task finding does not name its owning task")
+            is_major = finding.get("severity") in MAJOR_FINDING_SEVERITIES
+            if review_cycle > 1 and classification in BLOCKING_FINDING_CLASSES and is_major and not finding.get("novelty_explanation"):
+                raise HumanIntervention(
+                    "correction review introduced a blocker without the required novelty explanation"
+                )
+            if classification == "SPEC_GAP":
+                specification_gaps.append(finding.get("message", "specification gap"))
+            if classification in BLOCKING_FINDING_CLASSES and is_major:
                 blocking.append("{}:{}".format(name, finding.get("severity")))
-            if category["status"] == "FAIL" or finding.get("severity") in {"HIGH", "CRITICAL"}:
+            if classification in BLOCKING_FINDING_CLASSES and is_major:
                 if len(blocking_findings) < max_findings:
                     blocking_findings.append(
-                        "{category} {severity} {file}:{line} - {message} Recommendation: {recommendation}".format(
+                        "{category} {classification} {severity} {file}:{line} - {message} Recommendation: {recommendation}".format(
                             category=name,
+                            classification=classification,
                             severity=finding.get("severity", "UNKNOWN"),
                             file=finding.get("file", "unknown"),
                             line=finding.get("line") or "?",
@@ -673,14 +734,32 @@ def _validate_review(
                             recommendation=finding.get("recommendation", ""),
                         )
                     )
+            elif classification in BLOCKING_FINDING_CLASSES:
+                auto_accepted_findings.append(
+                    "{} {} {}:{} - {}".format(
+                        name,
+                        finding.get("severity", "UNKNOWN"),
+                        finding.get("file", "unknown"),
+                        finding.get("line") or "?",
+                        finding.get("message", ""),
+                    )
+                )
+    if specification_gaps:
+        raise HumanIntervention(
+            "review identified a specification gap:\n" + "\n".join(specification_gaps)
+        )
     if review.get("human_intervention") or review["verdict"] == "HUMAN_REQUIRED":
         raise HumanIntervention(review.get("summary", "review requires human intervention"))
-    passed = review["verdict"] == "PASS" and not blocking
+    passed = not blocking
     detail = review.get("summary", "")
     if blocking:
         detail += "\nBlocking review categories: " + ", ".join(sorted(set(blocking)))
     if blocking_findings:
         detail += "\nBlocking findings:\n" + "\n".join(blocking_findings)
+    if auto_accepted_findings:
+        detail += "\nAuto-accepted minor findings:\n" + "\n".join(
+            auto_accepted_findings[:max_findings]
+        )
     return passed, _bounded_text(detail.strip(), feedback_limit)
 
 
@@ -749,6 +828,9 @@ def _milestone_review(
             "CHANGED_FILES": "\n".join(sorted(changed)),
             "PATCH_PATH": str(patch_path.relative_to(ROOT)),
             "QUALITY_EVIDENCE": _bounded_text(quality_detail, feedback_limit),
+            "DECISION_LEDGER": json.dumps(
+                _load_json(DECISION_LEDGER_PATH), indent=2
+            ),
         },
     )
     review_text = _invoke_codex(
@@ -825,12 +907,13 @@ def _print_plan(plan: Dict[str, Any], state: Optional[Dict[str, Any]] = None) ->
     for task in plan["tasks"]:
         status = "complete" if task["id"] in completed else "pending"
         marker = " milestone" if task["milestone"] else ""
-        start, end = task["criteria_range"]
-        print(
-            "{} [{}] criteria {}-{}{}: {}".format(
-                task["id"], status, start, end, marker, task["title"]
-            )
+        criteria_range = task["criteria_range"]
+        scope = (
+            "support"
+            if criteria_range is None
+            else "criteria {}-{}".format(*criteria_range)
         )
+        print("{} [{}] {}{}: {}".format(task["id"], status, scope, marker, task["title"]))
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -858,8 +941,21 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         _print_plan(plan, existing_state)
         return 0
 
+    if plan["execution_status"] != "active":
+        raise HumanIntervention(
+            "Ralph implementation is paused for task replanning: "
+            + plan.get("pause_reason", "review ralph/REPLAN.md")
+        )
+
     max_iterations = args.max_iterations or int(plan["default_max_iterations"])
     max_attempts = args.max_attempts or int(plan["default_max_attempts_per_task"])
+    policy_max_attempts = int(plan["review_policy"]["max_review_cycles_per_task"])
+    if max_attempts > policy_max_attempts:
+        raise HumanIntervention(
+            "requested attempt limit {} exceeds the hard review-cycle limit {}".format(
+                max_attempts, policy_max_attempts
+            )
+        )
     limits = plan["context_limits"]
     feedback_limit = int(limits["max_feedback_characters"])
     max_changed_files = int(limits["max_changed_files"])
@@ -894,6 +990,12 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 _record_event(state, {"event": "complete", "detail": detail})
                 print("All Ralph tasks and the final quality gate are complete.")
                 return 0
+            if task.get("requires_replan"):
+                raise HumanIntervention(
+                    "task {} is a deliberate replan gate; split and review this phase before execution".format(
+                        task["id"]
+                    )
+                )
 
             feedback = state["feedback"].get(task["id"], "none")
             iterations += 1
@@ -934,6 +1036,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                         "ATTEMPT": str(attempt),
                         "MAX_ATTEMPTS": str(max_attempts),
                         "FEEDBACK": _bounded_text(feedback or "none", feedback_limit),
+                        "DECISION_LEDGER": json.dumps(
+                            _load_json(DECISION_LEDGER_PATH), indent=2
+                        ),
                     },
                 )
                 if args.dry_run:
@@ -1073,6 +1178,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                         "QUALITY_EVIDENCE": _bounded_text(
                             quality_detail, feedback_limit
                         ),
+                        "DECISION_LEDGER": json.dumps(
+                            _load_json(DECISION_LEDGER_PATH), indent=2
+                        ),
+                        "PRIOR_FINDINGS": _bounded_text(
+                            feedback or "none", feedback_limit
+                        ),
+                        "REVIEW_CYCLE": str(attempt),
                     },
                 )
                 review_text = _invoke_codex(
@@ -1098,6 +1210,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     review,
                     max_findings=max_review_findings,
                     feedback_limit=feedback_limit,
+                    review_cycle=attempt,
                 )
                 if not review_passed:
                     feedback = _persist_feedback(

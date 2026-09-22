@@ -14,10 +14,9 @@
 #
 # Label strategy
 # --------------
-# Per-partition metrics (latency histograms, checks counters, consecutive
-#     failures gauge) carry BOTH `host` and `partition` labels.  Callers must
-#     include both in every .labels() call:
-#         metrics.E2E_LATENCY.labels(host=metrics.HOST, partition=str(p)).observe(ms)
+# Aggregate metrics never carry a `partition` label.  Their variable labels
+# are closed enums so exception text and other unbounded values cannot create
+# new time series.
 #
 # Cluster-level and process-level metrics (broker count, uptime, etc.) carry
 #     only `host`.  These are pre-labeled at module load time using HOST.
@@ -46,6 +45,7 @@
 import logging
 import os
 import socket
+import threading
 
 from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 
@@ -58,18 +58,46 @@ log = logging.getLogger(__name__)
 # multi-instance deployments on the same host.
 HOST = os.getenv("CANARY_INSTANCE_ID") or socket.gethostname()
 
+RESULT_VALUES = frozenset({"success", "failure"})
+STATE_VALUES = frozenset({"healthy", "degraded", "unhealthy"})
+FAILURE_PHASE_VALUES = frozenset({
+    "ASSIGNMENT", "SEEK", "PRODUCE", "CONSUME", "SCHEMA_REGISTRY",
+    "METADATA_FETCH", "TOPIC_CREATE", "TOPIC_EXPAND", "TOPIC_DELETE",
+    "TOPIC_VERIFY", "CONSUMER_CREATE", "CONSUMER_REPLACE", "SCHEDULER",
+    "STATE_UPDATE", "HTTP_REQUEST", "STARTUP", "SHUTDOWN", "UNKNOWN",
+})
+FAILURE_CATEGORY_VALUES = frozenset({
+    "NETWORK", "BROKER_SERVICE", "AUTHENTICATION", "AUTHORIZATION",
+    "TLS_CERTIFICATE", "CONFIGURATION", "SERIALIZATION", "CLIENT_STATE",
+    "CAPACITY", "INTERNAL", "UNKNOWN",
+})
+RECOVERABILITY_VALUES = frozenset({
+    "TRANSIENT", "DETERMINISTIC", "INTERNAL_FATAL", "UNKNOWN",
+})
+
+
+def bounded_label(value, allowed: frozenset[str], aliases=None) -> str:
+    """Return a closed-enum metric label, mapping unclassified input safely."""
+    candidate = getattr(value, "value", value)
+    candidate = str(candidate)
+    if aliases:
+        candidate = aliases.get(candidate, candidate)
+    if candidate in allowed:
+        return candidate
+    if "UNKNOWN" in allowed:
+        return "UNKNOWN"
+    raise ValueError(f"unsupported metric label value: {candidate!r}")
+
+
 # ---------------------------------------------------------------------------
-# Latency histograms — labeled per host AND partition at call time.
-# Checks target individual partitions. Kafka controls leader placement, so multiple
-# partitions may share a leader and distinct coverage of every broker is not guaranteed.
+# Aggregate latency histograms — labeled only by host at call time.
 # ---------------------------------------------------------------------------
 
 E2E_LATENCY = Histogram(
     "canary_e2e_latency_ms",
     "End-to-end latency per check (produce timestamp → consumer receive timestamp) in ms, "
     "aggregated across all partitions per host. Partition label removed to prevent cardinality "
-    "explosion on large clusters (100 partitions × 12 buckets = 1200 series per host). "
-    "Use canary_checks_total{partition=N} to identify per-partition issues.",
+    "explosion on large clusters.",
     ["host"],
     buckets=[10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
 )
@@ -93,48 +121,215 @@ PRODUCE_DURATION = Histogram(
 )
 
 # ---------------------------------------------------------------------------
-# Reliability counters — host and partition are variable labels;
-# callers must pass both in every .labels() call.
+# Aggregate reliability counters. These deliberately omit partition identity;
+# partition-specific signals use the separately named per-partition metrics.
 # ---------------------------------------------------------------------------
 
 CHECKS_TOTAL = Counter(
     "canary_checks_total",
-    "Total canary check attempts, labelled by result, host, and partition. "
-    "Use rate(canary_checks_total[5m]) to compute check throughput per broker.",
-    ["result", "host", "partition"],
+    "Total canary check attempts, labelled by bounded result and host.",
+    ["host", "result"],
     # result values: "success" | "failure"
 )
 
 FAILURES_TOTAL = Counter(
     "canary_failures_total",
     "Failed canary checks, labelled by the phase where the error occurred, its category, "
-    "host, and partition. Use to identify whether failures are connectivity-related (NETWORK) "
-    "or cluster-side (BROKER), which pipeline stage is affected, and which broker is at fault.",
-    ["phase", "category", "host", "partition"],
-    # phase values:    SEEK | PRODUCE | CONSUME | SCHEMA_REGISTRY | ASSIGNMENT | UNKNOWN
-    # category values: NETWORK | BROKER | UNKNOWN
+    "recoverability, and host. Labels use closed enums and never exception text.",
+    ["host", "phase", "category", "recoverability"],
 )
 
+# Aggregate health gauges. State children are maintained only for the three
+# bounded states; the remaining gauges have no variable label beyond host.
+PARTITIONS_BY_STATE = Gauge(
+    "canary_partitions_by_state",
+    "Current number of expected Kafka partitions in each bounded health state.",
+    ["host", "state"],
+)
+
+WORST_PARTITION_STALENESS_SECONDS = Gauge(
+    "canary_worst_partition_staleness_seconds",
+    "Greatest seconds since success among observed expected Kafka partitions.",
+    ["host"],
+)
+
+MAX_CONSECUTIVE_FAILURES = Gauge(
+    "canary_max_consecutive_failures",
+    "Greatest current consecutive failure streak among expected Kafka partitions.",
+    ["host"],
+)
+
+OLDEST_PARTITION_OVERDUE_SECONDS = Gauge(
+    "canary_oldest_partition_overdue_seconds",
+    "Seconds the oldest due Kafka partition check is overdue.",
+    ["host"],
+)
+
+SCHEDULER_PENDING_CHECKS = Gauge(
+    "canary_scheduler_pending_checks",
+    "Number of due Kafka partition checks waiting for worker capacity.",
+    ["host"],
+)
+
+SCHEDULER_IN_FLIGHT_CHECKS = Gauge(
+    "canary_scheduler_in_flight_checks",
+    "Number of Kafka partition checks currently executing.",
+    ["host"],
+)
+
+PARTITION_COVERAGE_DURATION_SECONDS = Gauge(
+    "canary_partition_coverage_duration_seconds",
+    "Effective seconds covered by the current partition scheduling records.",
+    ["host"],
+)
+
+# Materialize the complete bounded state vocabulary and scalar aggregate
+# series even before the first check completes.
+for _state in STATE_VALUES:
+    PARTITIONS_BY_STATE.labels(host=HOST, state=_state).set(0)
+WORST_PARTITION_STALENESS_SECONDS.labels(host=HOST).set(0)
+MAX_CONSECUTIVE_FAILURES.labels(host=HOST).set(0)
+OLDEST_PARTITION_OVERDUE_SECONDS.labels(host=HOST).set(0)
+SCHEDULER_PENDING_CHECKS.labels(host=HOST).set(0)
+SCHEDULER_IN_FLIGHT_CHECKS.labels(host=HOST).set(0)
+PARTITION_COVERAGE_DURATION_SECONDS.labels(host=HOST).set(0)
+
+
+def update_scheduler_metrics(snapshot) -> None:
+    """Publish one immutable scheduler snapshot without partition labels."""
+    SCHEDULER_PENDING_CHECKS.labels(host=HOST).set(snapshot.pending)
+    SCHEDULER_IN_FLIGHT_CHECKS.labels(host=HOST).set(snapshot.in_flight)
+    OLDEST_PARTITION_OVERDUE_SECONDS.labels(host=HOST).set(
+        snapshot.oldest_overdue_seconds
+    )
+    PARTITION_COVERAGE_DURATION_SECONDS.labels(host=HOST).set(
+        snapshot.coverage_duration_seconds
+    )
+
+
+def update_health_metrics(snapshot, consecutive_failures) -> None:
+    """Publish aggregate partition health from one immutable state snapshot."""
+    counts = {state: 0 for state in STATE_VALUES}
+    staleness = []
+    expected_partitions = set()
+    for index, component in enumerate(snapshot.partitions):
+        state = bounded_label(component.status, STATE_VALUES)
+        counts[state] += 1
+        component_name = getattr(component, "component", f"kafka:{index}")
+        partition = component_name.removeprefix("kafka:")
+        expected_partitions.add(partition)
+        with _partition_metric_lock:
+            _set_partition_state(partition, state)
+        if component.staleness_seconds is not None:
+            staleness.append(max(0.0, component.staleness_seconds))
+
+    reconcile_partition_metrics(expected_partitions)
+
+    for state, count in counts.items():
+        PARTITIONS_BY_STATE.labels(host=HOST, state=state).set(count)
+    WORST_PARTITION_STALENESS_SECONDS.labels(host=HOST).set(
+        max(staleness, default=0.0)
+    )
+    MAX_CONSECUTIVE_FAILURES.labels(host=HOST).set(
+        max(consecutive_failures.values(), default=0)
+    )
+
+
 # ---------------------------------------------------------------------------
-# Reliability gauge — labeled per host AND partition at call time.
-# Alert fires if ANY partition's streak reaches the threshold.
+# Stable per-partition metrics. These are the only metric families that carry
+# a partition label; their other labels are closed enums.
 # ---------------------------------------------------------------------------
 
-CONSECUTIVE_FAILURES = Gauge(
-    "canary_consecutive_failures",
+PARTITION_LAST_SUCCESS_TIMESTAMP_SECONDS = Gauge(
+    "canary_partition_last_success_timestamp_seconds",
+    "Unix timestamp of the last successful check for an expected partition.",
+    ["host", "partition"],
+)
+
+PARTITION_CONSECUTIVE_FAILURES = Gauge(
+    "canary_partition_consecutive_failures",
     "Current streak of consecutive check failures without an intervening success, "
-    "per host and partition. Primary alerting signal — alert when this value exceeds "
-    "a threshold (e.g. >= 3). Resets to 0 on any successful check for that partition.",
+    "per host and partition.",
     ["host", "partition"],
 )
 
-LAST_SUCCESS_TIMESTAMP = Gauge(
-    "canary_last_success_timestamp_seconds",
-    "Unix timestamp of the last successful check per host and partition. "
-    "Use (time() - canary_last_success_timestamp_seconds) to detect stale monitoring. "
-    "Alert if this value is too far in the past (e.g., > 300s means no success in 5 minutes).",
-    ["host", "partition"],
+PARTITION_CHECKS_TOTAL = Counter(
+    "canary_partition_checks_total",
+    "Check attempts for an expected partition, labelled by bounded result.",
+    ["host", "partition", "result"],
 )
+
+PARTITION_CURRENT_STATE = Gauge(
+    "canary_partition_current_state",
+    "Current bounded health state for an expected partition; exactly one state is present.",
+    ["host", "partition", "state"],
+)
+
+_partition_metric_lock = threading.RLock()
+_known_partitions: set[str] = set()
+_partition_states: dict[str, str] = {}
+_partition_results: dict[str, set[str]] = {}
+_partitions_with_success: set[str] = set()
+
+
+def record_partition_check(
+    partition: int,
+    result: str,
+    consecutive_failures: int,
+    last_success: float | None = None,
+) -> None:
+    """Update stable per-partition check metrics using bounded labels."""
+    result = bounded_label(result, RESULT_VALUES)
+    partition_label = str(partition)
+    with _partition_metric_lock:
+        _known_partitions.add(partition_label)
+        PARTITION_CHECKS_TOTAL.labels(
+            host=HOST, partition=partition_label, result=result
+        ).inc()
+        _partition_results.setdefault(partition_label, set()).add(result)
+        PARTITION_CONSECUTIVE_FAILURES.labels(
+            host=HOST, partition=partition_label
+        ).set(consecutive_failures)
+        if last_success is not None:
+            PARTITION_LAST_SUCCESS_TIMESTAMP_SECONDS.labels(
+                host=HOST, partition=partition_label
+            ).set(last_success)
+            _partitions_with_success.add(partition_label)
+
+
+def _set_partition_state(partition: str, state: str) -> None:
+    """Replace, rather than retain, a partition's previous state child."""
+    previous = _partition_states.get(partition)
+    if previous is not None and previous != state:
+        PARTITION_CURRENT_STATE.remove(HOST, partition, previous)
+    PARTITION_CURRENT_STATE.labels(host=HOST, partition=partition, state=state).set(1)
+    _partition_states[partition] = state
+    _known_partitions.add(partition)
+
+
+def reconcile_partition_metrics(expected_partitions, *, reset: bool = False) -> None:
+    """Remove children for deleted partitions or a replaced topic generation."""
+    expected = {str(partition) for partition in expected_partitions}
+    with _partition_metric_lock:
+        removed = set(_known_partitions) if reset else _known_partitions - expected
+        for partition in removed:
+            if partition in _partitions_with_success:
+                PARTITION_LAST_SUCCESS_TIMESTAMP_SECONDS.remove(HOST, partition)
+            PARTITION_CONSECUTIVE_FAILURES.remove(HOST, partition)
+            for result in _partition_results.get(partition, ()):
+                PARTITION_CHECKS_TOTAL.remove(HOST, partition, result)
+            state = _partition_states.pop(partition, None)
+            if state is not None:
+                PARTITION_CURRENT_STATE.remove(HOST, partition, state)
+            _partition_results.pop(partition, None)
+            _partitions_with_success.discard(partition)
+        _known_partitions.difference_update(removed)
+
+
+# Compatibility aliases reference the required families without registering
+# legacy metric names.
+CONSECUTIVE_FAILURES = PARTITION_CONSECUTIVE_FAILURES
+LAST_SUCCESS_TIMESTAMP = PARTITION_LAST_SUCCESS_TIMESTAMP_SECONDS
 
 # ---------------------------------------------------------------------------
 # Schema Registry metrics — host is a variable label; callers must pass host=HOST
@@ -223,6 +418,7 @@ def start_metrics_server(
 
     Spawns a background daemon thread that serves multiple endpoints:
     - /metrics — Prometheus metrics exposition format
+    - /live    — Process and scheduler-control-plane liveness
     - /health  — Kafka dependency-health summary (healthy/degraded/unhealthy)
     - /ready   — Readiness probe (ready/not_ready)
 
@@ -262,7 +458,11 @@ def start_metrics_server(
     import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-    from src.health import get_health_status, get_readiness_status
+    from src.health import (
+        get_health_status,
+        get_liveness_status,
+        get_readiness_status,
+    )
 
     class CanaryHTTPHandler(BaseHTTPRequestHandler):
         """
@@ -270,7 +470,7 @@ def start_metrics_server(
         """
 
         def do_GET(self):
-            """Handle GET requests for /metrics, /health, and /ready"""
+            """Handle GET requests for /metrics, /live, /health, and /ready."""
 
             if self.path == "/metrics":
                 # Prometheus metrics endpoint
@@ -282,6 +482,36 @@ def start_metrics_server(
                     self.wfile.write(metrics_output)
                 except Exception as e:
                     self.send_error(500, f"Error generating metrics: {e}")
+
+            elif self.path == "/live":
+                try:
+                    liveness = get_liveness_status()
+                    self.send_response(liveness.http_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    response = {
+                        "status": liveness.status.value,
+                        "timestamp": liveness.timestamp,
+                        "scheduler_heartbeat_age_seconds": (
+                            liveness.scheduler_heartbeat_age_seconds
+                        ),
+                        "shutdown_started": liveness.shutdown_started,
+                        "message": liveness.message,
+                    }
+                    self.wfile.write(json.dumps(response, indent=2).encode())
+                except Exception:
+                    log.error("Liveness evaluation failed")
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    response = {
+                        "status": "not_live",
+                        "timestamp": None,
+                        "scheduler_heartbeat_age_seconds": None,
+                        "shutdown_started": False,
+                        "message": "Liveness evaluation failed",
+                    }
+                    self.wfile.write(json.dumps(response, indent=2).encode())
 
             elif self.path == "/health":
                 # Kafka dependency-health endpoint
@@ -299,8 +529,19 @@ def start_metrics_server(
                         "checks": health.checks,
                     }
                     self.wfile.write(json.dumps(response, indent=2).encode())
-                except Exception as e:
-                    self.send_error(500, f"Error checking health: {e}")
+                except Exception:
+                    log.error("Health evaluation failed")
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    response = {
+                        "status": "unhealthy",
+                        "timestamp": None,
+                        "uptime_seconds": None,
+                        "message": "Health evaluation failed",
+                        "checks": {},
+                    }
+                    self.wfile.write(json.dumps(response, indent=2).encode())
 
             elif self.path == "/ready":
                 # Readiness probe endpoint
@@ -317,8 +558,18 @@ def start_metrics_server(
                         "checks": readiness.checks,
                     }
                     self.wfile.write(json.dumps(response, indent=2).encode())
-                except Exception as e:
-                    self.send_error(500, f"Error checking readiness: {e}")
+                except Exception:
+                    log.error("Readiness evaluation failed")
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    response = {
+                        "status": "not_ready",
+                        "timestamp": None,
+                        "message": "Readiness evaluation failed",
+                        "checks": {},
+                    }
+                    self.wfile.write(json.dumps(response, indent=2).encode())
 
             else:
                 # Unknown endpoint
