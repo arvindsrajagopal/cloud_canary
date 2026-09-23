@@ -105,7 +105,8 @@ artifact are verified against the restored accepted baseline.
 | R54 | 63–64 | HTTP method policy and response redaction |
 | R55 | 65 | HTTPS probe verification — milestone |
 | R56 | 66–67 | Development monitoring versus enterprise monitoring |
-| R57 | 68–69 | Long-lived startup clients and deterministic failures |
+| R57 | 68 | Long-lived startup client validation |
+| R100 | 69 | Deterministic startup failure execution |
 | R58 | 70 | Transient startup health and retry-stage isolation |
 | R59 | 71–72 | Backoff progression and single-flight initialization |
 | R60 | 73–74 | Partial-client cleanup and warmup capability proof |
@@ -224,14 +225,17 @@ initialization behavior can be split before implementation.
 
 ## R14 activation
 
-R14 was replaced after R56 completed. The activated sequence separates
-long-lived client ownership and deterministic failure from transient startup
-state:
+R14 was replaced after R56 completed. The initial R57 attempt exceeded its
+diff budget because it combined two independently testable invariants, so the
+activated sequence now separates long-lived client ownership, deterministic
+failure execution, and transient startup state:
 
-1. R57 owns criteria 68–69: validation through the actual long-lived Kafka
-   administrative and Schema Registry clients, plus deterministic startup
-   failure through centralized recovery and bounded cleanup.
-2. R58 owns criterion 70: live-but-unready transient initialization state,
+1. R57 owns criterion 68: validation through the actual long-lived Kafka
+   administrative and Schema Registry clients, including alignment of the
+   existing ordering and reconciliation tests.
+2. R100 owns criterion 69: deterministic startup failure through typed,
+   centralized recovery and bounded cleanup.
+3. R58 owns criterion 70: live-but-unready transient initialization state,
    unhealthy dependency reporting, and retry of only the current failed stage.
 
 Backoff progression, attempt overlap, partial-client cleanup, warmup capability

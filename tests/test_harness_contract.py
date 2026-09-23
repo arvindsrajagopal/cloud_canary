@@ -35,7 +35,7 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(66, len(plan["tasks"]))
+        self.assertEqual(67, len(plan["tasks"]))
         self.assertEqual("active", plan["execution_status"])
         self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
         self.assertTrue(
@@ -77,7 +77,7 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertEqual(len(identifiers), len(set(identifiers)))
         self.assertTrue(any(task["milestone"] for task in plan["tasks"]))
         for index, task in enumerate(plan["tasks"]):
-            self.assertRegex(task["id"], r"^R\d{2}$")
+            self.assertRegex(task["id"], r"^R\d{2,3}$")
             expected_dependency = [] if index == 0 else [identifiers[index - 1]]
             self.assertEqual(expected_dependency, task["depends_on"], task["id"])
             self.assertTrue(task["test_files"], task["id"])
@@ -217,9 +217,15 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertEqual(["R55"], tasks["R56"]["depends_on"])
         self.assertEqual([66, 67], tasks["R56"]["criteria_range"])
         self.assertEqual(["R56"], tasks["R57"]["depends_on"])
-        self.assertEqual([68, 69], tasks["R57"]["criteria_range"])
-        self.assertEqual(["R57"], tasks["R58"]["depends_on"])
+        self.assertEqual([68, 68], tasks["R57"]["criteria_range"])
+        self.assertEqual(["R57"], tasks["R100"]["depends_on"])
+        self.assertEqual([69, 69], tasks["R100"]["criteria_range"])
+        self.assertEqual(["R100"], tasks["R58"]["depends_on"])
         self.assertEqual([70, 70], tasks["R58"]["criteria_range"])
+        self.assertIn(
+            "Deterministic startup termination owned by R100",
+            tasks["R58"]["explicit_exclusions"],
+        )
         self.assertEqual(["R58"], tasks["R15"]["depends_on"])
         self.assertTrue(tasks["R15"]["requires_replan"])
 
@@ -242,7 +248,7 @@ class SpecificationCoverageTests(unittest.TestCase):
         tasks = {
             task["id"]: task for task in _load_json("ralph/tasks.json")["tasks"]
         }
-        for task_id in ("R57", "R58"):
+        for task_id in ("R57", "R100", "R58"):
             task = tasks[task_id]
             self.assertTrue(task["ownership_boundary"].strip())
             self.assertTrue(task["explicit_exclusions"])
