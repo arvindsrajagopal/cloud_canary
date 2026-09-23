@@ -151,6 +151,7 @@ from src.health_state import HealthStateStore
 from src.kafka_log_handler import KafkaLogHandler
 from src.metrics import start_metrics_server
 from src.producer import create_producer, produce_canary
+from src.recovery_policy import RecoveryAction, RecoveryContext, recovery_action
 from src.scheduler import (
     OperationDeadlineExceeded,
     PartitionScheduler,
@@ -383,9 +384,12 @@ def _record_schema_registry_completion(health_store, duration_ms, error) -> None
         return
 
     failure, failure_label, failure_fields = _bounded_completion_failure(error)
+    action = recovery_action(failure, RecoveryContext.RUNTIME)
     health_store.record_schema_registry_result(
         success=False,
-        deterministic_failure=error.deterministic,
+        deterministic_failure=(
+            action is RecoveryAction.MARK_COMPONENT_UNHEALTHY
+        ),
         failure=failure_label,
     )
     metrics.SR_CHECKS_TOTAL.labels(result="failure", host=metrics.HOST).inc()
@@ -393,6 +397,8 @@ def _record_schema_registry_completion(health_store, duration_ms, error) -> None
         "Schema Registry check failed",
         extra={**failure_fields, "latency_ms": duration_ms},
     )
+    if action is RecoveryAction.TERMINATE_PROCESS:
+        _request_fatal_shutdown()
 
 
 def check_kafka(
