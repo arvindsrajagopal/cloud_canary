@@ -30,15 +30,15 @@ pip install -r requirements.txt
 
 # 3. Configure credentials
 cp config/config.ini.template config/config.ini
-# Edit config/config.ini — fill in bootstrap.servers, sasl.username/password,
-# schema_registry url, and basic.auth.user.info
+# Edit config/config.ini — fill in endpoints and usernames, then configure the
+# file-backed Kafka and Schema Registry secret sources.
 
 # 4. Run the canary (from project root)
 python -m src.main
 
 # 5. (Optional) Start the development-only monitoring stack separately.
 #    Docker and Docker Compose V2 must already be installed and running.
-./run.sh start
+docker compose -f monitoring/docker-compose.yml up -d
 # Prometheus: http://localhost:9090   Grafana: http://localhost:3000
 # Grafana's admin/admin credential is for local development only.
 ```
@@ -234,7 +234,6 @@ cloud_canary/
 │
 ├── .gitignore
 ├── requirements.txt
-├── run.sh                      # Starts or stops only the local monitoring stack
 └── README.md
 ```
 
@@ -249,7 +248,7 @@ cloud_canary/
 | A Confluent Cloud cluster | Dedicated or Basic tier both work |
 | Kafka API key + secret | Needs `TOPIC:CREATE`, `TOPIC:WRITE`, `TOPIC:READ` ACLs on `cloud-canary*` |
 | Schema Registry API key + secret | Needs `SUBJECT:READ` and `SUBJECT:WRITE` on `com.cloud.canary*` |
-| Docker + Docker Compose V2 | Only required for the optional local monitoring workflow. Uses `docker compose` (space, not hyphen). Install and start the runtime yourself before using `run.sh`; the helper never manages the external runtime. |
+| Docker + Docker Compose V2 | Only required for the optional local monitoring workflow. Uses `docker compose` (space, not hyphen). Install and start the runtime yourself before using the explicit monitoring commands; the project never manages the external runtime. |
 
 ---
 
@@ -291,6 +290,12 @@ cp config/config.ini.template config/config.ini
 ```
 
 Open `config/config.ini` and fill in your Confluent Cloud credentials:
+
+For production, mount secrets as files and set `sasl.password.file` and
+`basic.auth.user.info.file` to those paths. Use `ssl.key.password.file` when a
+password-protected Kafka client key is configured. Each `.file` setting is
+mutually exclusive with its inline counterpart. A fully secret-mounted INI is
+also supported; direct secret environment variables are not recommended.
 
 ```ini
 [kafka]
@@ -768,16 +773,17 @@ readinessProbe:
 > Grafana ports bind to loopback by default.
 
 The stack requires an already installed and running Docker-compatible runtime
-with Docker Compose V2. The helper reports missing prerequisites and never
-installs, starts, stops, or reconfigures the external runtime. The canary
-process can be started or stopped independently and must be running on the host
-for successful scraping (Prometheus scrapes
+with Docker Compose V2. Verify prerequisites with `docker compose version` and
+`docker info`; failures are non-mutating and identify the missing CLI, Compose
+plugin, or unavailable runtime. The project never installs, starts, stops, or
+reconfigures the external runtime. The canary process can be started or stopped
+independently and must be running on the host for successful scraping (Prometheus scrapes
 `host.docker.internal:8000`).
 
 ### Start the stack
 
 ```bash
-./run.sh start
+docker compose -f monitoring/docker-compose.yml up -d
 ```
 
 | Service | URL | Credentials |
@@ -803,7 +809,7 @@ canary's `/metrics` endpoint, with appropriate transport and network controls.
 ### Stop the stack
 
 ```bash
-./run.sh stop                # stops containers, preserves data volumes
+docker compose -f monitoring/docker-compose.yml down  # preserves data volumes
 ```
 
 ### Dashboard panels

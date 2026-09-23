@@ -28,6 +28,65 @@ log = logging.getLogger(__name__)
 
 SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 1.0
 
+SECRET_SOURCES = (
+    ("kafka", "sasl.password", True),
+    ("schema_registry", "basic.auth.user.info", True),
+    ("kafka", "ssl.key.password", False),
+)
+
+
+def _read_secret_file(path: str) -> str:
+    """Read a configured secret file without normalizing its line endings."""
+    with open(path, encoding="utf-8", newline="") as secret_file:
+        return secret_file.read()
+
+
+def _remove_one_trailing_line_ending(value: str) -> str:
+    if value.endswith("\r\n"):
+        return value[:-2]
+    if value.endswith(("\r", "\n")):
+        return value[:-1]
+    return value
+
+
+def resolve_secret_sources(config: dict) -> None:
+    """Resolve configured secret files into client settings in place."""
+    for section, setting, required in SECRET_SOURCES:
+        values = config.get(section, {})
+        file_setting = f"{setting}.file"
+        has_inline = setting in values
+        has_file = file_setting in values
+        setting_name = f"[{section}].{setting}"
+
+        if has_inline and has_file:
+            raise ValueError(
+                f"{setting_name} and {setting_name}.file are mutually exclusive"
+            )
+        if not has_inline and not has_file:
+            if required:
+                raise ValueError(
+                    f"Missing required secret source: {setting_name} or "
+                    f"{setting_name}.file"
+                )
+            continue
+
+        if has_file:
+            path = values[file_setting]
+            if not path:
+                raise ValueError(f"Secret file setting is empty: {setting_name}.file")
+            try:
+                resolved = _remove_one_trailing_line_ending(_read_secret_file(path))
+            except (OSError, UnicodeError):
+                raise ValueError(
+                    f"Unable to read secret for {setting_name}"
+                ) from None
+            if not resolved:
+                raise ValueError(f"Resolved secret is empty: {setting_name}")
+            values[setting] = resolved
+            del values[file_setting]
+        elif not values[setting]:
+            raise ValueError(f"Inline secret is empty: {setting_name}")
+
 
 def validate_config(config: dict) -> None:
     """
@@ -357,8 +416,9 @@ def load_config(path: str = "config/config.ini") -> dict:
         "app":             dict(parser["app"]),
     }
 
-    # Validate configuration before returning
+    # Resolve file-backed credentials before validation or client construction.
     try:
+        resolve_secret_sources(config)
         validate_config(config)
     except ValueError as exc:
         sys.exit(f"Configuration error: {exc}")

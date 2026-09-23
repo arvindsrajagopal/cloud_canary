@@ -6,7 +6,9 @@ bootstrap.servers=pkc-xxxxx.region.provider.confluent.cloud:9092
 security.protocol=SASL_SSL
 sasl.mechanisms=PLAIN
 sasl.username=YOUR_KAFKA_API_KEY
-sasl.password=YOUR_KAFKA_API_SECRET
+# Use exactly one secret source. File-backed secrets are recommended in production.
+sasl.password.file=/run/secrets/kafka_api_secret
+#sasl.password=YOUR_KAFKA_API_SECRET
 
 # SSL/TLS Certificate Validation
 # CRITICAL: Ensures secure connection to Confluent Cloud
@@ -23,11 +25,15 @@ enable.ssl.certificate.verification=true
 # Uncomment if your Confluent Cloud deployment requires client certificates:
 #ssl.certificate.location=/app/certs/client-cert.pem
 #ssl.key.location=/app/certs/client-key.pem
+# Use at most one of these when the private key is password protected:
+#ssl.key.password.file=/run/secrets/kafka_ssl_key_password
 #ssl.key.password=optional_key_password
 
 [schema_registry]
 url=https://psrc-xxxxx.region.provider.confluent.cloud
-basic.auth.user.info=SR_API_KEY:SR_API_SECRET
+# Use exactly one secret source. The file must contain SR_API_KEY:SR_API_SECRET.
+basic.auth.user.info.file=/run/secrets/schema_registry_basic_auth
+#basic.auth.user.info=SR_API_KEY:SR_API_SECRET
 
 [app]
 topic=cloud-canary
