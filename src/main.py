@@ -102,6 +102,7 @@ import concurrent.futures
 import logging
 import os
 import signal
+import ssl
 import sys
 import threading
 import time
@@ -284,6 +285,81 @@ def _request_fatal_shutdown() -> None:
     except IndexError:
         return
     _shutdown_request = request
+
+
+def _startup_failure(
+    exc: BaseException,
+    *,
+    phase: Phase,
+    component: FailureComponent,
+    schema_registry: bool = False,
+) -> FailureDescriptor:
+    """Classify a startup exception without retaining dependency data."""
+    if isinstance(exc, CanaryError):
+        return exc.failure
+    if (
+        isinstance(exc, KafkaException)
+        and exc.args
+        and isinstance(exc.args[0], KafkaError)
+    ):
+        return classify_kafka_error(
+            exc.args[0], phase=phase, component=component
+        )
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return FailureDescriptor(
+            component=component,
+            phase=phase,
+            category=ErrorCategory.TLS_CERTIFICATE,
+            recoverability=Recoverability.DETERMINISTIC,
+            code="TLS.CERTIFICATE_VERIFICATION_FAILED",
+            safe_summary=FailureSummary.OPERATION_FAILED,
+        )
+    if isinstance(exc, (SystemExit, ValueError, TypeError, FileNotFoundError)):
+        return FailureDescriptor(
+            component=component,
+            phase=phase,
+            category=ErrorCategory.CONFIGURATION,
+            recoverability=Recoverability.DETERMINISTIC,
+            code="STARTUP.INVALID_CONFIGURATION",
+            safe_summary=FailureSummary.INVALID_CONFIGURATION,
+        )
+    if schema_registry:
+        return classify_schema_registry_error(exc)
+    return FailureDescriptor(
+        component=component,
+        phase=phase,
+        category=ErrorCategory.UNKNOWN,
+        recoverability=Recoverability.UNKNOWN,
+        code=None,
+        safe_summary=FailureSummary.OPERATION_FAILED,
+    )
+
+
+def _execute_startup_operation(operation, classifier):
+    """Execute startup work through centralized classification and policy."""
+    try:
+        return operation()
+    except _StartupDispatchRejected:
+        raise
+    except (Exception, SystemExit) as exc:
+        failure = classifier(exc)
+        action = recovery_action(failure, RecoveryContext.STARTUP)
+
+    log.error(
+        "Startup operation failed",
+        extra={
+            "phase": failure.phase,
+            "category": failure.category,
+            "code": failure.code,
+            "detail": failure.safe_summary,
+            "recovery_action": action,
+        },
+    )
+    if action is RecoveryAction.FAIL_STARTUP:
+        _request_fatal_shutdown()
+    # Raise after leaving the handler so the bounded error does not retain the
+    # raw exception or its potentially sensitive text through __context__.
+    raise CanaryError(failure)
 
 
 def check_sr(sr_client: SchemaRegistryClient) -> None:
@@ -1223,7 +1299,14 @@ def _run_lifecycle_owned(http_owner) -> None:
     """
     global _shutdown_timeout_seconds
 
-    config = load_config(CONFIG_FILE)
+    config = _execute_startup_operation(
+        lambda: load_config(CONFIG_FILE),
+        lambda exc: _startup_failure(
+            exc,
+            phase=Phase.STARTUP,
+            component=FailureComponent.INTERNAL_STATE,
+        ),
+    )
     kafka_config  = config["kafka"]
     sr_config     = config["schema_registry"]
     app           = config["app"]
@@ -1351,8 +1434,22 @@ def _run_lifecycle_owned(http_owner) -> None:
     # Reusing the AdminClient across topic operations eliminates repeated
     # TCP handshakes and metadata fetches, improving startup performance.
     # ------------------------------------------------------------------
-    admin = _run_startup_dependency(lambda: AdminClient(kafka_config))
-    _run_startup_dependency(lambda: validate_kafka_startup_client(admin))
+    def classify_kafka_startup(exc):
+        return _startup_failure(
+            exc,
+            phase=Phase.METADATA_FETCH,
+            component=FailureComponent.KAFKA_PARTITION,
+        )
+    admin = _execute_startup_operation(
+        lambda: _run_startup_dependency(lambda: AdminClient(kafka_config)),
+        classify_kafka_startup,
+    )
+    _execute_startup_operation(
+        lambda: _run_startup_dependency(
+            lambda: validate_kafka_startup_client(admin)
+        ),
+        classify_kafka_startup,
+    )
 
     # ------------------------------------------------------------------
     # Startup: ensure the canary topic exists before creating clients.
@@ -1408,11 +1505,24 @@ def _run_lifecycle_owned(http_owner) -> None:
     # and by check_sr() for independent SR health checks.
     sr_client_config = dict(sr_config)
     sr_client_config["timeout"] = sr_check_timeout
-    sr_client = _run_startup_dependency(
-        lambda: SchemaRegistryClient(sr_client_config)
+    def classify_sr_startup(exc):
+        return _startup_failure(
+            exc,
+            phase=Phase.SCHEMA_REGISTRY,
+            component=FailureComponent.SCHEMA_REGISTRY,
+            schema_registry=True,
+        )
+    sr_client = _execute_startup_operation(
+        lambda: _run_startup_dependency(
+            lambda: SchemaRegistryClient(sr_client_config)
+        ),
+        classify_sr_startup,
     )
-    _run_startup_dependency(
-        lambda: validate_schema_registry_startup_client(sr_client)
+    _execute_startup_operation(
+        lambda: _run_startup_dependency(
+            lambda: validate_schema_registry_startup_client(sr_client)
+        ),
+        classify_sr_startup,
     )
 
     # Resource placeholders make startup reconciliation and construction failures
@@ -1423,8 +1533,11 @@ def _run_lifecycle_owned(http_owner) -> None:
 
     # Create the long-lived producer and serializer.  Thread-safe in librdkafka —
     # shared across all per-partition check threads.
-    producer, avro_serializer = _run_startup_dependency(
-        lambda: create_producer(kafka_config, sr_client)
+    producer, avro_serializer = _execute_startup_operation(
+        lambda: _run_startup_dependency(
+            lambda: create_producer(kafka_config, sr_client)
+        ),
+        classify_kafka_startup,
     )
 
     # ------------------------------------------------------------------
@@ -1457,10 +1570,13 @@ def _run_lifecycle_owned(http_owner) -> None:
     # Create one exclusively owned consumer per active worker. The pool
     # manually reassigns each consumer before every partition check.
     try:
-        consumers = _run_startup_dependency(
-            lambda: _build_consumer_pool(
-                kafka_config, sr_client, topic, partitions, max_workers
-            )
+        consumers = _execute_startup_operation(
+            lambda: _run_startup_dependency(
+                lambda: _build_consumer_pool(
+                    kafka_config, sr_client, topic, partitions, max_workers
+                )
+            ),
+            classify_kafka_startup,
         )
         # Retaining one executor with the configured upper bound allows safe
         # additive scale-up while _submit_due_checks keeps active work at
@@ -1894,10 +2010,10 @@ def _run_behind_daemon_boundary(
         else:
             completed.wait(0.05)
 
-    if outcome:
-        raise outcome[0]
     if _fatal_shutdown_request is not None:
         raise SystemExit(1)
+    if outcome:
+        raise outcome[0]
 
 
 def run() -> None:

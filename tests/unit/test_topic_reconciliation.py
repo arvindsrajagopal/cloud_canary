@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import call, patch
 
 from src import metrics
+from src.error_classifier import CanaryError
 from src.health_state import HealthStateStore
 from src.main import (
     _shutdown_event,
@@ -382,13 +383,14 @@ class TopicReconciliationTests(unittest.TestCase):
             patch("src.main.configure_health_state"),
             patch("src.main.log", logger),
         ):
-            with self.assertRaisesRegex(RuntimeError, "pool failed"):
+            with self.assertRaises(CanaryError) as raised:
                 run()
 
+        self.assertNotIn("pool failed", str(raised.exception))
         producer.flush.assert_called_once_with(timeout=5)
         logger.error.assert_called_with(
             "Fatal topic reconciliation failure",
-            extra={"stage": "initial_runtime_build", "error": "RuntimeError"},
+            extra={"stage": "initial_runtime_build", "error": "CanaryError"},
         )
 
     def test_control_loop_rebuild_failure_runs_final_cleanup_and_propagates(self):
