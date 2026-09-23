@@ -247,7 +247,7 @@ class PlanAndPromptTests(unittest.TestCase):
 
     def test_next_broad_phase_is_an_explicit_replan_gate(self):
         plan = ralph._load_plan()
-        task = next(task for task in plan["tasks"] if task["id"] == "R14")
+        task = next(task for task in plan["tasks"] if task["id"] == "R15")
         self.assertTrue(task["requires_replan"])
 
     def test_r13_migration_selects_r53_after_completed_prefix(self):
@@ -257,6 +257,31 @@ class PlanAndPromptTests(unittest.TestCase):
 
         self.assertEqual("R52", state["completed_tasks"][-1])
         self.assertEqual("R53", ralph._select_task(plan, state, None)["id"])
+
+    def test_r14_migration_selects_r57_after_completed_prefix(self):
+        plan = ralph._load_plan()
+        completed = [
+            "R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27",
+            "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86",
+            "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40",
+            "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91",
+            "R92", "R94", "R95", "R96", "R97", "R98", "R93", "R99", "R49",
+            "R47", "R50", "R48", "R51", "R52", "R53", "R54", "R55", "R56",
+        ]
+        state = {
+            "completed_tasks": completed,
+            "current_task": None,
+            "repository_fingerprint": "recorded",
+            "working_tree_fingerprint": "clean",
+            "attempts": {},
+            "feedback": {},
+            "plan_schema_version": 40,
+        }
+
+        self.assertEqual(40, plan["schema_version"])
+        ralph._validate_state(plan, state)
+        self.assertEqual("R56", state["completed_tasks"][-1])
+        self.assertEqual("R57", ralph._select_task(plan, state, None)["id"])
 
     def test_state_completion_must_be_an_execution_order_prefix(self):
         plan = ralph._load_plan()

@@ -221,3 +221,19 @@ in separate ownership boundaries:
 The monitoring criteria were removed from the old R14 range. Execution stops
 at R14 so long-lived startup clients, deterministic failures, and transient
 initialization behavior can be split before implementation.
+
+## R14 activation
+
+R14 was replaced after R56 completed. The activated sequence separates
+long-lived client ownership and deterministic failure from transient startup
+state:
+
+1. R57 owns criteria 68–69: validation through the actual long-lived Kafka
+   administrative and Schema Registry clients, plus deterministic startup
+   failure through centralized recovery and bounded cleanup.
+2. R58 owns criterion 70: live-but-unready transient initialization state,
+   unhealthy dependency reporting, and retry of only the current failed stage.
+
+Backoff progression, attempt overlap, partial-client cleanup, warmup capability
+proof, and the production entry point remain outside this sequence. Execution
+stops at R15 so criteria 71–75 can be split before implementation.
