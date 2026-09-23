@@ -247,8 +247,16 @@ class PlanAndPromptTests(unittest.TestCase):
 
     def test_next_broad_phase_is_an_explicit_replan_gate(self):
         plan = ralph._load_plan()
-        task = next(task for task in plan["tasks"] if task["id"] == "R13")
+        task = next(task for task in plan["tasks"] if task["id"] == "R14")
         self.assertTrue(task["requires_replan"])
+
+    def test_r13_migration_selects_r53_after_completed_prefix(self):
+        plan = ralph._load_plan()
+        r53_index = plan["execution_order"].index("R53")
+        state = {"completed_tasks": plan["execution_order"][:r53_index]}
+
+        self.assertEqual("R52", state["completed_tasks"][-1])
+        self.assertEqual("R53", ralph._select_task(plan, state, None)["id"])
 
     def test_state_completion_must_be_an_execution_order_prefix(self):
         plan = ralph._load_plan()

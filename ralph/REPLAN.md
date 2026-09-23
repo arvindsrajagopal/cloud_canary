@@ -202,3 +202,22 @@ boundary:
 Endpoint exposure, method policy, response redaction, TLS probing, and monitoring
 deployment policy remain outside this sequence. Execution stops at R13 so that
 security and enterprise-monitoring work is split before implementation.
+
+## R13 activation
+
+R13 was replaced after the R52 milestone passed. The activated sequence keeps
+endpoint exposure, method policy, probe TLS, and monitoring deployment policy
+in separate ownership boundaries:
+
+1. R53 owns criteria 61–62: loopback listener defaults and the warning for an
+   explicitly configured non-loopback plaintext listener.
+2. R54 owns criteria 63–64: read-only HTTP method handling and bounded response
+   redaction.
+3. R55 owns criterion 65: certificate-verifying HTTPS liveness probing. R55 is
+   the endpoint-security milestone.
+4. R56 owns criteria 66–67: the development-only Prometheus/Grafana stack and
+   the externally managed enterprise-monitoring contract.
+
+The monitoring criteria were removed from the old R14 range. Execution stops
+at R14 so long-lived startup clients, deterministic failures, and transient
+initialization behavior can be split before implementation.

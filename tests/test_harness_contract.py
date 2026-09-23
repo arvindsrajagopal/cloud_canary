@@ -35,7 +35,7 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(62, len(plan["tasks"]))
+        self.assertEqual(65, len(plan["tasks"]))
         self.assertEqual("active", plan["execution_status"])
         self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
         self.assertTrue(
@@ -207,8 +207,33 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertEqual(["R50"], tasks["R48"]["depends_on"])
         self.assertEqual(["R48"], tasks["R51"]["depends_on"])
         self.assertEqual(["R51"], tasks["R52"]["depends_on"])
-        self.assertEqual(["R52"], tasks["R13"]["depends_on"])
-        self.assertTrue(tasks["R13"]["requires_replan"])
+        self.assertEqual(["R52"], tasks["R53"]["depends_on"])
+        self.assertEqual([61, 62], tasks["R53"]["criteria_range"])
+        self.assertEqual(["R53"], tasks["R54"]["depends_on"])
+        self.assertEqual([63, 64], tasks["R54"]["criteria_range"])
+        self.assertEqual(["R54"], tasks["R55"]["depends_on"])
+        self.assertEqual([65, 65], tasks["R55"]["criteria_range"])
+        self.assertTrue(tasks["R55"]["milestone"])
+        self.assertEqual(["R55"], tasks["R56"]["depends_on"])
+        self.assertEqual([66, 67], tasks["R56"]["criteria_range"])
+        self.assertEqual(["R56"], tasks["R14"]["depends_on"])
+        self.assertEqual([68, 70], tasks["R14"]["criteria_range"])
+        self.assertTrue(tasks["R14"]["requires_replan"])
+
+    def test_endpoint_security_phase_has_bounded_task_shapes(self):
+        tasks = {
+            task["id"]: task for task in _load_json("ralph/tasks.json")["tasks"]
+        }
+        for task_id in ("R53", "R54", "R55", "R56"):
+            task = tasks[task_id]
+            self.assertTrue(task["ownership_boundary"].strip())
+            self.assertTrue(task["explicit_exclusions"])
+            self.assertTrue(task["failure_mode_checklist"])
+            start, end = task["criteria_range"]
+            self.assertLessEqual(end - start + 1, 3)
+            self.assertLessEqual(task["budget"]["max_changed_files"], 4)
+            self.assertLessEqual(task["budget"]["max_diff_lines"], 500)
+            self.assertLessEqual(len(task["allowed_paths"]), 4)
 
 
 class PromptAndReviewContractTests(unittest.TestCase):
