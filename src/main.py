@@ -371,6 +371,30 @@ def _timed_sr_probe(sr_client: SchemaRegistryClient):
         return (time.monotonic() - started) * 1000, exc
 
 
+def _record_schema_registry_completion(health_store, duration_ms, error) -> None:
+    """Record one completed production SR probe from bounded result data."""
+    metrics.SR_LATENCY.labels(host=metrics.HOST).observe(duration_ms)
+    if error is None:
+        health_store.record_schema_registry_result(success=True)
+        metrics.SR_CHECKS_TOTAL.labels(result="success", host=metrics.HOST).inc()
+        log.info(
+            "Schema Registry check succeeded", extra={"latency_ms": duration_ms}
+        )
+        return
+
+    failure, failure_label, failure_fields = _bounded_completion_failure(error)
+    health_store.record_schema_registry_result(
+        success=False,
+        deterministic_failure=error.deterministic,
+        failure=failure_label,
+    )
+    metrics.SR_CHECKS_TOTAL.labels(result="failure", host=metrics.HOST).inc()
+    log.error(
+        "Schema Registry check failed",
+        extra={**failure_fields, "latency_ms": duration_ms},
+    )
+
+
 def check_kafka(
     producer: Producer,
     avro_serializer: AvroSerializer,
@@ -982,6 +1006,90 @@ def _record_failed_partition_attempt(
         category,
     )
     return True
+
+
+def _record_kafka_completion(
+    health_store: HealthStateStore,
+    partition: int,
+    check_sequence: int,
+    generation: int,
+    consecutive_failures: dict[int, int],
+    completed_future,
+) -> None:
+    """Record one completed production Kafka check using bounded result data."""
+    try:
+        latency_ms = completed_future.result()
+        _record_successful_partition_attempt(
+            health_store,
+            partition,
+            check_sequence,
+            latency_ms,
+            consecutive_failures,
+            generation=generation,
+        )
+        return
+    except WorkerPoolInvariantError:
+        raise
+    except (ConsumerFailure, CanaryError) as error:
+        failure, failure_label, failure_fields = _bounded_completion_failure(error)
+        accepted = _record_failed_partition_attempt(
+            health_store,
+            partition,
+            check_sequence,
+            consecutive_failures,
+            failure.phase,
+            failure.category,
+            failure=failure_label,
+            generation=generation,
+        )
+        if accepted:
+            message = (
+                "Consumer check failed after replacement"
+                if isinstance(error, ConsumerFailure)
+                else "Check failed"
+            )
+            log.error(
+                message,
+                extra={
+                    "consecutive_failures": consecutive_failures[partition],
+                    "check_sequence": check_sequence,
+                    "partition": partition,
+                    **failure_fields,
+                },
+            )
+        return
+    except Exception:
+        # Unknown exception content is deliberately discarded at completion.
+        bounded_error = CanaryError(_local_kafka_failure(
+            Phase.UNKNOWN,
+            ErrorCategory.UNKNOWN,
+            Recoverability.UNKNOWN,
+            "CANARY.UNEXPECTED_COMPLETION",
+            FailureSummary.INTERNAL_FAILURE,
+        ))
+        failure, failure_label, failure_fields = _bounded_completion_failure(
+            bounded_error
+        )
+        accepted = _record_failed_partition_attempt(
+            health_store,
+            partition,
+            check_sequence,
+            consecutive_failures,
+            failure.phase,
+            failure.category,
+            failure=failure_label,
+            generation=generation,
+        )
+        if accepted:
+            log.error(
+                "Check failed (unexpected exception)",
+                extra={
+                    "consecutive_failures": consecutive_failures[partition],
+                    "check_sequence": check_sequence,
+                    "partition": partition,
+                    **failure_fields,
+                },
+            )
 
 
 def _update_failure_metrics(
@@ -1706,36 +1814,17 @@ def _run_lifecycle() -> None:
                     sr_duration_ms, sr_error = sr_future.result()
                 except OperationDeadlineExceeded as exc:
                     sr_duration_ms = exc.timeout * 1000
-                    sr_error = CanaryError(
-                        FailureDescriptor(
-                            component=FailureComponent.SCHEMA_REGISTRY,
-                            phase=Phase.SCHEMA_REGISTRY,
-                            category=ErrorCategory.NETWORK,
-                            recoverability=Recoverability.TRANSIENT,
-                            code="CANARY.SR_PROBE_TIMEOUT",
-                            safe_summary=FailureSummary.OPERATION_TIMED_OUT,
-                        )
-                    )
-                if sr_error is None:
-                    health_store.record_schema_registry_result(success=True)
-                    metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
-                    metrics.SR_CHECKS_TOTAL.labels(result="success", host=metrics.HOST).inc()
-                    log.info("Schema Registry check succeeded", extra={"latency_ms": sr_duration_ms})
-                else:
-                    sr_failure, sr_failure_label, sr_failure_fields = (
-                        _bounded_completion_failure(sr_error)
-                    )
-                    health_store.record_schema_registry_result(
-                        success=False,
-                        deterministic_failure=sr_error.deterministic,
-                        failure=sr_failure_label,
-                    )
-                    metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
-                    metrics.SR_CHECKS_TOTAL.labels(result="failure", host=metrics.HOST).inc()
-                    log.error(
-                        "Schema Registry check failed",
-                        extra={**sr_failure_fields, "latency_ms": sr_duration_ms}
-                    )
+                    sr_error = CanaryError(FailureDescriptor(
+                        component=FailureComponent.SCHEMA_REGISTRY,
+                        phase=Phase.SCHEMA_REGISTRY,
+                        category=ErrorCategory.NETWORK,
+                        recoverability=Recoverability.TRANSIENT,
+                        code="CANARY.SR_PROBE_TIMEOUT",
+                        safe_summary=FailureSummary.OPERATION_TIMED_OUT,
+                    ))
+                _record_schema_registry_completion(
+                    health_store, sr_duration_ms, sr_error
+                )
 
             # ------------------------------------------------------------------
             # Canary check — the core measurement
@@ -1801,101 +1890,14 @@ def _run_lifecycle() -> None:
             ):
                 p, completed_sequence, completed_generation = active_futures.pop(future)
                 try:
-                    latency_ms = future.result()
-
-                    # Success path — counters are always updated (even during warmup)
-                    # so failure detection is never suppressed.
-                    _record_successful_partition_attempt(
+                    _record_kafka_completion(
                         health_store,
                         p,
                         completed_sequence,
-                        latency_ms,
+                        completed_generation,
                         consecutive_failures,
-                        generation=completed_generation,
+                        future,
                     )
-
-                except WorkerPoolInvariantError:
-                    # A missing worker-owned consumer creates a monitoring gap.
-                    # Fail closed so the centralized finalizer performs bounded
-                    # cleanup instead of dispatching against an incomplete pool.
-                    raise
-
-                except ConsumerFailure as exc:
-                    failure, failure_label, failure_fields = (
-                        _bounded_completion_failure(exc)
-                    )
-                    accepted = _record_failed_partition_attempt(
-                        health_store,
-                        p,
-                        completed_sequence,
-                        consecutive_failures,
-                        failure.phase,
-                        failure.category,
-                        failure=failure_label,
-                        generation=completed_generation,
-                    )
-                    if accepted:
-                        log.error(
-                            "Consumer check failed after replacement",
-                            extra={
-                                "consecutive_failures": consecutive_failures[p],
-                                "check_sequence": completed_sequence,
-                                "partition": p,
-                                **failure_fields,
-                            },
-                        )
-
-                except CanaryError as exc:
-                    failure, failure_label, failure_fields = (
-                        _bounded_completion_failure(exc)
-                    )
-                    accepted = _record_failed_partition_attempt(
-                        health_store,
-                        p,
-                        completed_sequence,
-                        consecutive_failures,
-                        failure.phase,
-                        failure.category,
-                        failure=failure_label,
-                        generation=completed_generation,
-                    )
-                    if accepted:
-                        log.error(
-                            "Check failed",
-                            extra={
-                                "consecutive_failures": consecutive_failures[p],
-                                "check_sequence": completed_sequence,
-                                "partition": p,
-                                **failure_fields,
-                            }
-                        )
-
-                except Exception as exc:
-                    # Unexpected failure — not a CanaryError, so phase/category unknown.
-                    # Still recorded in metrics so the failure is visible.
-                    accepted = _record_failed_partition_attempt(
-                        health_store,
-                        p,
-                        completed_sequence,
-                        consecutive_failures,
-                        "UNKNOWN",
-                        "UNKNOWN",
-                        failure="UNKNOWN:UNKNOWN",
-                        generation=completed_generation,
-                    )
-                    if accepted:
-                        log.error(
-                            "Check failed (unexpected exception)",
-                            extra={
-                                "consecutive_failures": consecutive_failures[p],
-                                "check_sequence": completed_sequence,
-                                "partition": p,
-                                "phase": "UNKNOWN",
-                                "category": "UNKNOWN",
-                                "detail": str(exc),
-                                "exception_type": type(exc).__name__,
-                            }
-                        )
                 finally:
                     scheduler.complete(p)
 
