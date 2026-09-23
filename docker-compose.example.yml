@@ -15,8 +15,8 @@
 
 services:
   cloud-canary:
-    image: cloud-canary:latest
-    build: .
+    # Replace with the explicit version published by your approved image registry.
+    image: cloud-canary:1.2.3
     container_name: cloud-canary
     restart: unless-stopped
     environment:
@@ -58,8 +58,7 @@ services:
 
   # Example: Second canary instance for redundancy or multi-region monitoring
   # cloud-canary-region-2:
-  #   image: cloud-canary:latest
-  #   build: .
+  #   image: cloud-canary:1.2.3
   #   container_name: cloud-canary-region-2
   #   restart: unless-stopped
   #   environment:

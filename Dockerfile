@@ -1,35 +1,35 @@
 # Dockerfile for cloud_canary
 #
 # Build:
-#   docker build -t cloud-canary:latest .
+#   docker build -t cloud-canary:1.2.3 .
 #
 # Run:
 #   docker run --rm \
 #     -e CANARY_INSTANCE_ID=my-canary-1 \
 #     -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
 #     -p 8000:8000 \
-#     cloud-canary:latest
+#     cloud-canary:1.2.3
 #
 # Run with HTTPS:
 #   docker run --rm \
 #     -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
 #     -v $(pwd)/certs:/certs:ro \
 #     -p 8000:8000 \
-#     cloud-canary:latest
+#     cloud-canary:1.2.3
 #   (Ensure config.ini has metrics.ssl.enabled=true and cert/key paths)
 #
 # DNS Troubleshooting:
 #   If you encounter DNS resolution issues with Confluent Cloud:
 #
 #   1. Run diagnostics:
-#      docker run --rm cloud-canary:latest diagnose
+#      docker run --rm cloud-canary:1.2.3 diagnose
 #
 #   2. Use custom DNS servers (recommended method):
 #      docker run --rm \
 #        --dns 8.8.8.8 --dns 8.8.4.4 \
 #        -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
 #        -p 8000:8000 \
-#        cloud-canary:latest
+#        cloud-canary:1.2.3
 #
 #   3. Or use docker-compose.yml with DNS configuration:
 #      services:

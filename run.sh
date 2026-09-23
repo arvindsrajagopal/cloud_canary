@@ -1,61 +1,56 @@
 #!/usr/bin/env bash
-# run.sh — Start cloud_canary together with its monitoring stack.
-#
-# Usage:
-#   ./run.sh [INSTANCE_ID]
-#
-# Examples:
-#   ./run.sh                    # Uses hostname as instance ID
-#   ./run.sh canary-dev-1       # Sets custom instance ID
-#   CANARY_INSTANCE_ID=my-id ./run.sh  # Via environment variable
-#
-# What it does:
-#   1. Starts Prometheus + Grafana via docker compose (detached)
-#   2. Launches the canary app in the foreground
-#   3. Tears down the monitoring stack on normal exit and trappable termination
-#      signals. SIGKILL cannot be trapped and therefore cannot trigger cleanup.
-#
-# Prometheus : http://localhost:9090
-# Grafana    : http://localhost:3000  (admin / admin)
-# Metrics    : http://localhost:8000/metrics
+# Manage only the optional local Prometheus and Grafana stack.
+# The canary is started separately with: python -m src.main
 
 set -euo pipefail
 
-# Optional: Set instance ID from command-line argument
-# Usage: ./run.sh canary-dev-1
-if [ $# -ge 1 ]; then
-    export CANARY_INSTANCE_ID="$1"
-    echo "Using instance ID: $CANARY_INSTANCE_ID"
-elif [ -n "${CANARY_INSTANCE_ID:-}" ]; then
-    echo "Using instance ID from environment: $CANARY_INSTANCE_ID"
-else
-    echo "Using default instance ID (hostname)"
+usage() {
+    echo "Usage: $0 {start|stop}" >&2
+}
+
+if [ "$#" -ne 1 ]; then
+    usage
+    exit 2
 fi
 
-# Ensure Colima (container runtime) is running before attempting docker compose.
-if ! colima status &>/dev/null; then
-    echo "Colima is not running — starting it now..."
-    colima start
+case "$1" in
+    start|stop) action="$1" ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Error: Docker CLI is required for local monitoring but was not found in PATH." >&2
+    echo "Install and start a supported container runtime, then retry '$0 $action'." >&2
+    exit 1
+fi
+
+if ! docker compose version >/dev/null 2>&1; then
+    echo "Error: Docker Compose V2 is required, but 'docker compose' is unavailable." >&2
+    echo "Install the Compose V2 plugin for your existing runtime, then retry." >&2
+    exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+    echo "Error: the Docker runtime is unavailable." >&2
+    echo "Start your container runtime outside this helper, then retry '$0 $action'." >&2
+    exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/monitoring/docker-compose.yml"
 
-cleanup() {
-    echo ""
-    echo "Stopping monitoring stack..."
-    docker compose -f "$COMPOSE_FILE" down
-}
-
-trap cleanup EXIT
-
-echo "Starting monitoring stack..."
-docker compose -f "$COMPOSE_FILE" up -d
-
-echo ""
-echo "  Prometheus : http://localhost:9090"
-echo "  Grafana    : http://localhost:3000  (admin / admin)"
-echo "  Metrics    : http://localhost:8000/metrics"
-echo ""
-
-"$SCRIPT_DIR/.venv/bin/python" -m src.main
+case "$action" in
+    start)
+        echo "Starting local monitoring stack..."
+        docker compose -f "$COMPOSE_FILE" up -d
+        echo "Prometheus: http://localhost:9090"
+        echo "Grafana:    http://localhost:3000 (admin / admin; local development only)"
+        ;;
+    stop)
+        echo "Stopping local monitoring stack..."
+        docker compose -f "$COMPOSE_FILE" down
+        ;;
+esac

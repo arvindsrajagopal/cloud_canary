@@ -36,10 +36,9 @@ cp config/config.ini.template config/config.ini
 # 4. Run the canary (from project root)
 python -m src.main
 
-# 5. (Optional, macOS + Colima) Start the development-only monitoring stack.
-#    run.sh starts Colima if needed, brings up the monitoring stack, runs the
-#    canary, and tears the stack down on normal exit or trappable signals.
-./run.sh
+# 5. (Optional) Start the development-only monitoring stack separately.
+#    Docker and Docker Compose V2 must already be installed and running.
+./run.sh start
 # Prometheus: http://localhost:9090   Grafana: http://localhost:3000
 # Grafana's admin/admin credential is for local development only.
 ```
@@ -235,7 +234,7 @@ cloud_canary/
 │
 ├── .gitignore
 ├── requirements.txt
-├── run.sh                      # Convenience script: starts monitoring stack + canary together
+├── run.sh                      # Starts or stops only the local monitoring stack
 └── README.md
 ```
 
@@ -250,7 +249,7 @@ cloud_canary/
 | A Confluent Cloud cluster | Dedicated or Basic tier both work |
 | Kafka API key + secret | Needs `TOPIC:CREATE`, `TOPIC:WRITE`, `TOPIC:READ` ACLs on `cloud-canary*` |
 | Schema Registry API key + secret | Needs `SUBJECT:READ` and `SUBJECT:WRITE` on `com.cloud.canary*` |
-| Docker + Docker Compose V2 | Only required for the optional monitoring stack. Uses `docker compose` (space, not hyphen). **macOS:** install [Colima](https://github.com/abiosoft/colima) (`brew install colima docker docker-compose`) or Docker Desktop. **Linux:** install the Compose plugin: `apt install docker-compose-plugin`. |
+| Docker + Docker Compose V2 | Only required for the optional local monitoring workflow. Uses `docker compose` (space, not hyphen). Install and start the runtime yourself before using `run.sh`; the helper never manages the external runtime. |
 
 ---
 
@@ -374,28 +373,20 @@ These keys are passed directly to the librdkafka client. Key names must match
 
 ## Running the Canary
 
-### Local Development (Python Virtual Environment)
+### Python workflow
 
 ```bash
 # From the project root, with the virtual environment active:
 python -m src.main
 ```
 
-On macOS with Colima installed, `run.sh` starts the monitoring stack and the
-canary together, then tears down the stack on normal exit or a trappable signal:
+The application uses whichever supported Python environment you activate; it
+does not depend on a repository-specific virtual-environment path. Set
+`CANARY_INSTANCE_ID` in the environment if an explicit instance ID is needed.
+The optional monitoring stack is an independent workflow documented under
+[Monitoring Stack](#monitoring-stack-prometheus--grafana).
 
-```bash
-# Use default instance ID (hostname)
-./run.sh
-
-# Specify custom instance ID
-./run.sh canary-dev-1
-
-# Or use environment variable
-CANARY_INSTANCE_ID=my-canary ./run.sh
-```
-
-### Docker Deployment
+### Versioned OCI-image workflow
 
 The container is a convenient evaluation and deployment format; it does not make
 the prototype production-ready. Apply the warning at the top of this README and
@@ -403,20 +394,20 @@ validate the image and operating model before using it in a production environme
 
 ```bash
 # Build the Docker image
-docker build -t cloud-canary:latest .
+docker build -t cloud-canary:1.2.3 .
 
 # Run with mounted config file
 docker run --rm \
   -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
   -p 8000:8000 \
-  cloud-canary:latest
+  cloud-canary:1.2.3
 
 # Run with custom instance ID (for multi-instance deployments)
 docker run --rm \
   -e CANARY_INSTANCE_ID=canary-us-east-1 \
   -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
   -p 8000:8000 \
-  cloud-canary:latest
+  cloud-canary:1.2.3
 
 # Run in background (detached mode)
 docker run -d \
@@ -424,7 +415,7 @@ docker run -d \
   --restart unless-stopped \
   -v $(pwd)/config/config.ini:/app/config/config.ini:ro \
   -p 8000:8000 \
-  cloud-canary:latest
+  cloud-canary:1.2.3
 
 # View logs
 docker logs -f cloud-canary
@@ -439,8 +430,7 @@ docker stop cloud-canary
 version: '3.8'
 services:
   cloud-canary:
-    image: cloud-canary:latest
-    build: .
+    image: cloud-canary:1.2.3
     container_name: cloud-canary
     restart: unless-stopped
     environment:
@@ -777,15 +767,17 @@ readinessProbe:
 > credential is development-only, not production-safe. Published Prometheus and
 > Grafana ports bind to loopback by default.
 
-The stack requires Docker and Docker Compose. The canary process must be running
-on the host before starting it (Prometheus scrapes
+The stack requires an already installed and running Docker-compatible runtime
+with Docker Compose V2. The helper reports missing prerequisites and never
+installs, starts, stops, or reconfigures the external runtime. The canary
+process can be started or stopped independently and must be running on the host
+for successful scraping (Prometheus scrapes
 `host.docker.internal:8000`).
 
 ### Start the stack
 
 ```bash
-cd monitoring/
-docker compose up -d
+./run.sh start
 ```
 
 | Service | URL | Credentials |
@@ -811,8 +803,7 @@ canary's `/metrics` endpoint, with appropriate transport and network controls.
 ### Stop the stack
 
 ```bash
-docker compose down          # stops containers, preserves data volumes
-docker compose down -v       # stops containers and deletes all stored data
+./run.sh stop                # stops containers, preserves data volumes
 ```
 
 ### Dashboard panels
