@@ -164,15 +164,22 @@ def create_partition_consumer(
         "auto.offset.reset":  "latest",
         "enable.auto.commit": False,
     })
-
-    avro_deserializer = AvroDeserializer(
-        sr_client,
-        CANARY_SCHEMA_STR,
-        dict_to_canary,
-    )
-
-    consumer.assign([TopicPartition(topic, partition)])
-    return consumer, avro_deserializer
+    try:
+        avro_deserializer = AvroDeserializer(
+            sr_client,
+            CANARY_SCHEMA_STR,
+            dict_to_canary,
+        )
+        consumer.assign([TopicPartition(topic, partition)])
+        return consumer, avro_deserializer
+    except Exception:
+        # Until the tuple is returned, this factory exclusively owns the
+        # native client and must release it before startup retries.
+        try:
+            consumer.close()
+        except Exception:
+            pass
+        raise
 
 
 def seek_to_end(consumer: Consumer) -> None:

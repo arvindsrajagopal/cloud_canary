@@ -3,7 +3,9 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from src import consumer as consumer_module
 from src import main
+from src import producer as producer_module
 
 
 class StartupCleanupTests(unittest.TestCase):
@@ -162,6 +164,61 @@ class StartupCleanupTests(unittest.TestCase):
         admin.close.assert_called_once_with()
         log_handler.close.assert_called_once_with()
         http_service.shutdown.assert_called_once()
+
+    def test_producer_factory_flushes_unpublished_client_on_serializer_failure(self):
+        producer = Mock()
+        failure = RuntimeError("serializer construction failed")
+
+        with (
+            patch.object(producer_module, "Producer", return_value=producer),
+            patch.object(
+                producer_module, "AvroSerializer", side_effect=failure
+            ),
+            self.assertRaisesRegex(RuntimeError, "serializer construction failed"),
+        ):
+            producer_module.create_producer({}, Mock())
+
+        producer.flush.assert_called_once_with(
+            timeout=producer_module.const.PRODUCER_FLUSH_TIMEOUT_SECONDS
+        )
+
+    def test_consumer_factory_closes_each_unpublished_client_before_retry(self):
+        consumers = [Mock(), Mock()]
+
+        with (
+            patch.object(
+                consumer_module, "Consumer", side_effect=consumers
+            ),
+            patch.object(
+                consumer_module,
+                "AvroDeserializer",
+                side_effect=[
+                    RuntimeError("first construction failed"),
+                    RuntimeError("second construction failed"),
+                ],
+            ),
+        ):
+            for expected in ("first", "second"):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    consumer_module.create_partition_consumer(
+                        {}, Mock(), "canary", 0
+                    )
+
+        for consumer in consumers:
+            consumer.close.assert_called_once_with()
+
+    def test_consumer_factory_closes_client_when_assignment_fails(self):
+        consumer = Mock()
+        consumer.assign.side_effect = RuntimeError("assignment failed")
+
+        with (
+            patch.object(consumer_module, "Consumer", return_value=consumer),
+            patch.object(consumer_module, "AvroDeserializer", return_value=Mock()),
+            self.assertRaisesRegex(RuntimeError, "assignment failed"),
+        ):
+            consumer_module.create_partition_consumer({}, Mock(), "canary", 7)
+
+        consumer.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

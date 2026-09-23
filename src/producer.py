@@ -160,14 +160,22 @@ def create_producer(kafka_config: dict, sr_client) -> tuple[Producer, AvroSerial
         **_get_producer_defaults(),  # get defaults with current instance ID
         **kafka_config,               # auth/connection settings override defaults
     })
-
-    avro_serializer = AvroSerializer(
-        sr_client,
-        CANARY_SCHEMA_STR,
-        canary_to_dict,  # converts CanaryMessage dataclass → dict for Avro encoding
-    )
-
-    return producer, avro_serializer
+    try:
+        avro_serializer = AvroSerializer(
+            sr_client,
+            CANARY_SCHEMA_STR,
+            canary_to_dict,  # converts CanaryMessage dataclass → dict for Avro encoding
+        )
+        return producer, avro_serializer
+    except Exception:
+        # The caller cannot own a client that this factory never returned.
+        # Keep cleanup bounded and preserve the construction failure even if
+        # the native client reports a secondary cleanup error.
+        try:
+            producer.flush(timeout=const.PRODUCER_FLUSH_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        raise
 
 
 def produce_canary(
