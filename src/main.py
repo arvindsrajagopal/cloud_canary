@@ -1643,6 +1643,7 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
     # Do NOT modify metrics.HOST after module load - pre-labeled metrics capture it at import time.
 
     topic               = app.get("topic",                          "cloud-canary")
+    topic_management_mode = app.get("topic.management.mode",              "manage")
     timeout             = float(app.get("consumer.timeout.seconds",              "5"))
     interval            = float(app.get("check.interval.seconds",               "15"))
     sync_interval       = float(app.get("partition.sync.interval.seconds",   "86400"))
@@ -1789,6 +1790,11 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
                     topic,
                     admin=admin,
                     before_recreate=before_recreate,
+                    **(
+                        {"management_mode": "observe"}
+                        if topic_management_mode == "observe"
+                        else {}
+                    ),
                 )
             ),
             classify_kafka_startup,
@@ -1809,14 +1815,15 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
     kafka_log_handler = None
     if log_topic_enabled:
         try:
-            _run_startup_dependency(
-                lambda: ensure_log_topic(
-                    kafka_config,
-                    log_topic,
-                    log_topic_retention_ms,
-                    admin=admin,
+            if topic_management_mode == "manage":
+                _run_startup_dependency(
+                    lambda: ensure_log_topic(
+                        kafka_config,
+                        log_topic,
+                        log_topic_retention_ms,
+                        admin=admin,
+                    )
                 )
-            )
             kafka_log_handler = _run_startup_dependency(
                 lambda: KafkaLogHandler(
                     kafka_config,
@@ -1906,6 +1913,11 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
                     topic,
                     admin=admin,
                     before_recreate=before_recreate,
+                    **(
+                        {"management_mode": "observe"}
+                        if topic_management_mode == "observe"
+                        else {}
+                    ),
                 )
             ),
             classify_kafka_startup,
@@ -1998,6 +2010,17 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
     recreation_requested = threading.Event()
     recreation_authorized = threading.Event()
     recreation_cancelled = threading.Event()
+    observer_topology_paused = False
+    observer_recovery_partition_count = None
+
+    topology_mismatch_failure = FailureDescriptor(
+        component=FailureComponent.KAFKA_PARTITION,
+        phase=Phase.TOPIC_VERIFY,
+        category=ErrorCategory.CLIENT_STATE,
+        recoverability=Recoverability.TRANSIENT,
+        code="KAFKA.TOPIC_TOPOLOGY_MISMATCH",
+        safe_summary=FailureSummary.OPERATION_FAILED,
+    )
 
     def request_recreation_exclusivity() -> None:
         """Ask the control-loop owner to drain Kafka work before deletion."""
@@ -2016,10 +2039,17 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
             topic,
             admin=admin,
             before_recreate=request_recreation_exclusivity,
+            **(
+                {"management_mode": "observe"}
+                if topic_management_mode == "observe"
+                else {}
+            ),
         )
         if (
             result
+            and result.topology_matches
             and not result.recreated
+            and topic_management_mode != "observe"
             and result.partition_count != len(partitions)
         ):
             health_store.begin_readiness_transition("worker_rebuild")
@@ -2054,7 +2084,21 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
                     _log_reconciliation_failure("periodic_reconciliation", exc)
                     raise
             if result:
-                if result.recreated:
+                if not result.topology_matches:
+                    observer_topology_paused = True
+                    observer_recovery_partition_count = None
+                    health_store.begin_readiness_transition("scheduler_paused")
+                    health_store.publish_initialization_state(
+                        "RECONCILING_TOPIC", failure=topology_mismatch_failure,
+                        retry_attempts=1,
+                    )
+                elif observer_topology_paused:
+                    # Keep dispatch paused and defer publication until every
+                    # check from the old generation has completed. The owner
+                    # loop below retires its executor before rebuilding.
+                    observer_recovery_partition_count = result.partition_count
+                    health_store.begin_readiness_transition("worker_rebuild")
+                elif result.recreated:
                     health_store.begin_readiness_transition("worker_rebuild")
                     try:
                         (
@@ -2163,7 +2207,7 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
             worker_limit = min(len(partitions), max_workers)
             next_sequence = check_sequence + 1
             due_partitions = ()
-            if not recreation_requested.is_set():
+            if not recreation_requested.is_set() and not observer_topology_paused:
                 dispatch_generation = health_store.topic_generation
                 due_partitions = _submit_due_checks(
                     scheduler,
@@ -2233,7 +2277,7 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
                 # from the previous dispatch remains blocked.
                 next_sequence = check_sequence + 1
                 refilled = ()
-                if not recreation_requested.is_set():
+                if not recreation_requested.is_set() and not observer_topology_paused:
                     dispatch_generation = health_store.topic_generation
                     refilled = _submit_due_checks(
                         scheduler,
@@ -2271,6 +2315,45 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
             ):
                 executor.shutdown(wait=True)
                 recreation_authorized.set()
+
+            if (
+                observer_recovery_partition_count is not None
+                and not active_futures
+            ):
+                replacement_partition_count = observer_recovery_partition_count
+                executor.shutdown(wait=True)
+                try:
+                    (
+                        consumers,
+                        executor,
+                        partitions,
+                        consecutive_failures,
+                    ) = _run_replacement_runtime_transaction(
+                        lambda: _replace_recreated_runtime(
+                            kafka_config,
+                            sr_client,
+                            topic,
+                            partitions,
+                            consumers,
+                            replacement_partition_count,
+                            max_workers,
+                            health_store,
+                            scheduler=scheduler,
+                        )
+                    )
+                except _ReplacementDispatchRejected:
+                    break
+                except Exception as exc:
+                    health_store.record_fatal_internal("topic_reconciliation")
+                    _log_reconciliation_failure(
+                        "observer_runtime_rebuild", exc
+                    )
+                    raise
+                num_partitions = replacement_partition_count
+                observer_recovery_partition_count = None
+                observer_topology_paused = False
+                health_store.publish_initialization_state("WARMING_UP")
+                health_store.end_readiness_transition()
 
             if not completed:
                 _publish_scheduler_observability(scheduler, health_store)

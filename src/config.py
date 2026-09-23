@@ -133,6 +133,12 @@ def validate_config(config: dict) -> None:
     sr = config['schema_registry']
     app = config['app']
 
+    topic_management_mode = app.get('topic.management.mode', 'manage')
+    if topic_management_mode not in ('manage', 'observe'):
+        raise ValueError(
+            "[app].topic.management.mode must be 'manage' or 'observe'"
+        )
+
     # Validate bootstrap.servers format
     if ':' not in kafka['bootstrap.servers']:
         raise ValueError(

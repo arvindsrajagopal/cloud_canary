@@ -22,10 +22,10 @@
 # leader coverage, but Kafka controls leader placement. Multiple partitions can
 # share a leader, so this code does not guarantee that every broker is exercised.
 #
-# Multi-instance safety
-# ---------------------
-# All three functions are safe to call concurrently from multiple instances
-# running against the same cluster.  Races are handled at the error level:
+# Multi-instance roles
+# --------------------
+# One manager owns mutation. Observer calls are metadata-only; legacy manager
+# collision handling remains defensive for an accidentally overlapping rollout:
 #
 #   ensure_topic() / ensure_log_topic()
 #       If two instances race to create the same topic, the second call
@@ -69,6 +69,7 @@ class ReconciliationResult:
     broker_count: int
     partition_count: int
     recreated: bool = False
+    topology_matches: bool = True
 
     def __iter__(self):
         yield self.broker_count
@@ -357,6 +358,7 @@ def ensure_topic(
     topic: str,
     admin: AdminClient | None = None,
     before_recreate: Callable[[], None] | None = None,
+    management_mode: str = "manage",
 ) -> ReconciliationResult | None:
     """
     Reconcile and verify the canary topic from broker metadata at startup.
@@ -384,6 +386,10 @@ def ensure_topic(
     before_recreate : callable, optional
         Invoked immediately before a destructive scale-down begins.
 
+    management_mode : str
+        ``manage`` mutates and verifies topology; ``observe`` only accepts an
+        already verified broker-count-derived topology.
+
     Raises
     ------
     RuntimeError
@@ -399,6 +405,13 @@ def ensure_topic(
         num_brokers, num_partitions = _inspect_startup_metadata(metadata, topic)
         log.info(f"Cluster has {num_brokers} broker(s).")
 
+        if management_mode == "observe":
+            if num_partitions != num_brokers:
+                return None
+            return ReconciliationResult(
+                num_brokers, num_partitions, topology_matches=True
+            )
+
         if num_partitions is not None:
             log.info(
                 f"Topic '{topic}' already exists ({num_partitions} partition(s)) — reconciling."
@@ -411,6 +424,7 @@ def ensure_topic(
             topic,
             admin=admin,
             before_recreate=before_recreate,
+            management_mode=management_mode,
         )
         if result is None:
             return None
@@ -474,6 +488,7 @@ def sync_topic_partitions(
     topic: str,
     admin: AdminClient | None = None,
     before_recreate: Callable[[], None] | None = None,
+    management_mode: str = "manage",
     *,
     monotonic_clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -517,6 +532,10 @@ def sync_topic_partitions(
     admin : AdminClient, optional
         Pre-created AdminClient to reuse. If None, a new one is created and cleaned up.
 
+    management_mode : str
+        ``observe`` performs metadata-only verification and reports topology
+        mismatches in the result. ``manage`` retains reconciliation ownership.
+
     Returns
     -------
     tuple[int, int] | None
@@ -535,6 +554,20 @@ def sync_topic_partitions(
         except RuntimeError as exc:
             log.error(f"Partition sync skipped — could not fetch cluster metadata: {exc}")
             return None
+
+        if management_mode == "observe":
+            num_brokers, current_partitions = _inspect_startup_metadata(
+                metadata, topic
+            )
+            if current_partitions is None:
+                return ReconciliationResult(
+                    num_brokers, 0, topology_matches=False
+                )
+            return ReconciliationResult(
+                num_brokers,
+                current_partitions,
+                topology_matches=current_partitions == num_brokers,
+            )
 
         if topic not in metadata.topics:
             log.warning(f"Partition sync skipped — topic '{topic}' not found in metadata.")
