@@ -28,6 +28,29 @@ def _config(**app_overrides):
 
 
 class ConfigValidationTests(unittest.TestCase):
+    def test_accepts_each_http_concurrency_setting_independently(self):
+        for setting in ("http.max.workers", "http.request.queue.size"):
+            for value in ("1", "4", "1000000"):
+                with self.subTest(setting=setting, value=value):
+                    validate_config(_config(**{setting: value}))
+
+    def test_rejects_invalid_http_worker_bounds_with_sanitized_error(self):
+        self._assert_invalid_http_bound("http.max.workers")
+
+    def test_rejects_invalid_http_queue_bounds_with_sanitized_error(self):
+        self._assert_invalid_http_bound("http.request.queue.size")
+
+    def _assert_invalid_http_bound(self, setting):
+        for value in ("0", "-1", "1.5", "not-a-number", "nan", "inf", 1.5):
+            with self.subTest(setting=setting, value=value):
+                with self.assertRaises(ValueError) as raised:
+                    validate_config(_config(**{setting: value}))
+
+                self.assertEqual(
+                    f"[app].{setting} must be a positive integer",
+                    str(raised.exception),
+                )
+
     def test_accepts_valid_health_boundary_combinations(self):
         validate_config(
             _config(

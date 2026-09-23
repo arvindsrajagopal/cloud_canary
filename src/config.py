@@ -180,6 +180,12 @@ def validate_config(config: dict) -> None:
             raise ValueError(f"[app].{key} must be a positive integer")
         return value
 
+    def http_positive_integer(key: str, default: str) -> int:
+        raw_value = app.get(key, default)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, str)):
+            raise ValueError(f"[app].{key} must be a positive integer")
+        return positive_integer(key, default)
+
     def finite_number(key: str, default: str) -> float:
         raw_value = app.get(key, default)
         try:
@@ -204,6 +210,8 @@ def validate_config(config: dict) -> None:
             "[app].health.failure.threshold must be greater than 0 and at most 1"
         )
     positive_integer("health.max.diagnostic.components", "20")
+    http_positive_integer("http.max.workers", "4")
+    http_positive_integer("http.request.queue.size", "16")
 
     kafka_degraded = finite_number("health.kafka.degraded.after.seconds", "60")
     kafka_unhealthy = finite_number("health.kafka.unhealthy.after.seconds", "300")

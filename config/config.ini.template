@@ -68,6 +68,10 @@ metrics.ssl.enabled=false
 #metrics.ssl.key=/path/to/key.pem
 
 # Concurrency configuration
+# HTTP serving limits (independent of Kafka partition-check workers)
+http.max.workers=4
+http.request.queue.size=16
+
 # max.workers controls the maximum number of concurrent threads for partition checks
 # Default: 20 (good for most deployments)
 # Each thread uses ~8MB stack memory. Adjust based on:
