@@ -101,6 +101,7 @@
 import concurrent.futures
 import logging
 import os
+import random
 import signal
 import ssl
 import sys
@@ -157,6 +158,37 @@ from src.scheduler import (
 )
 from src.structured_logging import CanaryLoggerAdapter, setup_logging
 from src.topic import ensure_log_topic, ensure_topic, sync_topic_partitions
+
+
+_STARTUP_WAITING_DEPENDENCIES = (
+    "WAITING_FOR_KAFKA",
+    "WAITING_FOR_SCHEMA_REGISTRY",
+    "RECONCILING_TOPIC",
+)
+STARTUP_RETRY_ATTEMPTS = metrics.Gauge(
+    "canary_startup_retry_attempts",
+    "Retry attempts in the current initialization stage.",
+    ["host"],
+).labels(host=metrics.HOST)
+STARTUP_RETRY_DELAY_SECONDS = metrics.Gauge(
+    "canary_startup_retry_delay_seconds",
+    "Current jittered retry delay for startup initialization.",
+    ["host"],
+).labels(host=metrics.HOST)
+STARTUP_STATE_ELAPSED_SECONDS = metrics.Gauge(
+    "canary_startup_state_elapsed_seconds",
+    "Monotonic elapsed time in the current initialization stage.",
+    ["host"],
+).labels(host=metrics.HOST)
+STARTUP_WAITING_DEPENDENCY = metrics.Gauge(
+    "canary_startup_waiting_dependency",
+    "Current bounded startup dependency wait state.",
+    ["host", "dependency"],
+)
+for _dependency in _STARTUP_WAITING_DEPENDENCIES:
+    STARTUP_WAITING_DEPENDENCY.labels(
+        host=metrics.HOST, dependency=_dependency
+    ).set(0)
 
 # Logging will be configured in run() after loading config.
 # Initialize adapter at module level with placeholder context.
@@ -375,6 +407,104 @@ def _execute_startup_operation(operation, classifier):
     raise CanaryError(failure)
 
 
+class _StartupRetryTiming:
+    """Configured, resettable startup backoff using monotonic deadlines."""
+
+    def __init__(
+        self,
+        initial_delay,
+        maximum_delay,
+        multiplier,
+        jitter_factor,
+        *,
+        monotonic_clock=time.monotonic,
+        wait_for_event=None,
+        jitter_source=random.uniform,
+    ):
+        self.initial_delay = initial_delay
+        self.maximum_delay = maximum_delay
+        self.multiplier = multiplier
+        self.jitter_factor = jitter_factor
+        self._monotonic = monotonic_clock
+        self._wait_for_event = wait_for_event or _shutdown_event.wait
+        self._jitter_source = jitter_source
+        self._current_delay = initial_delay
+        self._stage = None
+        self._current_state = None
+        self._state_started_at = None
+        self._stage_retry_attempts = 0
+
+    def start_stage(self, stage):
+        if self._stage is None:
+            self._stage = stage
+            STARTUP_STATE_ELAPSED_SECONDS.set_function(self.state_elapsed)
+        if stage != self._current_state:
+            self._current_state = stage
+            self._state_started_at = self._monotonic()
+
+    def state_elapsed(self):
+        if self._state_started_at is None:
+            return 0
+        return max(0.0, self._monotonic() - self._state_started_at)
+
+    def record_retry(self):
+        self._stage_retry_attempts += 1
+        return self._stage_retry_attempts
+
+    def complete_stage(self):
+        self._current_delay = self.initial_delay
+        self._stage = None
+        self._current_state = None
+        self._state_started_at = None
+        self._stage_retry_attempts = 0
+        STARTUP_RETRY_ATTEMPTS.set(0)
+        STARTUP_RETRY_DELAY_SECONDS.set(0)
+        for dependency in _STARTUP_WAITING_DEPENDENCIES:
+            STARTUP_WAITING_DEPENDENCY.labels(
+                host=metrics.HOST, dependency=dependency
+            ).set(0)
+
+    def wait(self, *, waiting_dependency, retry_attempts):
+        if waiting_dependency not in _STARTUP_WAITING_DEPENDENCIES:
+            raise ValueError("unknown startup waiting dependency")
+        if self._state_started_at is None:
+            self.start_stage(waiting_dependency)
+        calculated_delay = self._current_delay
+        jitter = self._jitter_source(
+            -calculated_delay * self.jitter_factor,
+            calculated_delay * self.jitter_factor,
+        )
+        actual_delay = max(0.0, calculated_delay + jitter)
+        deadline = self._monotonic() + actual_delay
+        self._current_delay = min(
+            calculated_delay * self.multiplier,
+            self.maximum_delay,
+        )
+        state_elapsed = self.state_elapsed()
+        STARTUP_RETRY_ATTEMPTS.set(retry_attempts)
+        STARTUP_RETRY_DELAY_SECONDS.set(actual_delay)
+        for dependency in _STARTUP_WAITING_DEPENDENCIES:
+            STARTUP_WAITING_DEPENDENCY.labels(
+                host=metrics.HOST, dependency=dependency
+            ).set(dependency == waiting_dependency)
+        log.info(
+            "Waiting to retry startup dependency",
+            extra={
+                "waiting_dependency": waiting_dependency,
+                "retry_attempts": retry_attempts,
+                "retry_delay_seconds": actual_delay,
+                "initialization_state_elapsed_seconds": state_elapsed,
+            },
+        )
+        while True:
+            remaining = deadline - self._monotonic()
+            if remaining <= 0 or self._wait_for_event(remaining):
+                STARTUP_WAITING_DEPENDENCY.labels(
+                    host=metrics.HOST, dependency=waiting_dependency
+                ).set(0)
+                return
+
+
 def _retry_transient_startup_stage(
     operation,
     classifier,
@@ -383,11 +513,14 @@ def _retry_transient_startup_stage(
     connecting_state: str,
     waiting_state: str,
     retry_wait,
+    stage_complete: bool = True,
 ):
     """Retry one transient startup operation without advancing its stage."""
     attempts = 0
     last_failure = None
     while True:
+        if isinstance(retry_wait, _StartupRetryTiming):
+            retry_wait.start_stage(connecting_state)
         health_store.publish_initialization_state(
             connecting_state,
             failure=last_failure,
@@ -403,23 +536,37 @@ def _retry_transient_startup_stage(
             ):
                 raise
             attempts += 1
+            published_attempts = attempts
+            if isinstance(retry_wait, _StartupRetryTiming):
+                published_attempts = retry_wait.record_retry()
+                retry_wait.start_stage(waiting_state)
             last_failure = exc.failure
             health_store.publish_initialization_state(
                 waiting_state,
                 failure=exc.failure,
-                retry_attempts=attempts,
+                retry_attempts=published_attempts,
             )
             if _shutdown_requested():
                 raise _StartupDispatchRejected(
                     "shutdown interrupted startup dependency retry"
                 )
-            retry_wait()
+            if isinstance(retry_wait, _StartupRetryTiming):
+                retry_wait.wait(
+                    waiting_dependency=waiting_state,
+                    retry_attempts=published_attempts,
+                )
+            else:
+                retry_wait()
             if _shutdown_requested():
                 raise _StartupDispatchRejected(
                     "shutdown interrupted startup dependency retry"
                 )
         else:
             health_store.publish_initialization_state(connecting_state)
+            if stage_complete:
+                complete_stage = getattr(retry_wait, "complete_stage", None)
+                if complete_stage is not None:
+                    complete_stage()
             return result
 
 
@@ -1485,10 +1632,12 @@ def _run_lifecycle_owned(http_owner) -> None:
     http_owner["health_store"] = health_store
     configure_health_state(health_store)
     health_store.publish_initialization_state("STARTING")
-    startup_retry_delay = float(app.get("startup.retry.initial.seconds", "1"))
-
-    def wait_for_startup_retry() -> None:
-        _shutdown_event.wait(startup_retry_delay)
+    startup_retry_timing = _StartupRetryTiming(
+        initial_delay=float(app.get("startup.retry.initial.seconds", "1")),
+        maximum_delay=float(app.get("startup.retry.max.seconds", "30")),
+        multiplier=float(app.get("startup.retry.multiplier", "2")),
+        jitter_factor=float(app.get("startup.retry.jitter.factor", "0.2")),
+    )
 
     # Set version info metric
     metrics.VERSION_INFO.info({
@@ -1560,7 +1709,8 @@ def _run_lifecycle_owned(http_owner) -> None:
         health_store,
         connecting_state="CONNECTING_KAFKA",
         waiting_state="WAITING_FOR_KAFKA",
-        retry_wait=wait_for_startup_retry,
+        retry_wait=startup_retry_timing,
+        stage_complete=False,
     )
     _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
@@ -1570,7 +1720,7 @@ def _run_lifecycle_owned(http_owner) -> None:
         health_store,
         connecting_state="CONNECTING_KAFKA",
         waiting_state="WAITING_FOR_KAFKA",
-        retry_wait=wait_for_startup_retry,
+        retry_wait=startup_retry_timing,
     )
 
     # ------------------------------------------------------------------
@@ -1588,7 +1738,7 @@ def _run_lifecycle_owned(http_owner) -> None:
             ),
             classify_kafka_startup,
             health_store,
-            wait_for_startup_retry,
+            startup_retry_timing,
         )
     except CanaryError as exc:
         health_store.record_fatal_internal("topic_reconciliation")
@@ -1652,7 +1802,8 @@ def _run_lifecycle_owned(http_owner) -> None:
         health_store,
         connecting_state="CONNECTING_SCHEMA_REGISTRY",
         waiting_state="WAITING_FOR_SCHEMA_REGISTRY",
-        retry_wait=wait_for_startup_retry,
+        retry_wait=startup_retry_timing,
+        stage_complete=False,
     )
     _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
@@ -1662,7 +1813,7 @@ def _run_lifecycle_owned(http_owner) -> None:
         health_store,
         connecting_state="CONNECTING_SCHEMA_REGISTRY",
         waiting_state="WAITING_FOR_SCHEMA_REGISTRY",
-        retry_wait=wait_for_startup_retry,
+        retry_wait=startup_retry_timing,
     )
 
     # Resource placeholders make startup reconciliation and construction failures
@@ -1681,7 +1832,7 @@ def _run_lifecycle_owned(http_owner) -> None:
         health_store,
         connecting_state="CONNECTING_KAFKA",
         waiting_state="WAITING_FOR_KAFKA",
-        retry_wait=wait_for_startup_retry,
+        retry_wait=startup_retry_timing,
     )
 
     # ------------------------------------------------------------------
@@ -1701,7 +1852,7 @@ def _run_lifecycle_owned(http_owner) -> None:
             ),
             classify_kafka_startup,
             health_store,
-            wait_for_startup_retry,
+            startup_retry_timing,
         )
     except Exception as exc:
         health_store.record_fatal_internal("topic_reconciliation")
@@ -1733,7 +1884,7 @@ def _run_lifecycle_owned(http_owner) -> None:
             health_store,
             connecting_state="STARTING_WORKERS",
             waiting_state="WAITING_FOR_KAFKA",
-            retry_wait=wait_for_startup_retry,
+            retry_wait=startup_retry_timing,
         )
         # Retaining one executor with the configured upper bound allows safe
         # additive scale-up while _submit_due_checks keeps active work at

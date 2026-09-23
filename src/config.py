@@ -226,6 +226,28 @@ def validate_config(config: dict) -> None:
     positive_finite_number("http.socket.timeout.seconds", "5")
     positive_finite_number("http.shutdown.timeout.seconds", "10")
 
+    startup_retry_initial = positive_finite_number(
+        "startup.retry.initial.seconds", "1"
+    )
+    startup_retry_maximum = positive_finite_number(
+        "startup.retry.max.seconds", "30"
+    )
+    if startup_retry_initial > startup_retry_maximum:
+        raise ValueError(
+            "[app].startup.retry.initial.seconds must be no greater than "
+            "[app].startup.retry.max.seconds"
+        )
+    startup_retry_multiplier = finite_number("startup.retry.multiplier", "2")
+    if startup_retry_multiplier <= 1:
+        raise ValueError(
+            "[app].startup.retry.multiplier must be greater than 1"
+        )
+    startup_retry_jitter = finite_number("startup.retry.jitter.factor", "0.2")
+    if not 0 <= startup_retry_jitter < 1:
+        raise ValueError(
+            "[app].startup.retry.jitter.factor must be at least 0 and less than 1"
+        )
+
     kafka_degraded = finite_number("health.kafka.degraded.after.seconds", "60")
     kafka_unhealthy = finite_number("health.kafka.unhealthy.after.seconds", "300")
     kafka_interval = finite_number("check.interval.seconds", "15")

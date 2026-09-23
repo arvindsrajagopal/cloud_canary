@@ -38,6 +38,13 @@ sr.check.interval.seconds=60
 sr.check.timeout.seconds=10
 warmup.checks=2
 
+# Transient startup dependency retry policy. Jitter is independently applied
+# within plus or minus the configured factor after the delay is capped.
+startup.retry.initial.seconds=1
+startup.retry.max.seconds=30
+startup.retry.multiplier=2
+startup.retry.jitter.factor=0.2
+
 # Current dependency health uses bounded, process-local rolling windows.
 health.failure.window.checks=20
 health.failure.minimum.checks=4
