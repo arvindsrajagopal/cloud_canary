@@ -398,8 +398,15 @@ the prototype production-ready. Apply the warning at the top of this README and
 validate the image and operating model before using it in a production environment.
 
 ```bash
-# Build the Docker image
-docker build -t cloud-canary:1.2.3 .
+# Build the Docker image from the authoritative application version.
+VERSION="$(python -c 'from src.__version__ import __version__; print(__version__)')"
+REVISION="$(git rev-parse HEAD)"
+CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+docker build \
+  --build-arg VERSION="$VERSION" \
+  --build-arg REVISION="$REVISION" \
+  --build-arg CREATED="$CREATED" \
+  -t "cloud-canary:$VERSION" .
 
 # Run with mounted config file
 docker run --rm \
@@ -428,6 +435,14 @@ docker logs -f cloud-canary
 # Stop the container
 docker stop cloud-canary
 ```
+
+These required build arguments populate the OCI source, version, revision, and
+creation labels. The build rejects missing or malformed provenance, a version
+that differs from `src/__version__.py`, or native dependencies that cannot be
+imported on the selected build platform. No multi-architecture image support is
+currently claimed; each architecture must complete build, startup, native
+dependency import, and the configured liveness probe before it is documented or
+published as supported.
 
 **Docker Compose example:**
 
