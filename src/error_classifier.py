@@ -472,37 +472,41 @@ def is_deterministic_sr_error(exc: Exception) -> bool:
 
 
 class CanaryError(Exception):
-    """
-    Raised when any phase of a canary check fails.
+    """Transport one bounded failure through a runtime completion boundary."""
 
-    Carries structured metadata (phase + category) alongside the raw error
-    detail string so that callers can update Prometheus labels and log a
-    consistent message format without re-parsing the exception text.
-
-    Attributes
-    ----------
-    phase : Phase
-        The pipeline stage that failed (used as a Prometheus label).
-    category : ErrorCategory
-        The classified cause (used as a Prometheus label).
-    detail : str
-        Human-readable description of the underlying error, suitable for
-        log output.
-    """
-
-    def __init__(
-        self,
-        phase: Phase,
-        category: ErrorCategory,
-        detail: str,
-        *,
-        deterministic: bool = False,
-    ) -> None:
-        self.phase    = phase
-        self.category = category
-        self.detail   = detail
-        self.deterministic = deterministic
+    def __init__(self, failure: FailureDescriptor) -> None:
+        if not isinstance(failure, FailureDescriptor):
+            raise TypeError("failure must be a FailureDescriptor")
+        self.failure = failure
         super().__init__(str(self))
 
+    @property
+    def phase(self) -> Phase:
+        return self.failure.phase
+
+    @property
+    def category(self) -> ErrorCategory:
+        return self.failure.category
+
+    @property
+    def detail(self) -> str:
+        """Compatibility name for the descriptor's provenance-safe summary."""
+        return self.failure.safe_summary
+
+    @property
+    def deterministic(self) -> bool:
+        """Preserve the established SR health signal from bounded fields."""
+        if (
+            self.failure.component is FailureComponent.SCHEMA_REGISTRY
+            and self.failure.category is ErrorCategory.CONFIGURATION
+            and self.failure.code is not None
+            and self.failure.code.startswith("SR.HTTP.")
+        ):
+            return False
+        return self.failure.recoverability is Recoverability.DETERMINISTIC
+
     def __str__(self) -> str:
-        return f"phase={self.phase} category={self.category} detail={self.detail}"
+        return (
+            f"phase={self.phase.value} category={self.category.value} "
+            f"detail={self.detail}"
+        )

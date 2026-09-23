@@ -111,7 +111,8 @@ from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from confluent_kafka import KafkaException, Consumer, Producer
+from confluent_kafka import KafkaError, KafkaException, Consumer, Producer
+from confluent_kafka.serialization import SerializationError
 from confluent_kafka.admin import AdminClient
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserializer
@@ -136,11 +137,14 @@ from src.worker_pool import (
 from src.error_classifier import (
     CanaryError,
     ErrorCategory,
+    FailureComponent,
+    FailureDescriptor,
+    FailureSummary,
     Phase,
+    Recoverability,
     classify_consumer_error,
     classify_kafka_error,
-    classify_sr_error,
-    is_deterministic_sr_error,
+    classify_schema_registry_error,
 )
 from src.health import configure_health_state
 from src.health_state import HealthStateStore
@@ -323,15 +327,38 @@ def check_sr(sr_client: SchemaRegistryClient) -> None:
     CanaryError
         With phase=SCHEMA_REGISTRY and the appropriate ErrorCategory.
     """
+    failure = None
     try:
         sr_client.get_subjects()
     except Exception as exc:
-        raise CanaryError(
-            Phase.SCHEMA_REGISTRY,
-            classify_sr_error(exc),
-            str(exc),
-            deterministic=is_deterministic_sr_error(exc),
-        )
+        failure = classify_schema_registry_error(exc)
+    if failure is not None:
+        # Raise outside the handler so the raw dependency exception is not
+        # attached as __context__ to the object transported by a Future.
+        raise CanaryError(failure)
+
+
+def _local_kafka_failure(phase: Phase, category: ErrorCategory,
+                         recoverability: Recoverability, code: str,
+                         summary: FailureSummary) -> FailureDescriptor:
+    """Describe a local check failure without retaining exception text."""
+    return FailureDescriptor(
+        component=FailureComponent.KAFKA_PARTITION,
+        phase=phase,
+        category=category,
+        recoverability=recoverability,
+        code=code,
+        safe_summary=summary,
+    )
+
+
+def _bounded_completion_failure(error):
+    """Return storage and logging inputs derived only from a descriptor."""
+    failure = error.failure
+    label = f"{failure.phase.value}:{failure.category.value}"
+    fields = {"phase": failure.phase, "category": failure.category,
+              "code": failure.code, "detail": failure.safe_summary}
+    return failure, label, fields
 
 
 def _timed_sr_probe(sr_client: SchemaRegistryClient):
@@ -416,13 +443,19 @@ def check_kafka(
     # independent of the write/read path.
     # ------------------------------------------------------------------
     t_seek = time.perf_counter()
+    seek_failure = None
     try:
         seek_to_end(consumer)
     except (RuntimeError, KafkaException) as exc:
         descriptor = classify_consumer_error(exc, phase=Phase.SEEK)
         if descriptor.category is ErrorCategory.CLIENT_STATE:
             raise ConsumerInvalidError(descriptor) from None
-        raise CanaryError(Phase.SEEK, descriptor.category, str(exc)) from exc
+        seek_failure = descriptor
+    except Exception:
+        seek_failure = _local_kafka_failure(
+            Phase.SEEK, ErrorCategory.UNKNOWN, Recoverability.UNKNOWN,
+            "CANARY.SEEK_UNKNOWN", FailureSummary.OPERATION_FAILED,
+        )
     finally:
         # Record seek duration regardless of success or failure so the
         # histogram captures partial attempts (e.g. successful on some
@@ -432,6 +465,8 @@ def check_kafka(
         metrics.SEEK_DURATION.labels(host=metrics.HOST).observe(
             (time.perf_counter() - t_seek) * 1000
         )
+    if seek_failure is not None:
+        raise CanaryError(seek_failure)
 
     # ------------------------------------------------------------------
     # Phase: PRODUCE
@@ -442,6 +477,7 @@ def check_kafka(
     # the client and the leader for this partition.
     # ------------------------------------------------------------------
     t_produce = time.perf_counter()
+    produce_failure = None
     try:
         sent = produce_canary(producer, avro_serializer, topic, check_sequence, partition)
         log.debug(
@@ -453,23 +489,43 @@ def check_kafka(
                 "producer_host": sent.producer_host,
             }
         )
-    except KafkaException as exc:
-        category = (
-            classify_kafka_error(exc.args[0], phase=Phase.PRODUCE).category
-            if exc.args else ErrorCategory.UNKNOWN
+    except (SerializationError, TypeError, ValueError):
+        produce_failure = _local_kafka_failure(
+            Phase.PRODUCE, ErrorCategory.SERIALIZATION,
+            Recoverability.INTERNAL_FATAL, "CANARY.PRODUCE_SERIALIZATION",
+            FailureSummary.INTERNAL_FAILURE,
         )
-        raise CanaryError(Phase.PRODUCE, category, str(exc))
-    except RuntimeError as exc:
+    except KafkaException as exc:
+        produce_failure = (
+            classify_kafka_error(exc.args[0], phase=Phase.PRODUCE)
+            if exc.args and isinstance(exc.args[0], KafkaError)
+            else _local_kafka_failure(
+                Phase.PRODUCE, ErrorCategory.UNKNOWN,
+                Recoverability.UNKNOWN, "CANARY.PRODUCE_UNKNOWN",
+                FailureSummary.OPERATION_FAILED,
+            )
+        )
+    except RuntimeError:
         # Local delivery-callback wait expired after 2s.
         # delivery.timeout.ms has not expired so the cause is unknown;
         # UNKNOWN is more honest than NETWORK or BROKER here.
-        raise CanaryError(Phase.PRODUCE, ErrorCategory.UNKNOWN, str(exc))
+        produce_failure = _local_kafka_failure(
+            Phase.PRODUCE, ErrorCategory.UNKNOWN, Recoverability.UNKNOWN,
+            "CANARY.PRODUCE_TIMEOUT", FailureSummary.OPERATION_TIMED_OUT,
+        )
+    except Exception:
+        produce_failure = _local_kafka_failure(
+            Phase.PRODUCE, ErrorCategory.UNKNOWN, Recoverability.UNKNOWN,
+            "CANARY.PRODUCE_UNKNOWN", FailureSummary.OPERATION_FAILED,
+        )
     finally:
         # Using perf_counter() for monotonic, accurate timing measurement.
         # Note: Partition label removed to prevent metrics cardinality explosion.
         metrics.PRODUCE_DURATION.labels(host=metrics.HOST).observe(
             (time.perf_counter() - t_produce) * 1000
         )
+    if produce_failure is not None:
+        raise CanaryError(produce_failure)
 
     # ------------------------------------------------------------------
     # Phase: CONSUME
@@ -482,20 +538,33 @@ def check_kafka(
     # latency is already captured by E2E_LATENCY (which measures the full
     # round-trip from send_timestamp_ms to receive_timestamp_ms).
     # ------------------------------------------------------------------
+    consume_failure = None
     try:
         received, receive_ts = consume_canary(consumer, avro_deserializer, sent.message_id, timeout)
     except TimeoutError:
-        raise CanaryError(
-            Phase.CONSUME,
-            ErrorCategory.BROKER,
-            f"Message not returned within {timeout}s — produce succeeded so broker received it "
-            "(possible replication lag or ISR issue)",
+        consume_failure = _local_kafka_failure(
+            Phase.CONSUME, ErrorCategory.BROKER_SERVICE,
+            Recoverability.TRANSIENT, "CANARY.CONSUME_TIMEOUT",
+            FailureSummary.OPERATION_TIMED_OUT,
+        )
+    except (SerializationError, TypeError, ValueError):
+        consume_failure = _local_kafka_failure(
+            Phase.CONSUME, ErrorCategory.SERIALIZATION,
+            Recoverability.INTERNAL_FATAL, "CANARY.CONSUME_DESERIALIZATION",
+            FailureSummary.INTERNAL_FAILURE,
         )
     except KafkaException as exc:
         descriptor = classify_consumer_error(exc, phase=Phase.CONSUME)
         if descriptor.category is ErrorCategory.CLIENT_STATE:
             raise ConsumerInvalidError(descriptor) from None
-        raise CanaryError(Phase.CONSUME, descriptor.category, str(exc)) from exc
+        consume_failure = descriptor
+    except Exception:
+        consume_failure = _local_kafka_failure(
+            Phase.CONSUME, ErrorCategory.UNKNOWN, Recoverability.UNKNOWN,
+            "CANARY.CONSUME_UNKNOWN", FailureSummary.OPERATION_FAILED,
+        )
+    if consume_failure is not None:
+        raise CanaryError(consume_failure)
 
     # End-to-end latency: consumer receive time minus the timestamp captured
     # by the producer just before calling produce().  Both timestamps are
@@ -1638,9 +1707,14 @@ def _run_lifecycle() -> None:
                 except OperationDeadlineExceeded as exc:
                     sr_duration_ms = exc.timeout * 1000
                     sr_error = CanaryError(
-                        Phase.SCHEMA_REGISTRY,
-                        ErrorCategory.NETWORK,
-                        "probe exceeded configured deadline",
+                        FailureDescriptor(
+                            component=FailureComponent.SCHEMA_REGISTRY,
+                            phase=Phase.SCHEMA_REGISTRY,
+                            category=ErrorCategory.NETWORK,
+                            recoverability=Recoverability.TRANSIENT,
+                            code="CANARY.SR_PROBE_TIMEOUT",
+                            safe_summary=FailureSummary.OPERATION_TIMED_OUT,
+                        )
                     )
                 if sr_error is None:
                     health_store.record_schema_registry_result(success=True)
@@ -1648,21 +1722,19 @@ def _run_lifecycle() -> None:
                     metrics.SR_CHECKS_TOTAL.labels(result="success", host=metrics.HOST).inc()
                     log.info("Schema Registry check succeeded", extra={"latency_ms": sr_duration_ms})
                 else:
+                    sr_failure, sr_failure_label, sr_failure_fields = (
+                        _bounded_completion_failure(sr_error)
+                    )
                     health_store.record_schema_registry_result(
                         success=False,
                         deterministic_failure=sr_error.deterministic,
-                        failure=f"{sr_error.phase}:{sr_error.category}",
+                        failure=sr_failure_label,
                     )
                     metrics.SR_LATENCY.labels(host=metrics.HOST).observe(sr_duration_ms)
                     metrics.SR_CHECKS_TOTAL.labels(result="failure", host=metrics.HOST).inc()
                     log.error(
                         "Schema Registry check failed",
-                        extra={
-                            "phase": sr_error.phase,
-                            "category": sr_error.category,
-                            "detail": sr_error.detail,
-                            "latency_ms": sr_duration_ms,
-                        }
+                        extra={**sr_failure_fields, "latency_ms": sr_duration_ms}
                     )
 
             # ------------------------------------------------------------------
@@ -1749,7 +1821,9 @@ def _run_lifecycle() -> None:
                     raise
 
                 except ConsumerFailure as exc:
-                    failure = exc.failure
+                    failure, failure_label, failure_fields = (
+                        _bounded_completion_failure(exc)
+                    )
                     accepted = _record_failed_partition_attempt(
                         health_store,
                         p,
@@ -1757,7 +1831,7 @@ def _run_lifecycle() -> None:
                         consecutive_failures,
                         failure.phase,
                         failure.category,
-                        failure=f"{failure.phase.value}:{failure.category.value}",
+                        failure=failure_label,
                         generation=completed_generation,
                     )
                     if accepted:
@@ -1767,23 +1841,22 @@ def _run_lifecycle() -> None:
                                 "consecutive_failures": consecutive_failures[p],
                                 "check_sequence": completed_sequence,
                                 "partition": p,
-                                "phase": failure.phase,
-                                "category": failure.category,
-                                "code": failure.code,
-                                "detail": failure.safe_summary,
+                                **failure_fields,
                             },
                         )
 
                 except CanaryError as exc:
-                    # Classified failure — phase and category are known
+                    failure, failure_label, failure_fields = (
+                        _bounded_completion_failure(exc)
+                    )
                     accepted = _record_failed_partition_attempt(
                         health_store,
                         p,
                         completed_sequence,
                         consecutive_failures,
-                        exc.phase,
-                        exc.category,
-                        failure=f"{exc.phase}:{exc.category}",
+                        failure.phase,
+                        failure.category,
+                        failure=failure_label,
                         generation=completed_generation,
                     )
                     if accepted:
@@ -1793,9 +1866,7 @@ def _run_lifecycle() -> None:
                                 "consecutive_failures": consecutive_failures[p],
                                 "check_sequence": completed_sequence,
                                 "partition": p,
-                                "phase": exc.phase,
-                                "category": exc.category,
-                                "detail": exc.detail,
+                                **failure_fields,
                             }
                         )
 
