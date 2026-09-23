@@ -149,6 +149,44 @@ class KafkaRecoveryIntegrationTests(unittest.TestCase):
                     "raw internal detail", repr(completion_log.mock_calls)
                 )
 
+    def test_stale_fatal_completions_do_not_execute_recovery_actions(self):
+        cases = (
+            CanaryError(_failure(
+                ErrorCategory.SERIALIZATION,
+                Recoverability.INTERNAL_FATAL,
+            )),
+            RuntimeError("raw internal detail"),
+        )
+        for error in cases:
+            with self.subTest(error=type(error).__name__):
+                store = _store()
+                stale_generation = store.topic_generation
+                store.replace_expected_partitions((0, 1), preserve_existing=False)
+                before = store.snapshot()
+                completed = Future()
+                completed.set_exception(error)
+                metric_mocks = [MagicMock() for _ in range(4)]
+
+                with (
+                    patch("src.main.recovery_action", wraps=recovery_action) as policy,
+                    patch("src.main.metrics.FAILURES_TOTAL", metric_mocks[0]),
+                    patch("src.main.metrics.CHECKS_TOTAL", metric_mocks[1]),
+                    patch("src.main.metrics.record_partition_check", metric_mocks[2]),
+                    patch("src.main.metrics.CHECK_SEQUENCE", metric_mocks[3]),
+                    patch("src.main.log") as completion_log,
+                    patch("src.main._request_fatal_shutdown") as fatal_shutdown,
+                ):
+                    _record_kafka_completion(
+                        store, 1, 3, stale_generation, {0: 0, 1: 0}, completed,
+                    )
+
+                policy.assert_called_once()
+                self.assertEqual(before, store.snapshot())
+                completion_log.error.assert_not_called()
+                fatal_shutdown.assert_not_called()
+                for metric_mock in metric_mocks:
+                    metric_mock.assert_not_called()
+
     def test_consumer_state_replaces_only_borrowed_worker_before_completion(self):
         created = []
 

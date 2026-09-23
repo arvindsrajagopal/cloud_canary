@@ -282,12 +282,16 @@ class PromptAndReviewContractTests(unittest.TestCase):
             "{{CHANGED_FILES}}",
             "{{PATCH_PATH}}",
             "{{QUALITY_EVIDENCE}}",
+            "{{PRIOR_FINDINGS}}",
+            "{{REVIEW_CYCLE}}",
         ):
             self.assertIn(token, prompt)
         self.assertIn("conflicts between tasks", prompt)
         self.assertIn("strictly limited", prompt)
         self.assertIn("future acceptance criteria must not block", prompt)
         self.assertIn("directly prevents a future criterion", prompt)
+        self.assertIn("novelty explanation", prompt)
+        self.assertIn("review-quality issue", prompt)
 
     def test_review_schema_requires_all_categories(self):
         schema = _load_json("ralph/review-schema.json")

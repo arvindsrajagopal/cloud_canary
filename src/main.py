@@ -1071,7 +1071,7 @@ def _record_kafka_completion(
                     **failure_fields,
                 },
             )
-        if action is RecoveryAction.TERMINATE_PROCESS:
+        if accepted and action is RecoveryAction.TERMINATE_PROCESS:
             _request_fatal_shutdown()
         return
     except Exception:
@@ -1107,7 +1107,7 @@ def _record_kafka_completion(
                     **failure_fields,
                 },
             )
-        if action is RecoveryAction.TERMINATE_PROCESS:
+        if accepted and action is RecoveryAction.TERMINATE_PROCESS:
             _request_fatal_shutdown()
 
 
@@ -1368,7 +1368,28 @@ def validate_ssl_connectivity(
     log.info("SSL/TLS connectivity validation complete - all checks passed")
 
 
+def _shutdown_http_service(owner) -> None:
+    """Make probes unavailable, then bound all HTTP resource cleanup."""
+    service = owner.pop("service", None)
+    if service is None:
+        return
+    owner["health_store"].begin_shutdown()
+    deadline = _shutdown_deadline()
+    if deadline is None:
+        deadline = time.monotonic() + _shutdown_timeout_seconds
+    service.shutdown(deadline)
+
+
 def _run_lifecycle() -> None:
+    """Own HTTP cleanup across both startup and runtime failures."""
+    http_owner = {}
+    try:
+        _run_lifecycle_owned(http_owner)
+    finally:
+        _shutdown_http_service(http_owner)
+
+
+def _run_lifecycle_owned(http_owner) -> None:
     """
     Main entry point: load configuration, initialise all clients, then run the
     check loop until a shutdown signal is received.
@@ -1461,6 +1482,7 @@ def _run_lifecycle() -> None:
         liveness_scheduler_max_staleness=liveness_scheduler_max_staleness,
         invariant_failure_callback=_request_fatal_shutdown,
     )
+    http_owner["health_store"] = health_store
     configure_health_state(health_store)
 
     # Set version info metric
@@ -1501,7 +1523,7 @@ def _run_lifecycle() -> None:
     # The /metrics endpoint is available immediately, returning zeros for
     # counters/histograms that haven't been updated yet.
     try:
-        start_metrics_server(
+        http_owner["service"] = start_metrics_server(
             port=metrics_port,
             addr=metrics_bind_addr,
             ssl_enabled=metrics_ssl_enabled,
@@ -2011,6 +2033,7 @@ def _run_lifecycle() -> None:
         # Signal publication remains lock-free; the lifecycle owner makes
         # shutdown visible before any dependency cleanup can block.
         _publish_shutdown_state(health_store)
+        _shutdown_http_service(http_owner)
         # Release a reconciliation callback waiting for authorization without
         # allowing it to begin deletion during exceptional shutdown.
         recreation_cancelled.set()

@@ -34,6 +34,13 @@ Complete quality-gate evidence:
 {{QUALITY_EVIDENCE}}
 ```
 
+This is review cycle {{REVIEW_CYCLE}}. Prior findings and their known
+disposition:
+
+```text
+{{PRIOR_FINDINGS}}
+```
+
 Review the cumulative patch for conflicts between tasks, incompatible shared
 interfaces, duplicated ownership, inconsistent configuration or state models,
 security regressions, unbounded work or memory, deployment portability, and
@@ -74,6 +81,11 @@ execution plan in `ralph/tasks.json`; they and `NON_BLOCKING_IMPROVEMENT`
 findings are non-blocking. `SPEC_GAP` requires `HUMAN_REQUIRED`. Frozen
 decisions may be challenged only with a direct conflicting citation from
 `SPEC.md`.
+
+On review cycle 2, a newly reported blocker must state whether the correction
+introduced it or give a concrete explanation of why it could not reasonably
+have been identified in cycle 1. Without that novelty explanation, treat it as
+a review-quality issue rather than another implementation attempt.
 
 Evaluate all six schema categories: consistency, security, architecture,
 performance, best practices, and specification deviation. Use concrete file

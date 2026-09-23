@@ -325,16 +325,23 @@ a bounded concurrent HTTP service implemented with the Python standard library.
   exception text, tracebacks, credentials, or internal objects.
 
 The application must retain explicit ownership of the HTTP server, request
-queue, and worker pool. They must not be left as an unmanaged daemon-only
-resource.
+queue, active connections, and worker pool through the bounded drain attempt.
+They must not be started as unmanaged daemon-only resources.
 
 HTTP shutdown must:
 
 1. Mark liveness and readiness unavailable.
 2. Stop accepting new request work.
-3. Drain or terminate bounded in-flight HTTP work for no longer than
-   `http.shutdown.timeout.seconds`.
-4. Close the listening socket and release HTTP worker resources.
+3. Drain in-flight HTTP work for no longer than
+   `http.shutdown.timeout.seconds`, then close active connections to interrupt
+   request and response I/O.
+4. Close the listening socket and release cooperative HTTP worker resources.
+
+Python threads must not be killed or asynchronously interrupted. If a handler
+does not terminate after its connection is closed, it may be abandoned only
+behind the owned daemon execution boundary so it cannot extend process exit.
+This deadline fallback is termination for shutdown purposes; the process must
+retain no non-daemon HTTP worker that can outlive the configured bound.
 
 Failure to finish HTTP draining within the shutdown bound must be logged safely
 and must not block the remaining process cleanup indefinitely.

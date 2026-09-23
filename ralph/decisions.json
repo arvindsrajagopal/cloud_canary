@@ -38,6 +38,10 @@
     "R41": [
       "Scheduler capacity is detached store-owned state, not a live snapshot callback. Topology transitions atomically publish expected partitions and their corresponding scheduler-capacity value under the HealthStateStore lock."
     ],
+    "R52": [
+      "HTTP shutdown drains only until the absolute process deadline, then closes active connections to interrupt request and response I/O.",
+      "Python threads are never killed or asynchronously interrupted. A handler that remains blocked after connection closure is abandoned behind the owned daemon execution boundary so it cannot delay remaining cleanup or process exit."
+    ],
     "R88": [
       "A recreated-topic replacement runtime is a distinct Kafka dependency transaction: authorize and submit it through the shared shutdown dispatch guard, run native construction outside the guard on an abandonable daemon lane, and skip reconstruction when shutdown wins first."
     ]

@@ -46,11 +46,25 @@ import logging
 import os
 import socket
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from types import SimpleNamespace
 
 from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+from src.bounded_executor import DaemonThreadPoolExecutor
+
+threading = SimpleNamespace(
+    BoundedSemaphore=threading.BoundedSemaphore,
+    Event=threading.Event,
+    Lock=threading.Lock,
+    RLock=threading.RLock,
+    Thread=threading.Thread,
+)
 
 log = logging.getLogger(__name__)
+_http_log = logging.getLogger(f"{__name__}.http")
+_http_log.propagate = False
+if not _http_log.handlers:
+    _http_log.addHandler(logging.StreamHandler())
 
 # Hostname of this canary instance.  Embedded as a constant label on every
 # metric so that dashboards and alerts can filter or group by instance without
@@ -413,6 +427,54 @@ VERSION_INFO = Info(
 # Note: VERSION_INFO is populated in main.py after importing __version__
 
 
+class HTTPService:
+    """Own the HTTP listener and its independent bounded request workers."""
+
+    def __init__(self, server, listener_thread):
+        self._server = server
+        self._listener_thread = listener_thread
+        self._shutdown_lock = threading.Lock()
+        self._stopped = False
+
+    def shutdown(self, deadline: float, *, monotonic_clock=time.monotonic) -> None:
+        """Stop admission and release HTTP resources by an absolute deadline."""
+        with self._shutdown_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
+        self._server._accepting.clear()
+
+        listener_shutdown = threading.Thread(
+            target=self._server.shutdown,
+            name="canary-http-listener-shutdown",
+            daemon=True,
+        )
+        listener_shutdown.start()
+        listener_shutdown.join(max(0.0, deadline - monotonic_clock()))
+
+        # Closing the socket is unconditional, even if serve_forever failed to
+        # acknowledge shutdown before the deadline.
+        self._server.server_close()
+        self._server._request_executor.shutdown(
+            wait=False, cancel_futures=True
+        )
+
+        worker_shutdown = threading.Thread(
+            target=self._server._request_executor.shutdown,
+            kwargs={"wait": True},
+            name="canary-http-worker-shutdown",
+            daemon=True,
+        )
+        worker_shutdown.start()
+        worker_shutdown.join(max(0.0, deadline - monotonic_clock()))
+        self._server._close_active_requests()
+        self._listener_thread.join(max(0.0, deadline - monotonic_clock()))
+
+        if listener_shutdown.is_alive() or worker_shutdown.is_alive():
+            _http_log.warning("HTTP shutdown exceeded its configured drain bound")
+
+
 def start_metrics_server(
     port: int,
     addr: str = "0.0.0.0",
@@ -422,11 +484,12 @@ def start_metrics_server(
     max_workers: int = 4,
     request_queue_size: int = 16,
     socket_timeout: float = 5.0,
-) -> None:
+) -> HTTPService:
     """
     Start the Prometheus HTTP(S) metrics server with health endpoints.
 
-    Spawns a background daemon thread that serves multiple endpoints:
+    Returns an owned service handle for the background listener and request
+    workers that serve multiple endpoints:
     - /metrics — Prometheus metrics exposition format
     - /live    — Process and scheduler-control-plane liveness
     - /health  — Kafka dependency-health summary (healthy/degraded/unhealthy)
@@ -475,7 +538,6 @@ def start_metrics_server(
         If SSL certificate or key files do not exist.
     """
     import json
-    import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from src.health import (
@@ -501,7 +563,7 @@ def start_metrics_server(
         def _write_failure(self, status, response):
             """Best-effort fixed-shape JSON failure without exception details."""
             try:
-                log.error("HTTP handler failed")
+                _http_log.error("HTTP handler failed")
             except Exception:
                 pass
 
@@ -635,7 +697,11 @@ def start_metrics_server(
         server._request_slots = threading.BoundedSemaphore(
             max_workers + request_queue_size
         )
-        server._request_executor = ThreadPoolExecutor(
+        server._accepting = threading.Event()
+        server._accepting.set()
+        server._active_requests = set()
+        server._active_requests_lock = threading.Lock()
+        server._request_executor = DaemonThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="canary-http",
         )
@@ -656,6 +722,9 @@ def start_metrics_server(
             # The listening thread never waits for executor capacity. An
             # accepted request either owns one active/waiting slot or is
             # rejected without entering the executor's internal queue.
+            if not server._accepting.is_set():
+                server.shutdown_request(request)
+                return
             if not server._request_slots.acquire(blocking=False):
                 HTTP_OVERLOAD_TOTAL.labels(host=HOST).inc()
                 try:
@@ -668,10 +737,14 @@ def start_metrics_server(
                 return
 
             try:
+                with server._active_requests_lock:
+                    server._active_requests.add(request)
                 server._request_executor.submit(
                     process_admitted_request, request, client_address
                 )
             except BaseException:
+                with server._active_requests_lock:
+                    server._active_requests.discard(request)
                 server._request_slots.release()
                 server.shutdown_request(request)
                 raise
@@ -683,11 +756,28 @@ def start_metrics_server(
                 except Exception:
                     server.handle_error(request, client_address)
                 finally:
+                    with server._active_requests_lock:
+                        server._active_requests.discard(request)
                     server.shutdown_request(request)
             finally:
                 server._request_slots.release()
 
+        def close_active_requests():
+            with server._active_requests_lock:
+                active_requests = tuple(server._active_requests)
+                server._active_requests.clear()
+            for request in active_requests:
+                try:
+                    request.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    request.close()
+                except Exception:
+                    pass
+
         server.process_request = process_request
+        server._close_active_requests = close_active_requests
         return server
 
     # Validate SSL configuration
@@ -732,3 +822,4 @@ def start_metrics_server(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     log.debug(f"Metrics server started on {addr}:{port} (ssl={ssl_enabled})")
+    return HTTPService(server, thread)

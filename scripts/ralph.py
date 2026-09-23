@@ -888,6 +888,14 @@ def _milestone_review(
     prefix = "milestone-{}".format(task["id"].lower())
     patch_path = STATE_DIR / (prefix + "-cumulative.patch")
     patch_path.write_text(patch, encoding="utf-8")
+    review_path = STATE_DIR / (prefix + "-review.json")
+    prior_findings = "none"
+    review_cycle = 1
+    if review_path.exists():
+        prior_findings = _bounded_text(
+            review_path.read_text(encoding="utf-8"), feedback_limit
+        )
+        review_cycle = 2
     milestone_tasks = plan["tasks"][completed_count : len(state["completed_tasks"]) + 1]
     prompt = _render_prompt(
         MILESTONE_REVIEW_PROMPT_PATH,
@@ -896,6 +904,8 @@ def _milestone_review(
             "CHANGED_FILES": "\n".join(sorted(changed)),
             "PATCH_PATH": str(patch_path.relative_to(ROOT)),
             "QUALITY_EVIDENCE": _bounded_text(quality_detail, feedback_limit),
+            "PRIOR_FINDINGS": prior_findings,
+            "REVIEW_CYCLE": str(review_cycle),
             "DECISION_LEDGER": json.dumps(
                 _load_json(DECISION_LEDGER_PATH), indent=2
             ),
@@ -904,7 +914,7 @@ def _milestone_review(
     review_text = _invoke_codex(
         codex_executable,
         prompt,
-        STATE_DIR / (prefix + "-review.json"),
+        review_path,
         STATE_DIR / (prefix + "-review.log"),
         timeout_seconds,
         read_only=True,
@@ -917,7 +927,10 @@ def _milestone_review(
             "milestone review output was not valid JSON: {}".format(exc)
         ) from exc
     passed, detail = _validate_review(
-        review, max_findings=max_findings, feedback_limit=feedback_limit
+        review,
+        max_findings=max_findings,
+        feedback_limit=feedback_limit,
+        review_cycle=review_cycle,
     )
     if not passed:
         raise HumanIntervention("cumulative milestone review failed:\n" + detail)
