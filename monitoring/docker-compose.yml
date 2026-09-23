@@ -1,11 +1,12 @@
-# Local monitoring stack for cloud_canary.
+# Development-only local monitoring stack for cloud_canary.
+# This stack, including its bundled credentials, is unsuitable for production.
 #
 # Usage:
 #   cd monitoring/
 #   docker compose up -d
 #
 # Prometheus: http://localhost:9090
-# Grafana:    http://localhost:3000  (admin / admin)
+# Grafana:    http://localhost:3000  (development-only admin / admin)
 #
 # The canary must be running on the host with metrics exposed on port 8000.
 # Prometheus reaches it via host.docker.internal (works on macOS natively;
@@ -17,7 +18,7 @@ services:
     container_name: canary-prometheus
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -25,7 +26,6 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=15d"
-      - "--web.enable-lifecycle"
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Linux compat; no-op on macOS
 
@@ -34,7 +34,7 @@ services:
     container_name: canary-grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin

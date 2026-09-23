@@ -36,11 +36,12 @@ cp config/config.ini.template config/config.ini
 # 4. Run the canary (from project root)
 python -m src.main
 
-# 5. (Optional, macOS + Colima) Start Prometheus + Grafana alongside the canary.
+# 5. (Optional, macOS + Colima) Start the development-only monitoring stack.
 #    run.sh starts Colima if needed, brings up the monitoring stack, runs the
 #    canary, and tears the stack down on normal exit or trappable signals.
 ./run.sh
-# Prometheus: http://localhost:9090   Grafana: http://localhost:3000 (admin/admin)
+# Prometheus: http://localhost:9090   Grafana: http://localhost:3000
+# Grafana's admin/admin credential is for local development only.
 ```
 
 > `config/config.ini` is git-ignored — never commit it.
@@ -770,9 +771,15 @@ readinessProbe:
 
 ## Monitoring Stack (Prometheus + Grafana)
 
-A pre-configured local monitoring stack is included in `monitoring/`. It requires
-Docker and Docker Compose. The canary process must be running on the host before
-starting the stack (Prometheus scrapes `host.docker.internal:8000`).
+> [!WARNING]
+> The pre-configured stack in `monitoring/` is for local development and testing
+> only and is unsuitable for production. Its bundled `admin` / `admin` Grafana
+> credential is development-only, not production-safe. Published Prometheus and
+> Grafana ports bind to loopback by default.
+
+The stack requires Docker and Docker Compose. The canary process must be running
+on the host before starting it (Prometheus scrapes
+`host.docker.internal:8000`).
 
 ### Start the stack
 
@@ -788,6 +795,18 @@ docker compose up -d
 
 The Cloud Canary dashboard is provisioned automatically and opens as the Grafana
 home page. No manual import is required.
+
+### Production monitoring boundary
+
+Production deployments must supply an externally managed, secure
+Prometheus-compatible scraper and visualization system. The production operator
+is responsible for retention, high availability, alerting, access control,
+authentication, network isolation, audit requirements, and dashboard security.
+
+Cloud Canary exposes metrics using the pull model; it does not accept or require
+a Prometheus server URL and does not push metrics to either the bundled stack or
+an enterprise monitoring service. Configure the external scraper to retrieve the
+canary's `/metrics` endpoint, with appropriate transport and network controls.
 
 ### Stop the stack
 
