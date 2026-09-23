@@ -282,6 +282,23 @@ def _path_allowed(path: str, allowed_paths: Iterable[str]) -> bool:
     return False
 
 
+def _task_change_limits(
+    task: Dict[str, Any], global_limits: Dict[str, Any]
+) -> Tuple[int, int]:
+    """Return the strictest configured file-count and diff-line limits."""
+    budget = task.get("budget") or {}
+    return (
+        min(
+            int(global_limits["max_changed_files"]),
+            int(budget.get("max_changed_files", global_limits["max_changed_files"])),
+        ),
+        min(
+            int(global_limits["max_diff_lines"]),
+            int(budget.get("max_diff_lines", global_limits["max_diff_lines"])),
+        ),
+    )
+
+
 def _load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -347,6 +364,18 @@ def _load_plan() -> Dict[str, Any]:
         raise RalphError("task array must match the declared execution order")
     covered = []
     for index, task in enumerate(plan["tasks"]):
+        budget = task.get("budget")
+        if budget is not None:
+            budget_keys = {"max_changed_files", "max_diff_lines"}
+            if set(budget) != budget_keys or any(
+                not isinstance(budget[name], int)
+                or budget[name] <= 0
+                or budget[name] > limits[name]
+                for name in budget_keys
+            ):
+                raise RalphError(
+                    "task {} has an invalid change budget".format(task["id"])
+                )
         criteria_range = task["criteria_range"]
         if criteria_range is None:
             conditions = task.get("acceptance_conditions")
@@ -997,8 +1026,6 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         )
     limits = plan["context_limits"]
     feedback_limit = int(limits["max_feedback_characters"])
-    max_changed_files = int(limits["max_changed_files"])
-    max_diff_lines = int(limits["max_diff_lines"])
     max_review_findings = int(limits["max_review_findings_forwarded"])
     if max_iterations <= 0 or max_attempts <= 0:
         raise RalphError("iteration and attempt limits must be positive")
@@ -1035,6 +1062,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                         task["id"]
                     )
                 )
+
+            max_changed_files, max_diff_lines = _task_change_limits(task, limits)
 
             feedback = state["feedback"].get(task["id"], "none")
             iterations += 1

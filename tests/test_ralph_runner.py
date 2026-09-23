@@ -65,6 +65,20 @@ class ScopeTests(unittest.TestCase):
             self.assertTrue(ralph._is_prohibited_path(path), path)
         self.assertFalse(ralph._is_prohibited_path("src/config.py"))
 
+    def test_task_change_limits_use_stricter_task_budget(self):
+        limits = {"max_changed_files": 4, "max_diff_lines": 500}
+        self.assertEqual(
+            (2, 220),
+            ralph._task_change_limits(
+                {"budget": {"max_changed_files": 2, "max_diff_lines": 220}},
+                limits,
+            ),
+        )
+
+    def test_task_change_limits_fall_back_to_global_ceiling(self):
+        limits = {"max_changed_files": 4, "max_diff_lines": 500}
+        self.assertEqual((4, 500), ralph._task_change_limits({}, limits))
+
 
 class ReviewGateTests(unittest.TestCase):
     def test_clean_review_passes(self):

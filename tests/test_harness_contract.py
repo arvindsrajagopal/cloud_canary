@@ -91,7 +91,8 @@ class SpecificationCoverageTests(unittest.TestCase):
                 self.assertTrue(test_path.startswith("tests/"), test_path)
 
     def test_context_limits_are_explicit_and_positive(self):
-        limits = _load_json("ralph/tasks.json")["context_limits"]
+        plan = _load_json("ralph/tasks.json")
+        limits = plan["context_limits"]
         self.assertEqual(
             {
                 "max_feedback_characters",
@@ -102,6 +103,17 @@ class SpecificationCoverageTests(unittest.TestCase):
             set(limits),
         )
         self.assertTrue(all(isinstance(value, int) and value > 0 for value in limits.values()))
+        for task in plan["tasks"]:
+            budget = task.get("budget")
+            if budget is None:
+                continue
+            self.assertEqual(
+                {"max_changed_files", "max_diff_lines"}, set(budget), task["id"]
+            )
+            for name, value in budget.items():
+                self.assertIsInstance(value, int, task["id"])
+                self.assertGreater(value, 0, task["id"])
+                self.assertLessEqual(value, limits[name], task["id"])
 
     def test_development_reference_is_non_normative_and_source_linked(self):
         plan = _load_json("ralph/tasks.json")
