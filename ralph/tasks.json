@@ -1,5 +1,5 @@
 {
-  "schema_version": 42,
+  "schema_version": 43,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
@@ -834,8 +834,8 @@
       "budget": {"max_changed_files": 4, "max_diff_lines": 500},
       "spec_sections": ["8.4"],
       "development_reference_sections": ["2", "3", "4", "5", "7"],
-      "test_files": ["tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py"],
-      "allowed_paths": ["src/main.py", "tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py"],
+      "test_files": ["tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py", "tests/unit/test_config_validation.py"],
+      "allowed_paths": ["src/main.py", "tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_config_validation.py"],
       "milestone": false
     },
     {
