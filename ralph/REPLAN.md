@@ -105,6 +105,7 @@ artifact are verified against the restored accepted baseline.
 | R54 | 63–64 | HTTP method policy and response redaction |
 | R55 | 65 | HTTPS probe verification — milestone |
 | R56 | 66–67 | Development monitoring versus enterprise monitoring |
+| R102 | support | Retire duplicate-client validation test assumptions |
 | R57 | 68 | Long-lived startup client validation |
 | R100 | 69 | Deterministic startup failure execution |
 | R58 | 70 | Transient startup health and retry-stage isolation |
@@ -230,12 +231,14 @@ diff budget because it combined two independently testable invariants, so the
 activated sequence now separates long-lived client ownership, deterministic
 failure execution, and transient startup state:
 
-1. R57 owns criterion 68: validation through the actual long-lived Kafka
+1. R102 first removes one file of obsolete test assumptions about temporary
+   Producer and urllib validation while retaining configuration coverage.
+2. R57 owns criterion 68: validation through the actual long-lived Kafka
    administrative and Schema Registry clients, including alignment of the
    existing ordering and reconciliation tests.
-2. R100 owns criterion 69: deterministic startup failure through typed,
+3. R100 owns criterion 69: deterministic startup failure through typed,
    centralized recovery and bounded cleanup.
-3. R58 owns criterion 70: live-but-unready transient initialization state,
+4. R58 owns criterion 70: live-but-unready transient initialization state,
    unhealthy dependency reporting, and retry of only the current failed stage.
 
 Backoff progression, attempt overlap, partial-client cleanup, warmup capability

@@ -35,7 +35,7 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(67, len(plan["tasks"]))
+        self.assertEqual(68, len(plan["tasks"]))
         self.assertEqual("active", plan["execution_status"])
         self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
         self.assertTrue(
@@ -216,7 +216,9 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertTrue(tasks["R55"]["milestone"])
         self.assertEqual(["R55"], tasks["R56"]["depends_on"])
         self.assertEqual([66, 67], tasks["R56"]["criteria_range"])
-        self.assertEqual(["R56"], tasks["R57"]["depends_on"])
+        self.assertEqual(["R56"], tasks["R102"]["depends_on"])
+        self.assertIsNone(tasks["R102"]["criteria_range"])
+        self.assertEqual(["R102"], tasks["R57"]["depends_on"])
         self.assertEqual([68, 68], tasks["R57"]["criteria_range"])
         self.assertEqual(["R57"], tasks["R100"]["depends_on"])
         self.assertEqual([69, 69], tasks["R100"]["criteria_range"])

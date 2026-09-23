@@ -1,12 +1,12 @@
 {
-  "schema_version": 43,
+  "schema_version": 44,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
   "development_reference": "ralph/confluent-development-reference.md",
   "decision_ledger": "ralph/decisions.json",
   "completion_criteria_count": 119,
-  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R96", "R97", "R98", "R93", "R99", "R49", "R47", "R50", "R48", "R51", "R52", "R53", "R54", "R55", "R56", "R57", "R100", "R58", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
+  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R96", "R97", "R98", "R93", "R99", "R49", "R47", "R50", "R48", "R51", "R52", "R53", "R54", "R55", "R56", "R102", "R57", "R100", "R58", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
   "default_max_iterations": 49,
   "default_max_attempts_per_task": 2,
   "review_policy": {
@@ -824,8 +824,24 @@
       "milestone": false
     },
     {
-      "id": "R57",
+      "id": "R102",
       "depends_on": ["R56"],
+      "title": "Retire duplicate-client validation test assumptions",
+      "criteria_range": null,
+      "acceptance_conditions": ["Configuration tests no longer require the temporary Kafka Producer or urllib Schema Registry validator", "Schema Registry timeout propagation to the retained client configuration remains covered", "HTTPS configuration rejection remains covered by centralized configuration validation", "The unchanged pre-R57 production implementation and the subsequent retained-client implementation can both satisfy these tests"],
+      "ownership_boundary": "One-file modernization of configuration tests that encode the superseded duplicate-client startup validator.",
+      "explicit_exclusions": ["Production startup behavior owned by R57", "Deterministic startup failure execution owned by R100", "Transient startup state owned by R58"],
+      "failure_mode_checklist": ["No test invokes temporary Producer or urllib validation", "Timeout propagation remains asserted", "Plain HTTP remains rejected without credential disclosure", "The complete quality gate remains green"],
+      "budget": {"max_changed_files": 1, "max_diff_lines": 160},
+      "spec_sections": ["8.4"],
+      "development_reference_sections": ["2", "3", "4", "5", "7"],
+      "test_files": ["tests/unit/test_config_validation.py"],
+      "allowed_paths": ["tests/unit/test_config_validation.py"],
+      "milestone": false
+    },
+    {
+      "id": "R57",
+      "depends_on": ["R102"],
       "title": "Long-lived startup client validation",
       "criteria_range": [68, 68],
       "ownership_boundary": "Construction and validation of the actual long-lived Kafka administrative and Schema Registry clients.",
@@ -834,8 +850,8 @@
       "budget": {"max_changed_files": 4, "max_diff_lines": 500},
       "spec_sections": ["8.4"],
       "development_reference_sections": ["2", "3", "4", "5", "7"],
-      "test_files": ["tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py", "tests/unit/test_config_validation.py"],
-      "allowed_paths": ["src/main.py", "tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_config_validation.py"],
+      "test_files": ["tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py"],
+      "allowed_paths": ["src/main.py", "tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py"],
       "milestone": false
     },
     {

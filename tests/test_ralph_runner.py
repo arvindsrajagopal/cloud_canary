@@ -258,7 +258,7 @@ class PlanAndPromptTests(unittest.TestCase):
         self.assertEqual("R52", state["completed_tasks"][-1])
         self.assertEqual("R53", ralph._select_task(plan, state, None)["id"])
 
-    def test_r14_migration_selects_r57_after_completed_prefix(self):
+    def test_r57_split_migration_selects_test_prerequisite(self):
         plan = ralph._load_plan()
         completed = [
             "R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27",
@@ -275,13 +275,13 @@ class PlanAndPromptTests(unittest.TestCase):
             "working_tree_fingerprint": "clean",
             "attempts": {},
             "feedback": {},
-            "plan_schema_version": 43,
+            "plan_schema_version": 44,
         }
 
-        self.assertEqual(43, plan["schema_version"])
+        self.assertEqual(44, plan["schema_version"])
         ralph._validate_state(plan, state)
         self.assertEqual("R56", state["completed_tasks"][-1])
-        self.assertEqual("R57", ralph._select_task(plan, state, None)["id"])
+        self.assertEqual("R102", ralph._select_task(plan, state, None)["id"])
 
     def test_state_completion_must_be_an_execution_order_prefix(self):
         plan = ralph._load_plan()

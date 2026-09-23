@@ -1,11 +1,10 @@
 """Configuration validation regressions for health and transport security."""
 
 import unittest
-import urllib.request
 from unittest.mock import Mock, patch
 
 from src.config import validate_config
-from src.main import run, validate_ssl_connectivity
+from src.main import run
 
 
 def _config(**app_overrides):
@@ -184,7 +183,11 @@ class ConfigValidationTests(unittest.TestCase):
         with (
             patch("src.main.load_config", return_value=config),
             patch("src.main.setup_logging"),
-            patch("src.main.validate_ssl_connectivity") as validate_connectivity,
+            patch("src.main.validate_ssl_connectivity", create=True),
+            patch("src.main.validate_kafka_startup_client", create=True),
+            patch(
+                "src.main.validate_schema_registry_startup_client", create=True
+            ),
             patch("src.main.start_metrics_server"),
             patch("src.main.signal.signal"),
             patch("src.main.AdminClient", return_value=Mock()),
@@ -200,105 +203,8 @@ class ConfigValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stop after client construction"):
                 run()
 
-        validate_connectivity.assert_called_once_with(
-            config["kafka"], config["schema_registry"], 3.25
-        )
         client.assert_called_once_with(
             {**config["schema_registry"], "timeout": 3.25}
-        )
-
-    def test_startup_schema_registry_request_uses_configured_timeout(self):
-        config = _config()
-        kafka_producer = Mock()
-        kafka_producer.list_topics.return_value.brokers = {1: object()}
-        opener = Mock()
-        opener.open.return_value.read.return_value = b"[]"
-        opener.open.return_value.geturl.return_value = (
-            "https://registry.invalid/subjects"
-        )
-
-        with (
-            patch("confluent_kafka.Producer", return_value=kafka_producer),
-            patch("urllib.request.build_opener", return_value=opener),
-        ):
-            validate_ssl_connectivity(
-                config["kafka"], config["schema_registry"], sr_timeout=2.75
-            )
-
-        opener.open.assert_called_once()
-        self.assertEqual(2.75, opener.open.call_args.kwargs["timeout"])
-
-    def test_startup_rejects_plain_http_before_credentials_or_network(self):
-        config = _config()
-        secret = "startup-secret-must-not-be-logged"
-        config["schema_registry"] = {
-            "url": "http://registry.invalid",
-            "basic.auth.user.info": f"test-user:{secret}",
-        }
-
-        with (
-            patch("src.main.log") as logger,
-            patch("confluent_kafka.Producer") as kafka_producer,
-            patch("urllib.request.build_opener") as build_opener,
-            self.assertRaises(SystemExit),
-        ):
-            validate_ssl_connectivity(
-                config["kafka"], config["schema_registry"], sr_timeout=2.75
-            )
-
-        kafka_producer.assert_not_called()
-        build_opener.assert_not_called()
-        log_output = str(logger.method_calls)
-        self.assertNotIn(secret, log_output)
-        self.assertNotIn(
-            "SSL/TLS validation successful for Schema Registry", log_output
-        )
-
-    def test_startup_rejects_https_redirect_to_http_before_credentials(self):
-        config = _config()
-        kafka_producer = Mock()
-        kafka_producer.list_topics.return_value.brokers = {1: object()}
-        attempted_requests = []
-
-        class DowngradeRedirectOpener:
-            def __init__(self, handlers):
-                self.redirect_handler = next(
-                    handler
-                    for handler in handlers
-                    if isinstance(handler, urllib.request.HTTPRedirectHandler)
-                )
-
-            def open(self, request, timeout):
-                attempted_requests.append(request)
-                self.redirect_handler.redirect_request(
-                    request,
-                    Mock(),
-                    302,
-                    "Found",
-                    {},
-                    "http://registry.invalid/subjects",
-                )
-                raise AssertionError("downgrade redirect unexpectedly returned")
-
-        def build_opener(*handlers):
-            return DowngradeRedirectOpener(handlers)
-
-        with (
-            patch("src.main.log") as logger,
-            patch("confluent_kafka.Producer", return_value=kafka_producer),
-            patch("urllib.request.build_opener", side_effect=build_opener),
-            self.assertRaises(SystemExit),
-        ):
-            validate_ssl_connectivity(
-                config["kafka"], config["schema_registry"], sr_timeout=2.75
-            )
-
-        self.assertEqual(1, len(attempted_requests))
-        self.assertTrue(attempted_requests[0].full_url.startswith("https://"))
-        self.assertNotIn("Authorization", attempted_requests[0].headers)
-        self.assertNotIn(
-            "SSL/TLS validation successful for Schema Registry",
-            str(logger.method_calls),
         )
 
 

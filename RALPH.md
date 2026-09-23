@@ -103,7 +103,7 @@ The ordered stages cover core health and scheduling through R43,
 R44-R46 for failure classification and recovery, R91-R98/R93 for checkpoint
 review integrity and recovery-boundary correction, R99/R49 for bounded HTTP
 concurrency, R47/R50/R48/R51-R52 for bounded HTTP safety and lifecycle,
-R53-R56 for endpoint and monitoring security, R57/R100/R58 for startup client and
+R53-R56 for endpoint and monitoring security, R102/R57/R100/R58 for startup client and
 transient-state boundaries, R15-R18 for startup continuation,
 portability, and secrets, and R19-R24 for supply-chain,
 multi-instance ownership, topology, observability, and resource containment.
