@@ -1036,13 +1036,20 @@ def _log_reconciliation_failure(stage: str, exc: Exception) -> None:
     )
 
 
+def _log_cleanup_failure(message: str, exc: Exception, **context) -> None:
+    """Report cleanup failure without exposing dependency exception text."""
+    log.error(message, extra={**context, "error": type(exc).__name__})
+
+
 def _cleanup_runtime_resources(executor, consumers, producer) -> None:
     """Best-effort cleanup that is safe for a partially constructed runtime."""
     if executor is not None:
         try:
             executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            log.exception("Failed to stop scheduler during final cleanup")
+        except Exception as exc:
+            _log_cleanup_failure(
+                "Failed to stop scheduler during final cleanup", exc
+            )
 
     consumer_items = ()
     if consumers is not None:
@@ -1050,16 +1057,19 @@ def _cleanup_runtime_resources(executor, consumers, producer) -> None:
             consumers.close()
         except AttributeError:
             consumer_items = consumers.items()
-        except Exception:
-            log.exception("Failed to close consumer pool during final cleanup")
+        except Exception as exc:
+            _log_cleanup_failure(
+                "Failed to close consumer pool during final cleanup", exc
+            )
 
     for partition, consumer in consumer_items:
         try:
             consumer.close()
-        except Exception:
-            log.exception(
+        except Exception as exc:
+            _log_cleanup_failure(
                 "Failed to close consumer during final cleanup",
-                extra={"partition": partition},
+                exc,
+                partition=partition,
             )
 
     if executor is not None:
@@ -1070,14 +1080,44 @@ def _cleanup_runtime_resources(executor, consumers, producer) -> None:
             # this wait at the already-published absolute deadline if a native
             # dependency call never returns.
             executor.shutdown(wait=True)
-        except Exception:
-            log.exception("Failed to drain scheduler during final cleanup")
+        except Exception as exc:
+            _log_cleanup_failure(
+                "Failed to drain scheduler during final cleanup", exc
+            )
 
     if producer is not None:
         try:
-            producer.flush(timeout=5)
-        except Exception:
-            log.exception("Failed to flush producer during final cleanup")
+            timeout = 5.0
+            deadline = _shutdown_deadline()
+            if deadline is not None:
+                timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+            producer.flush(timeout=timeout)
+        except Exception as exc:
+            _log_cleanup_failure(
+                "Failed to flush producer during final cleanup", exc
+            )
+
+
+def _cleanup_startup_resources(owner) -> None:
+    """Idempotently release only long-lived startup clients already owned."""
+    executor = owner.pop("executor", None)
+    consumers = owner.pop("consumers", None)
+    producer = owner.pop("producer", None)
+    _cleanup_runtime_resources(executor, consumers, producer)
+
+    for name in ("schema_registry", "admin"):
+        client = owner.pop(name, None)
+        close = getattr(client, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception as exc:
+            _log_cleanup_failure(
+                f"Failed to close {name} client during final cleanup", exc
+            )
+
+    _close_kafka_log_handler(owner.pop("kafka_log_handler", None))
 
 
 def _submit_due_checks(
@@ -1185,8 +1225,10 @@ def _close_kafka_log_handler(handler) -> None:
     try:
         logging.getLogger().removeHandler(handler)
         handler.close()
-    except Exception:
-        log.exception("Failed to close Kafka log handler during final cleanup")
+    except Exception as exc:
+        _log_cleanup_failure(
+            "Failed to close Kafka log handler during final cleanup", exc
+        )
 
 
 def _register_kafka_log_handler(handler) -> bool:
@@ -1528,12 +1570,18 @@ def _run_lifecycle() -> None:
     """Own HTTP cleanup across both startup and runtime failures."""
     http_owner = {}
     try:
+        # Preserve the established single-argument lifecycle seam while the
+        # owned implementation publishes its partial-startup ledger here.
         _run_lifecycle_owned(http_owner)
     finally:
-        _shutdown_http_service(http_owner)
+        startup_owner = http_owner.pop("startup_resources", {})
+        try:
+            _shutdown_http_service(http_owner)
+        finally:
+            _cleanup_startup_resources(startup_owner)
 
 
-def _run_lifecycle_owned(http_owner) -> None:
+def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
     """
     Main entry point: load configuration, initialise all clients, then run the
     check loop until a shutdown signal is received.
@@ -1558,6 +1606,8 @@ def _run_lifecycle_owned(http_owner) -> None:
     • kafka_log_handler.close() flushes any buffered log records to Kafka.
     """
     global _shutdown_timeout_seconds
+    if startup_owner is None:
+        startup_owner = http_owner.setdefault("startup_resources", {})
 
     config = _execute_startup_operation(
         lambda: load_config(CONFIG_FILE),
@@ -1716,6 +1766,7 @@ def _run_lifecycle_owned(http_owner) -> None:
         retry_wait=startup_retry_timing,
         stage_complete=False,
     )
+    startup_owner["admin"] = admin
     _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
             lambda: validate_kafka_startup_client(admin)
@@ -1774,6 +1825,7 @@ def _run_lifecycle_owned(http_owner) -> None:
                     shutdown_deadline=_shutdown_deadline,
                 )
             )
+            startup_owner["kafka_log_handler"] = kafka_log_handler
             kafka_log_handler.setFormatter(logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
@@ -1809,6 +1861,7 @@ def _run_lifecycle_owned(http_owner) -> None:
         retry_wait=startup_retry_timing,
         stage_complete=False,
     )
+    startup_owner["schema_registry"] = sr_client
     _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
             lambda: validate_schema_registry_startup_client(sr_client)
@@ -1838,6 +1891,7 @@ def _run_lifecycle_owned(http_owner) -> None:
         waiting_state="WAITING_FOR_KAFKA",
         retry_wait=startup_retry_timing,
     )
+    startup_owner["producer"] = producer
 
     # ------------------------------------------------------------------
     # Initial partition sync determines how many workers and consumers to
@@ -1861,10 +1915,6 @@ def _run_lifecycle_owned(http_owner) -> None:
     except Exception as exc:
         health_store.record_fatal_internal("topic_reconciliation")
         _log_reconciliation_failure("initial_reconciliation", exc)
-        _cleanup_runtime_resources(executor, consumers, producer)
-        producer = None
-        admin = None
-        _close_kafka_log_handler(kafka_log_handler)
         raise
     num_brokers, num_partitions = result
     metrics.BROKER_COUNT.set(num_brokers)
@@ -1890,17 +1940,15 @@ def _run_lifecycle_owned(http_owner) -> None:
             waiting_state="WAITING_FOR_KAFKA",
             retry_wait=startup_retry_timing,
         )
+        startup_owner["consumers"] = consumers
         # Retaining one executor with the configured upper bound allows safe
         # additive scale-up while _submit_due_checks keeps active work at
         # min(partitions, max_workers).
         executor = DaemonThreadPoolExecutor(max_workers=max_workers)
+        startup_owner["executor"] = executor
     except Exception as exc:
         health_store.record_fatal_internal("internal_runtime_build")
         _log_reconciliation_failure("initial_runtime_build", exc)
-        _cleanup_runtime_resources(executor, consumers, producer)
-        producer = None
-        admin = None
-        _close_kafka_log_handler(kafka_log_handler)
         raise
     log.info(
         "Worker-owned consumers ready",
@@ -1978,6 +2026,10 @@ def _run_lifecycle_owned(http_owner) -> None:
             consumers.grow(min(result.partition_count, max_workers))
         return result
 
+    # Runtime cleanup below now owns these resources. Admin and Schema Registry
+    # remain in the outer ledger so normal shutdown releases those clients too.
+    for name in ("executor", "consumers", "producer", "kafka_log_handler"):
+        startup_owner.pop(name, None)
     try:
         while not _shutdown_requested():
             # Update uptime gauge at the top of every iteration so it reflects
