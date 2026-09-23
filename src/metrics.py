@@ -489,8 +489,41 @@ def start_metrics_server(
         HTTP handler that serves metrics and health endpoints.
         """
 
+        def _write_json(self, status, response):
+            """Serialize before sending headers so encoding failures are recoverable."""
+            body = json.dumps(response, separators=(",", ":")).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _write_failure(self, status, response):
+            """Best-effort fixed-shape JSON failure without exception details."""
+            try:
+                log.error("HTTP handler failed")
+            except Exception:
+                pass
+
+            try:
+                self._write_json(status, response)
+            except Exception:
+                # The connection may already be unwritable; do not let the
+                # reporting attempt escape the handler boundary.
+                pass
+
         def do_GET(self):
             """Handle GET requests for /metrics, /live, /health, and /ready."""
+
+            try:
+                self._do_GET()
+            except Exception:
+                self._write_failure(
+                    500, {"status": "error", "message": "HTTP request failed"}
+                )
+
+        def _do_GET(self):
+            """Dispatch a GET request inside the sanitizing boundary."""
 
             if self.path == "/metrics":
                 # Prometheus metrics endpoint
@@ -500,15 +533,15 @@ def start_metrics_server(
                     self.send_header("Content-Type", CONTENT_TYPE_LATEST)
                     self.end_headers()
                     self.wfile.write(metrics_output)
-                except Exception as e:
-                    self.send_error(500, f"Error generating metrics: {e}")
+                except Exception:
+                    self._write_failure(
+                        500,
+                        {"status": "error", "message": "Metrics generation failed"},
+                    )
 
             elif self.path == "/live":
                 try:
                     liveness = get_liveness_status()
-                    self.send_response(liveness.http_code)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
                     response = {
                         "status": liveness.status.value,
                         "timestamp": liveness.timestamp,
@@ -518,29 +551,23 @@ def start_metrics_server(
                         "shutdown_started": liveness.shutdown_started,
                         "message": liveness.message,
                     }
-                    self.wfile.write(json.dumps(response, indent=2).encode())
+                    self._write_json(liveness.http_code, response)
                 except Exception:
-                    log.error("Liveness evaluation failed")
-                    self.send_response(503)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    response = {
-                        "status": "not_live",
-                        "timestamp": None,
-                        "scheduler_heartbeat_age_seconds": None,
-                        "shutdown_started": False,
-                        "message": "Liveness evaluation failed",
-                    }
-                    self.wfile.write(json.dumps(response, indent=2).encode())
+                    self._write_failure(
+                        503,
+                        {
+                            "status": "not_live",
+                            "timestamp": None,
+                            "scheduler_heartbeat_age_seconds": None,
+                            "shutdown_started": False,
+                            "message": "Liveness evaluation failed",
+                        },
+                    )
 
             elif self.path == "/health":
                 # Kafka dependency-health endpoint
                 try:
                     health = get_health_status()
-                    self.send_response(health.http_code)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-
                     response = {
                         "status": health.status.value,
                         "timestamp": health.timestamp,
@@ -548,58 +575,48 @@ def start_metrics_server(
                         "message": health.message,
                         "checks": health.checks,
                     }
-                    self.wfile.write(json.dumps(response, indent=2).encode())
+                    self._write_json(health.http_code, response)
                 except Exception:
-                    log.error("Health evaluation failed")
-                    self.send_response(503)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    response = {
-                        "status": "unhealthy",
-                        "timestamp": None,
-                        "uptime_seconds": None,
-                        "message": "Health evaluation failed",
-                        "checks": {},
-                    }
-                    self.wfile.write(json.dumps(response, indent=2).encode())
+                    self._write_failure(
+                        503,
+                        {
+                            "status": "unhealthy",
+                            "timestamp": None,
+                            "uptime_seconds": None,
+                            "message": "Health evaluation failed",
+                            "checks": {},
+                        },
+                    )
 
             elif self.path == "/ready":
                 # Readiness probe endpoint
                 try:
                     readiness = get_readiness_status()
-                    self.send_response(readiness.http_code)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-
                     response = {
                         "status": readiness.status.value,
                         "timestamp": readiness.timestamp,
                         "message": readiness.message,
                         "checks": readiness.checks,
                     }
-                    self.wfile.write(json.dumps(response, indent=2).encode())
+                    self._write_json(readiness.http_code, response)
                 except Exception:
-                    log.error("Readiness evaluation failed")
-                    self.send_response(503)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    response = {
-                        "status": "not_ready",
-                        "timestamp": None,
-                        "message": "Readiness evaluation failed",
-                        "checks": {},
-                    }
-                    self.wfile.write(json.dumps(response, indent=2).encode())
+                    self._write_failure(
+                        503,
+                        {
+                            "status": "not_ready",
+                            "timestamp": None,
+                            "message": "Readiness evaluation failed",
+                            "checks": {},
+                        },
+                    )
 
             else:
-                # Unknown endpoint
-                self.send_error(404, f"Endpoint not found: {self.path}")
+                self._write_failure(
+                    404, {"status": "not_found", "message": "Endpoint not found"}
+                )
 
         def log_message(self, format, *args):
-            """Suppress default logging - application uses structured logging"""
-            # Only log errors
-            if args[1].startswith(("4", "5")):
-                log.warning(f"{self.address_string()} - {format % args}")
+            """Suppress request-line logging because it contains request targets."""
 
     def configure_bounded_execution(server):
         """Attach fixed-pool request execution to a concrete HTTP server."""
