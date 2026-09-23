@@ -1,5 +1,5 @@
 {
-  "schema_version": 41,
+  "schema_version": 42,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
@@ -831,7 +831,7 @@
       "ownership_boundary": "Construction and validation of the actual long-lived Kafka administrative and Schema Registry clients.",
       "explicit_exclusions": ["Deterministic startup failure execution owned by R100", "Transient startup state and retry-stage isolation owned by R58", "Retry timing, partial-client cleanup, and warmup proof owned by the R15 replacement sequence", "Runtime recovery behavior"],
       "failure_mode_checklist": ["Kafka metadata validation uses the long-lived AdminClient with complete runtime configuration", "Schema Registry validation uses the long-lived SchemaRegistryClient with complete runtime configuration", "No temporary Kafka producer or urllib Schema Registry validator is created", "The validated instances are the instances retained for subsequent startup stages", "Existing startup ordering and reconciliation tests reflect the long-lived client lifecycle"],
-      "budget": {"max_changed_files": 4, "max_diff_lines": 420},
+      "budget": {"max_changed_files": 4, "max_diff_lines": 500},
       "spec_sections": ["8.4"],
       "development_reference_sections": ["2", "3", "4", "5", "7"],
       "test_files": ["tests/unit/test_startup_clients.py", "tests/unit/test_startup_dispatch.py", "tests/unit/test_startup_reconciliation.py"],

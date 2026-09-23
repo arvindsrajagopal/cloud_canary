@@ -275,10 +275,10 @@ class PlanAndPromptTests(unittest.TestCase):
             "working_tree_fingerprint": "clean",
             "attempts": {},
             "feedback": {},
-            "plan_schema_version": 41,
+            "plan_schema_version": 42,
         }
 
-        self.assertEqual(41, plan["schema_version"])
+        self.assertEqual(42, plan["schema_version"])
         ralph._validate_state(plan, state)
         self.assertEqual("R56", state["completed_tasks"][-1])
         self.assertEqual("R57", ralph._select_task(plan, state, None)["id"])
