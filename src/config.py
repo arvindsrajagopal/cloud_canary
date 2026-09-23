@@ -365,6 +365,14 @@ def validate_config(config: dict) -> None:
                     f"[app].{key} must be 'true' or 'false' (got: '{app[key]}')"
                 )
 
+    if app.get('log.topic.enabled', 'false').lower() == 'true':
+        log_topic = app.get('log.topic', 'cloud-canary-logs')
+        if log_topic == app['topic']:
+            raise ValueError(
+                "[app].log.topic must differ from [app].topic when "
+                "log.topic.enabled=true"
+            )
+
     # Validate SSL configuration consistency
     ssl_enabled = app.get('metrics.ssl.enabled', 'false').lower() == 'true'
     if ssl_enabled:

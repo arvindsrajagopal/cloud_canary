@@ -47,6 +47,7 @@
 import json
 import logging
 import socket
+import threading
 import time
 from collections.abc import Callable
 
@@ -54,6 +55,44 @@ from confluent_kafka import KafkaException, Producer
 
 from src import constants as const
 from src import metrics
+from src.error_classifier import ErrorCategory, Phase, classify_kafka_error
+
+
+_failure_metric = None
+_failure_metric_lock = threading.Lock()
+
+
+def enable_log_failure_metric():
+    """Materialize the optional bounded failure counter only when enabled."""
+    global _failure_metric
+    with _failure_metric_lock:
+        if _failure_metric is None:
+            _failure_metric = metrics.Counter(
+                "canary_log_publish_failures_total",
+                "Optional Kafka log setup and publishing failures.",
+                ["host", "category"],
+            )
+    return _failure_metric
+
+
+def record_log_failure(category: ErrorCategory = ErrorCategory.UNKNOWN) -> None:
+    """Count one sanitized failure without producing another log record."""
+    bounded = metrics.bounded_label(category, metrics.FAILURE_CATEGORY_VALUES)
+    enable_log_failure_metric().labels(host=metrics.HOST, category=bounded).inc()
+
+
+def _failure_category(exc: BaseException) -> ErrorCategory:
+    if isinstance(exc, BufferError):
+        return ErrorCategory.CAPACITY
+    if isinstance(exc, UnicodeEncodeError):
+        return ErrorCategory.SERIALIZATION
+    if isinstance(exc, KafkaException) and exc.args:
+        kafka_error = exc.args[0]
+        if hasattr(kafka_error, "code"):
+            return classify_kafka_error(
+                kafka_error, phase=Phase.PRODUCE
+            ).category
+    return ErrorCategory.UNKNOWN
 
 
 class KafkaLogHandler(logging.Handler):
@@ -110,6 +149,7 @@ class KafkaLogHandler(logging.Handler):
         self._shutdown_requested = shutdown_requested or (lambda: False)
         self._shutdown_deadline = shutdown_deadline or (lambda: None)
         self._monotonic = monotonic
+        enable_log_failure_metric()
         # Use metrics.HOST to respect configurable instance ID
         self._host = metrics.HOST
         # Cache JSON encoder instance to avoid recreating on every log call.
@@ -160,22 +200,29 @@ class KafkaLogHandler(logging.Handler):
             producer.produce(
                 topic=self._topic,
                 value=payload.encode("utf-8"),
+                on_delivery=self._on_delivery,
             )
             # poll(0) is non-blocking: it drives the librdkafka event loop to
             # process delivery callbacks from previously produced messages without
             # waiting for new ones.  This prevents the internal callback queue
             # from growing unbounded during a burst of log output.
             producer.poll(0)
-        except (KafkaException, json.JSONEncodeError, UnicodeEncodeError, BufferError) as exc:
-            # Catch specific exceptions that can occur during log publishing:
-            # - KafkaException: broker connectivity or quota issues
-            # - JSONEncodeError: malformed log record data
-            # - UnicodeEncodeError: non-UTF8 characters in log message
-            # - BufferError: producer queue is full
-            # handleError() logs the exception to stderr via the logging
-            # framework's fallback mechanism, avoiding re-entry into emit()
-            # which would cause infinite recursion.
-            self.handleError(record)
+        except Exception as exc:
+            # Do not call logging from this path: doing so could recurse through
+            # this handler and could expose exception text. Standard output has
+            # already received the original record from its independent handler.
+            record_log_failure(_failure_category(exc))
+
+    @staticmethod
+    def _on_delivery(error, _message) -> None:
+        """Count asynchronous delivery failures without entering logging."""
+        if error is None:
+            return
+        try:
+            descriptor = classify_kafka_error(error, phase=Phase.PRODUCE)
+            record_log_failure(descriptor.category)
+        except Exception:
+            record_log_failure()
 
     def close(self) -> None:
         """
@@ -201,6 +248,13 @@ class KafkaLogHandler(logging.Handler):
             deadline = self._shutdown_deadline()
             if deadline is not None:
                 timeout = min(timeout, max(0.0, deadline - self._monotonic()))
-            producer.flush(timeout=timeout)
+            try:
+                undelivered = producer.flush(timeout=timeout)
+                if undelivered:
+                    record_log_failure(ErrorCategory.CAPACITY)
+            except Exception as exc:
+                # Kafka logging is optional. Count a bounded, sanitized failure
+                # without logging recursively or changing shutdown semantics.
+                record_log_failure(_failure_category(exc))
         finally:
             super().close()   # always call the parent to mark the handler as closed

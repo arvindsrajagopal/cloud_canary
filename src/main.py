@@ -147,7 +147,7 @@ from src.error_classifier import (
 )
 from src.health import configure_health_state
 from src.health_state import HealthStateStore
-from src.kafka_log_handler import KafkaLogHandler
+from src.kafka_log_handler import KafkaLogHandler, record_log_failure
 from src.metrics import start_metrics_server
 from src.producer import create_producer, produce_canary
 from src.recovery_policy import RecoveryAction, RecoveryContext, recovery_action
@@ -1853,10 +1853,10 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
             ))
         except _StartupDispatchRejected:
             raise
-        except RuntimeError as exc:
+        except Exception:
+            record_log_failure()
             log.error(
-                "Failed to set up log topic, continuing without it",
-                extra={"error": str(exc)}
+                "Failed to set up Kafka log publishing; continuing with standard output"
             )
 
     # Create the shared Schema Registry client.  The same instance is used by
