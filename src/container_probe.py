@@ -57,7 +57,6 @@ def request_liveness(
     *,
     timeout: float = PROBE_TIMEOUT_SECONDS,
     opener: Callable[..., object] = urllib.request.urlopen,
-    context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context,
 ) -> bool:
     """Return whether the configured liveness endpoint responds with HTTP 200."""
     if timeout <= 0 or timeout > PROBE_TIMEOUT_SECONDS:
@@ -66,8 +65,8 @@ def request_liveness(
     request = urllib.request.Request(url, method="GET")
     kwargs: dict[str, object] = {"timeout": timeout}
     if url.startswith("https://"):
-        # The default context validates the certificate chain and hostname.
-        kwargs["context"] = context_factory()
+        # SERVER_AUTH validates both the certificate chain and localhost hostname.
+        kwargs["context"] = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
 
     with opener(request, **kwargs) as response:
         return response.getcode() == 200

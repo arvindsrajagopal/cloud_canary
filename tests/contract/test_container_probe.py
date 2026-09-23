@@ -63,6 +63,23 @@ class ContainerProbeContractTests(TestCase):
         self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
         self.assertTrue(response.closed)
 
+    def test_https_certificate_failure_has_no_insecure_retry(self):
+        calls = []
+
+        def opener(request, **kwargs):
+            calls.append((request, kwargs))
+            raise ssl.SSLCertVerificationError("certificate verify failed")
+
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            container_probe.request_liveness(
+                "https://localhost:9443/live", opener=opener
+            )
+
+        self.assertEqual(1, len(calls))
+        context = calls[0][1]["context"]
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
+
     def test_http_probe_does_not_add_tls_or_credentials(self):
         response = _Response()
         calls = []
