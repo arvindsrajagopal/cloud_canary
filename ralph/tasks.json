@@ -1,5 +1,5 @@
 {
-  "schema_version": 44,
+  "schema_version": 45,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
@@ -786,7 +786,7 @@
       "ownership_boundary": "Uniform HTTP method rejection and bounded response-data sanitization across metrics and probe endpoints.",
       "explicit_exclusions": ["Listener exposure owned by R53", "TLS probe transport owned by R55", "Monitoring deployment policy owned by R56", "CORS enablement", "Application-managed authentication or authorization"],
       "failure_mode_checklist": ["GET remains supported for every endpoint", "POST, PUT, PATCH, and DELETE are rejected without executing endpoint work", "HEAD behavior is explicit and read-only", "Responses omit credentials, authenticated URLs, raw exceptions, tracebacks, Kafka records, configuration values, certificate paths, and filesystem paths", "Rejections and errors remain bounded and sanitized"],
-      "budget": {"max_changed_files": 2, "max_diff_lines": 320},
+      "budget": {"max_changed_files": 3, "max_diff_lines": 400},
       "spec_sections": ["6.5"],
       "development_reference_sections": [],
       "test_files": ["tests/contract/test_endpoint_security.py"],
@@ -865,8 +865,8 @@
       "budget": {"max_changed_files": 2, "max_diff_lines": 320},
       "spec_sections": ["8.2", "8.3", "8.4"],
       "development_reference_sections": ["3", "4", "5", "7"],
-      "test_files": ["tests/unit/test_startup_failures.py"],
-      "allowed_paths": ["src/main.py", "tests/unit/test_startup_failures.py"],
+      "test_files": ["tests/unit/test_startup_failures.py", "tests/unit/test_topic_reconciliation.py"],
+      "allowed_paths": ["src/main.py", "tests/unit/test_startup_failures.py", "tests/unit/test_topic_reconciliation.py"],
       "milestone": false
     },
     {
