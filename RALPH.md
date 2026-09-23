@@ -101,7 +101,7 @@ ahead or reopen a completed task.
 The ordered stages cover core health and scheduling through R43,
 R44-R46 for failure classification and recovery, R91-R98/R93 for checkpoint
 review integrity and recovery-boundary correction, R99/R49 for bounded HTTP
-concurrency, R47/R50-R52 for bounded HTTP safety and lifecycle, R13-R18 for secure
+concurrency, R47/R50/R48/R51-R52 for bounded HTTP safety and lifecycle, R13-R18 for secure
 operation, startup, portability, and secrets, and R19-R24 for supply-chain,
 multi-instance ownership, topology, observability, and resource containment.
 Each stage ends in a cumulative milestone review.
