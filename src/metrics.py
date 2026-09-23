@@ -45,6 +45,7 @@
 import ipaddress
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -561,6 +562,65 @@ def start_metrics_server(
             "authentication or authorization."
         )
 
+    max_json_bytes = 64 * 1024
+    max_metrics_bytes = 1024 * 1024
+    sensitive_text = re.compile(
+        rb"(?i)(?:"
+        rb"(?:password|passwd|token|secret|credential|authorization|"
+        rb"api[_-]?key)\s*[:=]|"
+        rb"https?://[^\s/@:]+:[^\s/@]+@|"
+        rb"traceback|(?:exception|[a-z]+error)(?:\s*:|\s*\()|"
+        rb"(?:^|[\s\"'=])/(?:etc|var|srv|run|home|users|private|tmp)(?:/|\b)|"
+        rb"(?:^|[\s\"'=])/(?!/)[\w.-]+(?:/[\w.-]+)+|"
+        rb"\.(?:pem|key|crt)\b|"
+        rb"(?:bootstrap\.servers|schema\.registry|sasl\.|ssl\.)\s*="
+        rb")"
+    )
+    prohibited_field = re.compile(
+        r"(?i)(?:credential|password|passwd|token|secret|authorization|"
+        r"api[_-]?key|exception|traceback|kafka[_-]?(?:record|message)|"
+        r"config(?:uration)?|certificate|filesystem|file[_-]?path|url)"
+    )
+    configuration_text = re.compile(rb"(?i)\b[a-z][\w.-]{1,64}\s*=")
+
+    def sanitize_json(value, depth=0):
+        """Return a bounded JSON-safe copy without suspicious internal text."""
+        if depth > 6:
+            return None
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            value = value[:512]
+            encoded = value.encode("utf-8", "replace")
+            if sensitive_text.search(encoded) or configuration_text.search(encoded):
+                return "[redacted]"
+            return value
+        if isinstance(value, dict):
+            sanitized = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index == 64:
+                    break
+                safe_key = str(key)[:128]
+                if prohibited_field.search(safe_key) or sensitive_text.search(
+                    safe_key.encode("utf-8", "replace")
+                ):
+                    continue
+                sanitized[safe_key] = sanitize_json(item, depth + 1)
+            return sanitized
+        if isinstance(value, (list, tuple)):
+            return [sanitize_json(item, depth + 1) for item in value[:64]]
+        return None
+
+    def sanitize_metrics(payload):
+        """Drop suspicious exposition lines and enforce a response-size bound."""
+        if not isinstance(payload, bytes) or len(payload) > max_metrics_bytes:
+            raise ValueError("invalid metrics response")
+        return b"".join(
+            line
+            for line in payload.splitlines(keepends=True)
+            if not sensitive_text.search(line)
+        )
+
     class CanaryHTTPHandler(BaseHTTPRequestHandler):
         """
         HTTP handler that serves metrics and health endpoints.
@@ -568,12 +628,18 @@ def start_metrics_server(
 
         def _write_json(self, status, response):
             """Serialize before sending headers so encoding failures are recoverable."""
-            body = json.dumps(response, separators=(",", ":")).encode()
+            body = json.dumps(
+                sanitize_json(response), separators=(",", ":")
+            ).encode()
+            if len(body) > max_json_bytes:
+                status = 500
+                body = b'{"status":"error","message":"Response unavailable"}'
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not getattr(self, "_suppress_body", False):
+                self.wfile.write(body)
 
         def _write_failure(self, status, response):
             """Best-effort fixed-shape JSON failure without exception details."""
@@ -599,17 +665,44 @@ def start_metrics_server(
                     500, {"status": "error", "message": "HTTP request failed"}
                 )
 
+        def do_HEAD(self):
+            """Serve GET metadata without a response body or mutation."""
+            previous = getattr(self, "_suppress_body", False)
+            self._suppress_body = True
+            try:
+                self.do_GET()
+            finally:
+                self._suppress_body = previous
+
+        def _reject_mutation(self):
+            """Reject mutation methods before any endpoint work is dispatched."""
+            response = {"status": "method_not_allowed", "message": "Method not allowed"}
+            body = json.dumps(response, separators=(",", ":")).encode()
+            self.send_response(405)
+            self.send_header("Allow", "GET, HEAD")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_POST = _reject_mutation
+        do_PUT = _reject_mutation
+        do_PATCH = _reject_mutation
+        do_DELETE = _reject_mutation
+
         def _do_GET(self):
             """Dispatch a GET request inside the sanitizing boundary."""
 
             if self.path == "/metrics":
                 # Prometheus metrics endpoint
                 try:
-                    metrics_output = generate_latest()
+                    metrics_output = sanitize_metrics(generate_latest())
                     self.send_response(200)
                     self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+                    self.send_header("Content-Length", str(len(metrics_output)))
                     self.end_headers()
-                    self.wfile.write(metrics_output)
+                    if not getattr(self, "_suppress_body", False):
+                        self.wfile.write(metrics_output)
                 except Exception:
                     self._write_failure(
                         500,
