@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -48,6 +49,78 @@ def _config(**overrides):
         "app": app,
     }
 class StartupRetryTimingTests(unittest.TestCase):
+    def test_native_attempt_finishes_before_retry_and_shutdown_stops_next(self):
+        attempt_started = threading.Event()
+        release_attempt = threading.Event()
+        retry_waiting = threading.Event()
+        release_retry = threading.Event()
+        shutdown = [False]
+        operation_calls = []
+        outcome = []
+
+        def operation():
+            operation_calls.append("started")
+            attempt_started.set()
+            self.assertTrue(release_attempt.wait(1))
+            raise _transient()
+
+        def retry_wait():
+            retry_waiting.set()
+            self.assertTrue(release_retry.wait(1))
+
+        def run_stage():
+            try:
+                main._retry_transient_startup_stage(
+                    operation, _classify, HealthStateStore(),
+                    connecting_state="CONNECTING_KAFKA",
+                    waiting_state="WAITING_FOR_KAFKA",
+                    retry_wait=retry_wait,
+                )
+            except BaseException as exc:
+                outcome.append(exc)
+
+        with patch.object(
+            main, "_shutdown_requested", side_effect=lambda: shutdown[0]
+        ):
+            worker = threading.Thread(target=run_stage)
+            worker.start()
+            try:
+                self.assertTrue(attempt_started.wait(2))
+                self.assertEqual(["started"], operation_calls)
+                self.assertFalse(retry_waiting.is_set())
+
+                release_attempt.set()
+                self.assertTrue(retry_waiting.wait(2))
+                self.assertEqual(["started"], operation_calls)
+                shutdown[0] = True
+            finally:
+                shutdown[0] = True
+                release_attempt.set()
+                release_retry.set()
+                worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(["started"], operation_calls)
+        self.assertEqual(1, len(outcome))
+        self.assertIsInstance(outcome[0], main._StartupDispatchRejected)
+
+    def test_success_advances_stage_once_after_serial_retries(self):
+        operation = Mock(side_effect=(_transient(), _transient(), "ready"))
+        retry_wait = Mock()
+
+        with patch.object(main, "_shutdown_requested", return_value=False):
+            result = main._retry_transient_startup_stage(
+                operation, _classify, HealthStateStore(),
+                connecting_state="CONNECTING_KAFKA",
+                waiting_state="WAITING_FOR_KAFKA",
+                retry_wait=retry_wait,
+            )
+
+        self.assertEqual("ready", result)
+        self.assertEqual(3, operation.call_count)
+        self.assertEqual(2, retry_wait.call_count)
+        retry_wait.complete_stage.assert_called_once_with()
+
     def test_progression_cap_independent_jitter_and_monotonic_deadlines(self):
         clock = _Clock()
         timing = _timing(clock, (0.0, 1.0, 0.5, 0.0))

@@ -519,6 +519,10 @@ def _retry_transient_startup_stage(
     attempts = 0
     last_failure = None
     while True:
+        if _shutdown_requested():
+            raise _StartupDispatchRejected(
+                "shutdown interrupted startup dependency retry"
+            )
         if isinstance(retry_wait, _StartupRetryTiming):
             retry_wait.start_stage(connecting_state)
         health_store.publish_initialization_state(
