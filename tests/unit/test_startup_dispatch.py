@@ -105,12 +105,13 @@ class StartupDispatchTests(unittest.TestCase):
     def test_kafka_logging_attaches_only_after_real_startup_path_completes(self):
         completed_stages = []
         expected_stages = [
-            "ssl",
             "admin",
+            "kafka_validation",
             "topic",
             "log_topic",
             "log_handler",
             "schema_registry",
+            "schema_registry_validation",
             "producer",
             "reconciliation",
             "consumers",
@@ -127,6 +128,8 @@ class StartupDispatchTests(unittest.TestCase):
 
         self_test = self
         handler = RecordingHandler()
+        admin_client = Mock()
+        schema_registry_client = object()
         consumers = MagicMock()
         consumers.__len__.return_value = 1
         runtime_executor = MagicMock()
@@ -138,9 +141,19 @@ class StartupDispatchTests(unittest.TestCase):
 
             return invoke
 
+        def validate_stage(name, expected_client):
+            def invoke(client):
+                self.assertIs(expected_client, client)
+                completed_stages.append(name)
+
+            return invoke
+
         config = {
-            "kafka": {},
-            "schema_registry": {},
+            "kafka": {"bootstrap.servers": "broker", "custom.kafka": "kept"},
+            "schema_registry": {
+                "url": "https://registry.invalid",
+                "custom.schema": "kept",
+            },
             "app": {
                 "log.topic.enabled": "true",
                 "max.workers": "1",
@@ -151,10 +164,18 @@ class StartupDispatchTests(unittest.TestCase):
             with (
                 patch("src.main.load_config", return_value=config),
                 patch("src.main.setup_logging"),
-                patch("src.main.validate_ssl_connectivity", side_effect=stage("ssl")),
                 patch("src.main.start_metrics_server"),
-                patch("src.main.AdminClient", side_effect=stage("admin", Mock())),
-                patch("src.main.ensure_topic", side_effect=stage("topic")),
+                patch(
+                    "src.main.AdminClient",
+                    side_effect=stage("admin", admin_client),
+                ) as admin_constructor,
+                patch(
+                    "src.main.validate_kafka_startup_client",
+                    side_effect=validate_stage("kafka_validation", admin_client),
+                ) as validate_kafka,
+                patch(
+                    "src.main.ensure_topic", side_effect=stage("topic")
+                ) as ensure_topic,
                 patch("src.main.ensure_log_topic", side_effect=stage("log_topic")),
                 patch(
                     "src.main.KafkaLogHandler",
@@ -162,18 +183,24 @@ class StartupDispatchTests(unittest.TestCase):
                 ),
                 patch(
                     "src.main.SchemaRegistryClient",
-                    side_effect=stage("schema_registry", object()),
-                ),
+                    side_effect=stage("schema_registry", schema_registry_client),
+                ) as schema_registry_constructor,
+                patch(
+                    "src.main.validate_schema_registry_startup_client",
+                    side_effect=validate_stage(
+                        "schema_registry_validation", schema_registry_client
+                    ),
+                ) as validate_schema_registry,
                 patch(
                     "src.main.create_producer",
                     side_effect=stage("producer", (Mock(), object())),
-                ),
+                ) as create_producer,
                 patch(
                     "src.main.sync_topic_partitions",
                     side_effect=stage(
                         "reconciliation", ReconciliationResult(1, 1)
                     ),
-                ),
+                ) as sync_topic_partitions,
                 patch(
                     "src.main._build_consumer_pool",
                     side_effect=stage("consumers", consumers),
@@ -190,6 +217,24 @@ class StartupDispatchTests(unittest.TestCase):
             logging.getLogger().removeHandler(handler)
 
         self.assertEqual(expected_stages, completed_stages)
+        admin_constructor.assert_called_once_with(config["kafka"])
+        validate_kafka.assert_called_once_with(admin_client)
+        ensure_topic.assert_called_once_with(
+            config["kafka"], "cloud-canary", admin=admin_client
+        )
+        schema_registry_constructor.assert_called_once_with(
+            {
+                **config["schema_registry"],
+                "timeout": 10.0,
+            }
+        )
+        validate_schema_registry.assert_called_once_with(schema_registry_client)
+        create_producer.assert_called_once_with(
+            config["kafka"], schema_registry_client
+        )
+        sync_topic_partitions.assert_called_once_with(
+            config["kafka"], "cloud-canary", admin=admin_client
+        )
 
 
 if __name__ == "__main__":

@@ -105,11 +105,8 @@ import signal
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 from confluent_kafka import KafkaError, KafkaException, Consumer, Producer
 from confluent_kafka.serialization import SerializationError
@@ -170,27 +167,6 @@ log = CanaryLoggerAdapter(_base_logger, {
     "version": "unknown",  # Updated in run() after loading config
 })
 
-
-class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Allow Schema Registry redirects only when transport remains HTTPS."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            parsed_url = urlparse(newurl)
-            is_https = parsed_url.scheme.lower() == "https" and bool(
-                parsed_url.hostname
-            )
-        except ValueError:
-            is_https = False
-        if not is_https:
-            raise urllib.error.HTTPError(
-                newurl,
-                code,
-                "Schema Registry redirect must use HTTPS",
-                headers,
-                fp,
-            )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 # Path to the INI configuration file, relative to the working directory
 # from which the application is launched (typically the project root).
@@ -1161,211 +1137,43 @@ def _update_failure_metrics(
     metrics.CHECK_SEQUENCE.set(check_sequence)
 
 
-def validate_ssl_connectivity(
-    kafka_config: dict, sr_config: dict, sr_timeout: float = 10.0
+def validate_ssl_connectivity(validation_operation) -> None:
+    """Run retained-client validation through the legacy patch seam.
+
+    The argument is an operation bound to an already constructed long-lived
+    client.  Keeping this seam lets lifecycle tests intercept startup network
+    work without restoring the removed config-based duplicate-client validator.
+    """
+    if not callable(validation_operation):
+        raise TypeError(
+            "validate_ssl_connectivity requires a retained-client operation"
+        )
+    validation_operation()
+
+
+def validate_kafka_startup_client(admin: AdminClient) -> None:
+    """Validate connectivity through the retained administrative client."""
+
+    def validate() -> None:
+        metadata = admin.list_topics(timeout=15)
+        log.info(
+            "Kafka startup validation succeeded",
+            extra={"brokers": len(metadata.brokers)},
+        )
+
+    validate_ssl_connectivity(validate)
+
+
+def validate_schema_registry_startup_client(
+    sr_client: SchemaRegistryClient,
 ) -> None:
-    """
-    Verify SSL/TLS connectivity to Confluent Cloud before entering main loop.
+    """Validate connectivity through the retained Schema Registry client."""
 
-    This startup validation ensures:
-    1. CA certificates are properly configured and valid
-    2. Server certificate chains are trusted
-    3. Hostname verification works correctly
-    4. No MITM attack is in progress
+    def validate() -> None:
+        check_sr(sr_client)
+        log.info("Schema Registry startup validation succeeded")
 
-    Fails fast with a clear error message if SSL/TLS validation fails,
-    preventing the application from running with compromised security.
-
-    Parameters
-    ----------
-    kafka_config : dict
-        Kafka connection settings from [kafka] section.
-    sr_config : dict
-        Schema Registry connection settings from [schema_registry] section.
-    sr_timeout : float
-        Maximum seconds for the Schema Registry startup request.
-
-    Raises
-    ------
-    SystemExit
-        If SSL/TLS validation fails for either Kafka or Schema Registry.
-    """
-    sr_url = sr_config.get("url", "")
-    try:
-        parsed_sr_url = urlparse(sr_url)
-        valid_https_url = (
-            parsed_sr_url.scheme.lower() == "https" and bool(parsed_sr_url.hostname)
-        )
-    except ValueError:
-        valid_https_url = False
-
-    # Enforce the transport invariant here as well as in configuration loading.
-    # This function may be called directly, so reject before creating either
-    # client or reading credentials that could otherwise be sent in plaintext.
-    if not valid_https_url:
-        log.error("Schema Registry URL must use HTTPS")
-        raise SystemExit(1)
-
-    from confluent_kafka import Producer
-
-    log.info("Validating SSL/TLS connectivity to Confluent Cloud...")
-
-    # ------------------------------------------------------------------
-    # Test 1: Kafka broker SSL/TLS validation
-    # ------------------------------------------------------------------
-    try:
-        # Create a test producer with SSL settings
-        test_config = {
-            'bootstrap.servers': kafka_config['bootstrap.servers'],
-            'security.protocol': kafka_config['security.protocol'],
-            'sasl.mechanisms': kafka_config['sasl.mechanisms'],
-            'sasl.username': kafka_config['sasl.username'],
-            'sasl.password': kafka_config['sasl.password'],
-            'socket.timeout.ms': 10000,
-            'api.version.request.timeout.ms': 10000,
-        }
-
-        # Include all SSL-related settings from config
-        for key, value in kafka_config.items():
-            if key.startswith('ssl.') or key.startswith('enable.ssl'):
-                test_config[key] = value
-
-        test_producer = Producer(test_config)
-
-        # Trigger actual connection by fetching metadata
-        # This performs TCP handshake, TLS handshake, and certificate validation
-        metadata = test_producer.list_topics(timeout=15)
-
-        broker_count = len(metadata.brokers)
-        log.info(
-            "SSL/TLS validation successful for Kafka",
-            extra={
-                "brokers": broker_count,
-                "security_protocol": kafka_config['security.protocol'],
-                "ssl_ca_location": kafka_config.get('ssl.ca.location', 'system default'),
-            }
-        )
-
-        # Clean up test producer
-        test_producer.flush(timeout=2)
-
-    except Exception as exc:
-        error_msg = str(exc).lower()
-
-        # Provide specific guidance based on error type
-        if "certificate verify failed" in error_msg or "ssl" in error_msg:
-            log.error(
-                "Kafka SSL/TLS certificate validation FAILED",
-                extra={
-                    "error": str(exc),
-                    "bootstrap_servers": kafka_config['bootstrap.servers'],
-                    "ssl_ca_location": kafka_config.get('ssl.ca.location', 'not set (using system default)'),
-                }
-            )
-            log.error("")
-            log.error("Possible causes:")
-            log.error("  1. Expired or invalid CA certificate bundle")
-            log.error("  2. MITM attack in progress")
-            log.error("  3. Incorrect ssl.ca.location setting")
-            log.error("  4. System CA certificates not up to date")
-            log.error("")
-            log.error("To fix:")
-            log.error("  - Verify ssl.ca.location points to valid CA bundle")
-            log.error("  - Run 'update-ca-certificates' to refresh system CAs")
-            log.error("  - Check network for MITM proxies or intercepting firewalls")
-            sys.exit(1)
-        else:
-            log.error(
-                "Kafka connection failed (non-SSL error)",
-                extra={"error": str(exc)}
-            )
-            sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Test 2: Schema Registry SSL/TLS validation
-    # ------------------------------------------------------------------
-    try:
-        import ssl as ssl_module
-
-        auth_string = sr_config['basic.auth.user.info']
-        username, password = auth_string.split(':', 1)
-
-        # Create SSL context with strict verification
-        ssl_context = ssl_module.create_default_context()
-        ssl_context.check_hostname = True
-        ssl_context.verify_mode = ssl_module.CERT_REQUIRED
-
-        # Create authenticated request
-        password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        password_mgr.add_password(None, sr_url, username, password)
-        auth_handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
-        https_handler = urllib.request.HTTPSHandler(context=ssl_context)
-        redirect_handler = _HTTPSOnlyRedirectHandler()
-        opener = urllib.request.build_opener(
-            https_handler, redirect_handler, auth_handler
-        )
-
-        # Test connection to Schema Registry
-        request = urllib.request.Request(f"{sr_url}/subjects")
-        response = opener.open(request, timeout=sr_timeout)
-        response.read()
-
-        # Defense in depth: a custom opener/handler must not be able to make a
-        # downgraded final response look like successful TLS validation.
-        final_url = response.geturl()
-        try:
-            parsed_final_url = urlparse(final_url)
-            final_url_is_https = (
-                parsed_final_url.scheme.lower() == "https"
-                and bool(parsed_final_url.hostname)
-            )
-        except (TypeError, ValueError):
-            final_url_is_https = False
-        if not final_url_is_https:
-            raise urllib.error.URLError(
-                "Schema Registry response URL must use HTTPS"
-            )
-
-        log.info(
-            "SSL/TLS validation successful for Schema Registry",
-            extra={"endpoint": "configured_schema_registry"}
-        )
-
-    except urllib.error.URLError as exc:
-        if hasattr(exc, 'reason') and 'CERTIFICATE_VERIFY_FAILED' in str(exc.reason):
-            log.error(
-                "Schema Registry SSL/TLS certificate validation FAILED",
-                extra={
-                    "error": type(exc).__name__,
-                    "endpoint": "configured_schema_registry",
-                }
-            )
-            log.error("")
-            log.error("Possible causes:")
-            log.error("  1. Expired or invalid CA certificate")
-            log.error("  2. MITM attack in progress")
-            log.error("  3. Schema Registry using self-signed certificate")
-            log.error("")
-            log.error("To fix:")
-            log.error("  - Verify Schema Registry URL is correct")
-            log.error("  - Update system CA certificates")
-            log.error("  - Check for intercepting proxies")
-            sys.exit(1)
-        else:
-            log.error(
-                "Schema Registry connection failed",
-                extra={"error": type(exc).__name__}
-            )
-            sys.exit(1)
-
-    except Exception as exc:
-        log.error(
-            "Schema Registry validation failed",
-            extra={"error": type(exc).__name__}
-        )
-        sys.exit(1)
-
-    log.info("SSL/TLS connectivity validation complete - all checks passed")
+    validate_ssl_connectivity(validate)
 
 
 def _shutdown_http_service(owner) -> None:
@@ -1507,18 +1315,6 @@ def _run_lifecycle_owned(http_owner) -> None:
         }
     )
 
-    # ------------------------------------------------------------------
-    # CRITICAL: Validate SSL/TLS connectivity before creating clients
-    # ------------------------------------------------------------------
-    # This fail-fast check ensures certificates are valid and prevents
-    # the application from running with compromised security.
-    # Validates both Kafka broker and Schema Registry SSL/TLS connections.
-    _run_startup_dependency(
-        lambda: validate_ssl_connectivity(
-            kafka_config, sr_config, sr_check_timeout
-        )
-    )
-
     # Start the Prometheus metrics HTTP(S) server (background daemon thread).
     # The /metrics endpoint is available immediately, returning zeros for
     # counters/histograms that haven't been updated yet.
@@ -1556,6 +1352,7 @@ def _run_lifecycle_owned(http_owner) -> None:
     # TCP handshakes and metadata fetches, improving startup performance.
     # ------------------------------------------------------------------
     admin = _run_startup_dependency(lambda: AdminClient(kafka_config))
+    _run_startup_dependency(lambda: validate_kafka_startup_client(admin))
 
     # ------------------------------------------------------------------
     # Startup: ensure the canary topic exists before creating clients.
@@ -1613,6 +1410,9 @@ def _run_lifecycle_owned(http_owner) -> None:
     sr_client_config["timeout"] = sr_check_timeout
     sr_client = _run_startup_dependency(
         lambda: SchemaRegistryClient(sr_client_config)
+    )
+    _run_startup_dependency(
+        lambda: validate_schema_registry_startup_client(sr_client)
     )
 
     # Resource placeholders make startup reconciliation and construction failures
