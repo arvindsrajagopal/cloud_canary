@@ -22,6 +22,15 @@ HEALTHY = "healthy"
 DEGRADED = "degraded"
 UNHEALTHY = "unhealthy"
 _STATUS_RANK = {HEALTHY: 0, DEGRADED: 1, UNHEALTHY: 2}
+_INITIALIZATION_STATES = frozenset(
+    {
+        "STARTING", "VALIDATING_CONFIGURATION", "CONNECTING_KAFKA",
+        "WAITING_FOR_KAFKA", "CONNECTING_SCHEMA_REGISTRY",
+        "WAITING_FOR_SCHEMA_REGISTRY", "RECONCILING_TOPIC",
+        "STARTING_WORKERS", "WARMING_UP", "READY",
+        "FATAL_CONFIGURATION", "FATAL_RECONCILIATION", "SHUTTING_DOWN",
+    }
+)
 _T = TypeVar("_T")
 
 
@@ -191,6 +200,10 @@ class HealthStateStore:
         self._scheduler_heartbeat: Optional[float] = None
         self._shutdown_started = False
         self._fatal_internal: Optional[str] = None
+        self._initialization_state: Optional[str] = None
+        self._initialization_entered_at: Optional[float] = None
+        self._startup_retry_attempts = 0
+        self._startup_failure: Optional[FailureDescriptor] = None
         self._invariant_failure_callback = invariant_failure_callback
         self._invariant_failure_notified = False
 
@@ -278,6 +291,51 @@ class HealthStateStore:
             self._fatal_internal is None or isinstance(self._fatal_internal, str),
             "invalid fatal state",
         )
+        self._invariant(
+            self._initialization_state is None
+            or self._initialization_state in _INITIALIZATION_STATES,
+            "invalid initialization state",
+        )
+        self._invariant(
+            self._initialization_entered_at is None
+            or self._finite_number(self._initialization_entered_at),
+            "invalid initialization timestamp",
+        )
+        self._invariant(
+            type(self._startup_retry_attempts) is int
+            and self._startup_retry_attempts >= 0,
+            "invalid startup retry count",
+        )
+        self._invariant(
+            self._startup_failure is None
+            or isinstance(self._startup_failure, FailureDescriptor),
+            "invalid startup failure",
+        )
+
+    @_invariant_boundary
+    def publish_initialization_state(
+        self,
+        state: str,
+        *,
+        failure: Optional[FailureDescriptor] = None,
+        retry_attempts: int = 0,
+    ) -> None:
+        """Atomically publish bounded startup progress and retry diagnostics."""
+        if state not in _INITIALIZATION_STATES:
+            raise ValueError("unknown initialization state")
+        if failure is not None and not isinstance(failure, FailureDescriptor):
+            raise TypeError("failure must be a FailureDescriptor")
+        if type(retry_attempts) is not int or retry_attempts < 0:
+            raise ValueError("retry_attempts must be a non-negative integer")
+        now = self._monotonic()
+        with self._lock:
+            self._validate_global_state()
+            if state != self._initialization_state:
+                self._initialization_entered_at = now
+            self._initialization_state = state
+            self._startup_retry_attempts = retry_attempts
+            self._startup_failure = failure
+            self._validate_global_state()
 
     def _validate_component(self, component: object) -> None:
         self._invariant(isinstance(component, _ComponentState), "invalid component")
@@ -570,6 +628,11 @@ class HealthStateStore:
             )
         ):
             self._readiness_latched = True
+            if self._initialization_state == "WARMING_UP":
+                self._initialization_state = "READY"
+                self._initialization_entered_at = self._monotonic()
+                self._startup_retry_attempts = 0
+                self._startup_failure = None
 
     @staticmethod
     def _record(
@@ -588,6 +651,26 @@ class HealthStateStore:
             # State retains only a bounded classification, never an exception.
             component.latest_failure = (failure or "failure")[:512]
 
+    @staticmethod
+    def _startup_retry_health(component: str, failure: FailureDescriptor,
+                              attempts: int) -> ComponentHealth:
+        detail = ":".join(
+            (
+                failure.phase.value,
+                failure.category.value,
+                failure.code or "none",
+                failure.safe_summary,
+            )
+        )[:512]
+        return ComponentHealth(
+            component=component,
+            status=UNHEALTHY,
+            staleness_seconds=None,
+            observation_count=attempts,
+            failure_rate=None,
+            latest_failure=detail,
+        )
+
     @_invariant_boundary
     def snapshot(self) -> HealthSnapshot:
         """Derive an immutable snapshot without exposing rolling histories."""
@@ -605,6 +688,19 @@ class HealthStateStore:
                 )
                 for partition, component in sorted(self._partitions.items())
             )
+            if (
+                self._startup_failure is not None
+                and self._startup_failure.component
+                is not FailureComponent.SCHEMA_REGISTRY
+            ):
+                partitions = (
+                    *partitions,
+                    self._startup_retry_health(
+                        "kafka_startup_retry",
+                        self._startup_failure,
+                        self._startup_retry_attempts,
+                    ),
+                )
             schema_registry = self._evaluate(
                 "schema_registry",
                 self._schema_registry,
@@ -613,6 +709,16 @@ class HealthStateStore:
                 self._sr_unhealthy_after,
                 schema_registry=True,
             )
+            if (
+                self._startup_failure is not None
+                and self._startup_failure.component
+                is FailureComponent.SCHEMA_REGISTRY
+            ):
+                schema_registry = self._startup_retry_health(
+                    "schema_registry_startup_retry",
+                    self._startup_failure,
+                    self._startup_retry_attempts,
+                )
             capacity_status = (
                 DEGRADED
                 if scheduler_oldest_overdue >= self._kafka_check_interval
@@ -671,6 +777,8 @@ class HealthStateStore:
                 blockers.append("fatal_internal")
             if self._readiness_transition is not None:
                 blockers.append(self._readiness_transition)
+            if self._initialization_state not in (None, "READY"):
+                blockers.append(self._initialization_state.lower())
             # Runtime initialization always publishes a heartbeat before it can
             # complete partition warmup.  Treat only an observed heartbeat as
             # stale so isolated store users can build initialization state.
@@ -704,8 +812,16 @@ class HealthStateStore:
             shutdown_started = self._shutdown_started
             fatal_internal = self._fatal_internal
             live = (
-                heartbeat_age is not None
-                and heartbeat_age <= self._liveness_scheduler_max_staleness
+                (
+                    (
+                        heartbeat_age is not None
+                        and heartbeat_age <= self._liveness_scheduler_max_staleness
+                    )
+                    or (
+                        heartbeat_age is None
+                        and self._initialization_state is not None
+                    )
+                )
                 and not shutdown_started
                 and fatal_internal is None
             )

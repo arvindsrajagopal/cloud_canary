@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.config import validate_config
+from src.error_classifier import CanaryError
 from src.health_state import HealthStateStore
 from src.main import (
     _publish_scheduler_observability,
@@ -96,7 +97,7 @@ class LivenessRuntimeTests(unittest.TestCase):
                 "src.main.configure_health_state",
                 side_effect=configured_store.append,
             ),
-            self.assertRaisesRegex(RuntimeError, "reconciliation failed"),
+            self.assertRaises(CanaryError),
         ):
             run()
 
@@ -128,7 +129,7 @@ class LivenessRuntimeTests(unittest.TestCase):
                 "src.main.configure_health_state",
                 side_effect=configured_store.append,
             ),
-            self.assertRaisesRegex(RuntimeError, "topic creation failed"),
+            self.assertRaises(CanaryError),
         ):
             run()
 

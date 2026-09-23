@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src.config import validate_config
+from src.error_classifier import CanaryError
 from src.main import run
 
 
@@ -200,7 +201,7 @@ class ConfigValidationTests(unittest.TestCase):
             ),
             patch("src.main.configure_health_state"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "stop after client construction"):
+            with self.assertRaises(CanaryError):
                 run()
 
         client.assert_called_once_with(

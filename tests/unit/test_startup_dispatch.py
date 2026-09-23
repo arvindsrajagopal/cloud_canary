@@ -4,7 +4,7 @@ import logging
 import signal
 import threading
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 from src import main
 from src.topic import ReconciliationResult
@@ -173,9 +173,9 @@ class StartupDispatchTests(unittest.TestCase):
                     "src.main.validate_kafka_startup_client",
                     side_effect=validate_stage("kafka_validation", admin_client),
                 ) as validate_kafka,
-                patch(
-                    "src.main.ensure_topic", side_effect=stage("topic")
-                ) as ensure_topic,
+                patch("src.main.ensure_topic", side_effect=stage(
+                    "topic", ReconciliationResult(1, 1)
+                )) as ensure_topic,
                 patch("src.main.ensure_log_topic", side_effect=stage("log_topic")),
                 patch(
                     "src.main.KafkaLogHandler",
@@ -220,7 +220,8 @@ class StartupDispatchTests(unittest.TestCase):
         admin_constructor.assert_called_once_with(config["kafka"])
         validate_kafka.assert_called_once_with(admin_client)
         ensure_topic.assert_called_once_with(
-            config["kafka"], "cloud-canary", admin=admin_client
+            config["kafka"], "cloud-canary", admin=admin_client,
+            before_recreate=ANY,
         )
         schema_registry_constructor.assert_called_once_with(
             {
@@ -233,7 +234,8 @@ class StartupDispatchTests(unittest.TestCase):
             config["kafka"], schema_registry_client
         )
         sync_topic_partitions.assert_called_once_with(
-            config["kafka"], "cloud-canary", admin=admin_client
+            config["kafka"], "cloud-canary", admin=admin_client,
+            before_recreate=ANY,
         )
 
 

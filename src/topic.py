@@ -356,7 +356,8 @@ def ensure_topic(
     kafka_config: dict,
     topic: str,
     admin: AdminClient | None = None,
-) -> ReconciliationResult:
+    before_recreate: Callable[[], None] | None = None,
+) -> ReconciliationResult | None:
     """
     Reconcile and verify the canary topic from broker metadata at startup.
 
@@ -380,6 +381,9 @@ def ensure_topic(
     admin : AdminClient, optional
         Pre-created AdminClient to reuse. If None, a new one is created and cleaned up.
 
+    before_recreate : callable, optional
+        Invoked immediately before a destructive scale-down begins.
+
     Raises
     ------
     RuntimeError
@@ -402,11 +406,14 @@ def ensure_topic(
         else:
             _create_topic(admin, topic, num_brokers)
 
-        result = sync_topic_partitions(kafka_config, topic, admin=admin)
+        result = sync_topic_partitions(
+            kafka_config,
+            topic,
+            admin=admin,
+            before_recreate=before_recreate,
+        )
         if result is None:
-            raise RuntimeError(
-                f"Startup reconciliation produced no verified state for '{topic}'"
-            )
+            return None
 
         verified = _get_metadata(admin)
         verified_brokers, verified_partitions = _inspect_startup_metadata(

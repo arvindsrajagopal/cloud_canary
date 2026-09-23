@@ -323,6 +323,19 @@ def _startup_failure(
             code="STARTUP.INVALID_CONFIGURATION",
             safe_summary=FailureSummary.INVALID_CONFIGURATION,
         )
+    nested = exc.__cause__ or exc.__context__
+    for _ in range(15):
+        if nested is None:
+            break
+        if (
+            isinstance(nested, KafkaException)
+            and nested.args
+            and isinstance(nested.args[0], KafkaError)
+        ):
+            return classify_kafka_error(
+                nested.args[0], phase=phase, component=component
+            )
+        nested = nested.__cause__ or nested.__context__
     if schema_registry:
         return classify_schema_registry_error(exc)
     return FailureDescriptor(
@@ -360,6 +373,102 @@ def _execute_startup_operation(operation, classifier):
     # Raise after leaving the handler so the bounded error does not retain the
     # raw exception or its potentially sensitive text through __context__.
     raise CanaryError(failure)
+
+
+def _retry_transient_startup_stage(
+    operation,
+    classifier,
+    health_store: HealthStateStore,
+    *,
+    connecting_state: str,
+    waiting_state: str,
+    retry_wait,
+):
+    """Retry one transient startup operation without advancing its stage."""
+    attempts = 0
+    last_failure = None
+    while True:
+        health_store.publish_initialization_state(
+            connecting_state,
+            failure=last_failure,
+            retry_attempts=attempts,
+        )
+        try:
+            result = _execute_startup_operation(operation, classifier)
+        except CanaryError as exc:
+            action = recovery_action(exc.failure, RecoveryContext.STARTUP)
+            if (
+                exc.failure.recoverability is not Recoverability.TRANSIENT
+                or action is not RecoveryAction.RECORD_AND_CONTINUE
+            ):
+                raise
+            attempts += 1
+            last_failure = exc.failure
+            health_store.publish_initialization_state(
+                waiting_state,
+                failure=exc.failure,
+                retry_attempts=attempts,
+            )
+            if _shutdown_requested():
+                raise _StartupDispatchRejected(
+                    "shutdown interrupted startup dependency retry"
+                )
+            retry_wait()
+            if _shutdown_requested():
+                raise _StartupDispatchRejected(
+                    "shutdown interrupted startup dependency retry"
+                )
+        else:
+            health_store.publish_initialization_state(connecting_state)
+            return result
+
+
+def _retry_transient_reconciliation(
+    operation, classifier, health_store: HealthStateStore, retry_wait
+):
+    """Retry safe reconciliation failures, never destructive ones."""
+    destructive_started = [False]
+
+    def mark_destructive() -> None:
+        destructive_started[0] = True
+
+    def invoke():
+        destructive_started[0] = False
+        result = operation(mark_destructive)
+        if result is None:
+            raise CanaryError(
+                FailureDescriptor(
+                    component=FailureComponent.KAFKA_PARTITION,
+                    phase=Phase.METADATA_FETCH,
+                    category=ErrorCategory.NETWORK,
+                    recoverability=Recoverability.TRANSIENT,
+                    code="KAFKA.METADATA_UNAVAILABLE",
+                    safe_summary=FailureSummary.DEPENDENCY_UNAVAILABLE,
+                )
+            )
+        return result
+
+    def classify(exc):
+        failure = classifier(exc)
+        if not destructive_started[0]:
+            return failure
+        return FailureDescriptor(
+            component=FailureComponent.TOPIC_ADMINISTRATION,
+            phase=Phase.TOPIC_VERIFY,
+            category=failure.category,
+            recoverability=failure.recoverability,
+            code=failure.code,
+            safe_summary=FailureSummary.OPERATION_FAILED,
+        )
+
+    return _retry_transient_startup_stage(
+        invoke,
+        classify,
+        health_store,
+        connecting_state="RECONCILING_TOPIC",
+        waiting_state="RECONCILING_TOPIC",
+        retry_wait=retry_wait,
+    )
 
 
 def check_sr(sr_client: SchemaRegistryClient) -> None:
@@ -1375,6 +1484,11 @@ def _run_lifecycle_owned(http_owner) -> None:
     )
     http_owner["health_store"] = health_store
     configure_health_state(health_store)
+    health_store.publish_initialization_state("STARTING")
+    startup_retry_delay = float(app.get("startup.retry.initial.seconds", "1"))
+
+    def wait_for_startup_retry() -> None:
+        _shutdown_event.wait(startup_retry_delay)
 
     # Set version info metric
     metrics.VERSION_INFO.info({
@@ -1440,25 +1554,43 @@ def _run_lifecycle_owned(http_owner) -> None:
             phase=Phase.METADATA_FETCH,
             component=FailureComponent.KAFKA_PARTITION,
         )
-    admin = _execute_startup_operation(
+    admin = _retry_transient_startup_stage(
         lambda: _run_startup_dependency(lambda: AdminClient(kafka_config)),
         classify_kafka_startup,
+        health_store,
+        connecting_state="CONNECTING_KAFKA",
+        waiting_state="WAITING_FOR_KAFKA",
+        retry_wait=wait_for_startup_retry,
     )
-    _execute_startup_operation(
+    _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
             lambda: validate_kafka_startup_client(admin)
         ),
         classify_kafka_startup,
+        health_store,
+        connecting_state="CONNECTING_KAFKA",
+        waiting_state="WAITING_FOR_KAFKA",
+        retry_wait=wait_for_startup_retry,
     )
 
     # ------------------------------------------------------------------
     # Startup: ensure the canary topic exists before creating clients.
     # ------------------------------------------------------------------
     try:
-        _run_startup_dependency(
-            lambda: ensure_topic(kafka_config, topic, admin=admin)
+        _retry_transient_reconciliation(
+            lambda before_recreate: _run_startup_dependency(
+                lambda: ensure_topic(
+                    kafka_config,
+                    topic,
+                    admin=admin,
+                    before_recreate=before_recreate,
+                )
+            ),
+            classify_kafka_startup,
+            health_store,
+            wait_for_startup_retry,
         )
-    except RuntimeError as exc:
+    except CanaryError as exc:
         health_store.record_fatal_internal("topic_reconciliation")
         log.error("Startup failed during topic creation", extra={"error": str(exc)})
         # Let the daemon lifecycle boundary turn failed reconciliation into a
@@ -1512,17 +1644,25 @@ def _run_lifecycle_owned(http_owner) -> None:
             component=FailureComponent.SCHEMA_REGISTRY,
             schema_registry=True,
         )
-    sr_client = _execute_startup_operation(
+    sr_client = _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
             lambda: SchemaRegistryClient(sr_client_config)
         ),
         classify_sr_startup,
+        health_store,
+        connecting_state="CONNECTING_SCHEMA_REGISTRY",
+        waiting_state="WAITING_FOR_SCHEMA_REGISTRY",
+        retry_wait=wait_for_startup_retry,
     )
-    _execute_startup_operation(
+    _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
             lambda: validate_schema_registry_startup_client(sr_client)
         ),
         classify_sr_startup,
+        health_store,
+        connecting_state="CONNECTING_SCHEMA_REGISTRY",
+        waiting_state="WAITING_FOR_SCHEMA_REGISTRY",
+        retry_wait=wait_for_startup_retry,
     )
 
     # Resource placeholders make startup reconciliation and construction failures
@@ -1533,11 +1673,15 @@ def _run_lifecycle_owned(http_owner) -> None:
 
     # Create the long-lived producer and serializer.  Thread-safe in librdkafka —
     # shared across all per-partition check threads.
-    producer, avro_serializer = _execute_startup_operation(
+    producer, avro_serializer = _retry_transient_startup_stage(
         lambda: _run_startup_dependency(
             lambda: create_producer(kafka_config, sr_client)
         ),
         classify_kafka_startup,
+        health_store,
+        connecting_state="CONNECTING_KAFKA",
+        waiting_state="WAITING_FOR_KAFKA",
+        retry_wait=wait_for_startup_retry,
     )
 
     # ------------------------------------------------------------------
@@ -1546,11 +1690,19 @@ def _run_lifecycle_owned(http_owner) -> None:
     # ------------------------------------------------------------------
     log.info("Running initial partition sync")
     try:
-        result = _run_startup_dependency(
-            lambda: sync_topic_partitions(kafka_config, topic, admin=admin)
+        result = _retry_transient_reconciliation(
+            lambda before_recreate: _run_startup_dependency(
+                lambda: sync_topic_partitions(
+                    kafka_config,
+                    topic,
+                    admin=admin,
+                    before_recreate=before_recreate,
+                )
+            ),
+            classify_kafka_startup,
+            health_store,
+            wait_for_startup_retry,
         )
-        if not result:
-            raise RuntimeError("partition reconciliation returned no verified state")
     except Exception as exc:
         health_store.record_fatal_internal("topic_reconciliation")
         _log_reconciliation_failure("initial_reconciliation", exc)
@@ -1567,16 +1719,21 @@ def _run_lifecycle_owned(http_owner) -> None:
         partitions, scheduler_oldest_overdue=0.0
     )
     metrics.reconcile_partition_metrics(partitions, reset=True)
+    health_store.publish_initialization_state("STARTING_WORKERS")
     # Create one exclusively owned consumer per active worker. The pool
     # manually reassigns each consumer before every partition check.
     try:
-        consumers = _execute_startup_operation(
+        consumers = _retry_transient_startup_stage(
             lambda: _run_startup_dependency(
                 lambda: _build_consumer_pool(
                     kafka_config, sr_client, topic, partitions, max_workers
                 )
             ),
             classify_kafka_startup,
+            health_store,
+            connecting_state="STARTING_WORKERS",
+            waiting_state="WAITING_FOR_KAFKA",
+            retry_wait=wait_for_startup_retry,
         )
         # Retaining one executor with the configured upper bound allows safe
         # additive scale-up while _submit_due_checks keeps active work at
@@ -1599,6 +1756,7 @@ def _run_lifecycle_owned(http_owner) -> None:
             "partitions": partitions,
         }
     )
+    health_store.publish_initialization_state("WARMING_UP")
 
     # Startup dependency construction is now complete. Attach Kafka-backed
     # logging only at this boundary so no startup log record can perform

@@ -347,13 +347,13 @@ class TopicReconciliationTests(unittest.TestCase):
             patch("src.main.configure_health_state"),
             patch("src.main.log", logger),
         ):
-            with self.assertRaisesRegex(RuntimeError, "must-not-be-logged"):
+            with self.assertRaises(CanaryError):
                 run()
 
         producer.flush.assert_called_once_with(timeout=5)
         logger.error.assert_called_with(
             "Fatal topic reconciliation failure",
-            extra={"stage": "initial_reconciliation", "error": "RuntimeError"},
+            extra={"stage": "initial_reconciliation", "error": "CanaryError"},
         )
         self.assertNotIn("must-not-be-logged", str(logger.method_calls))
 

@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from src import main
+from src.error_classifier import CanaryError
 from src.main import run
 from src.topic import ensure_topic
 from tests.fakes.kafka import FakeAdminClient, FakeClusterMetadata, FakeTopicMetadata
@@ -45,6 +47,41 @@ class _TopicErrorMetadataAdmin(FakeAdminClient):
 
 
 class StartupReconciliationTests(unittest.TestCase):
+    def test_transient_topic_reconciliation_retries_before_schema_registry(self):
+        config = {
+            "kafka": {},
+            "schema_registry": {"url": "https://registry.invalid"},
+            "app": {"topic": "canary", "startup.retry.initial.seconds": "0"},
+        }
+        rejected = main._StartupDispatchRejected("stop after retry proof")
+
+        with (
+            patch("src.main.load_config", return_value=config),
+            patch("src.main.setup_logging"),
+            patch("src.main.start_metrics_server"),
+            patch("src.main.AdminClient", return_value=Mock()),
+            patch("src.main.validate_kafka_startup_client"),
+            patch("src.main._shutdown_requested", return_value=False),
+            patch("src.main.ensure_topic", side_effect=(None, rejected))
+            as ensure_topic,
+            patch("src.main.SchemaRegistryClient") as schema_registry,
+            patch("src.main.create_producer") as create_producer,
+            self.assertRaises(main._StartupDispatchRejected),
+        ):
+            main._run_lifecycle_owned({})
+
+        self.assertEqual(2, ensure_topic.call_count)
+        schema_registry.assert_not_called()
+        create_producer.assert_not_called()
+
+    def test_internal_transient_sync_result_is_preserved_for_outer_retry(self):
+        admin = FakeAdminClient(broker_count=2, topics={"canary": 2})
+
+        with patch("src.topic.sync_topic_partitions", return_value=None):
+            result = ensure_topic({}, "canary", admin=admin)
+
+        self.assertIsNone(result)
+
     def test_failed_destructive_reconciliation_is_terminal_at_lifecycle_boundary(self):
         config = {
             "kafka": {},
@@ -65,9 +102,7 @@ class StartupReconciliationTests(unittest.TestCase):
             ),
             patch("src.main.SchemaRegistryClient") as schema_registry,
             patch("src.main.create_producer") as create_producer,
-            self.assertRaisesRegex(
-                RuntimeError, "replacement verification failed"
-            ),
+            self.assertRaises(CanaryError),
         ):
             run()
 
