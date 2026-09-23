@@ -166,7 +166,7 @@ checkpoint review then added R91–R95 to harden review ownership, correct
 transient Schema Registry recovery, add the missing partition-local unhealthy
 state transition, preserve consumer failure propagation, and connect the
 recovery policy to runtime Kafka operation boundaries. Startup retry timing
-remains owned by R15. Major review findings now stop for human approval instead
+is owned by R103. Major review findings now stop for human approval instead
 of automatically starting a correction attempt.
 Execution stops at R11 for the next broad-phase replan.
 
@@ -242,5 +242,24 @@ failure execution, and transient startup state:
    unhealthy dependency reporting, and retry of only the current failed stage.
 
 Backoff progression, attempt overlap, partial-client cleanup, warmup capability
-proof, and the production entry point remain outside this sequence. Execution
-stops at R15 so criteria 71–75 can be split before implementation.
+proof, and the production entry point remain outside this sequence.
+
+## R15 activation
+
+R15 was replaced after R58 completed. The human approved exactly five
+single-criterion tasks and froze the plan at 72 total tasks:
+
+1. R103 owns criterion 71: monotonic exponential retry timing, cap, jitter,
+   reset, and bounded timing diagnostics.
+2. R104 owns criterion 72: serial attempts with no overlap or queued retry
+   demand.
+3. R105 owns criterion 73: bounded cleanup of every partially initialized
+   long-lived startup resource.
+4. R106 owns criterion 74: produce, Schema Registry, and consume capability
+   proof through warmup before readiness eligibility. R35-R36 retain readiness
+   transition ownership.
+5. R107 owns criterion 75: the portable `python -m src.main` entry point.
+
+R16 now depends on R107. No further task addition or split is authorized by
+this activation; any change to the fixed total requires explicit human
+approval.

@@ -35,7 +35,7 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(68, len(plan["tasks"]))
+        self.assertEqual(72, len(plan["tasks"]))
         self.assertEqual("active", plan["execution_status"])
         self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
         self.assertTrue(
@@ -228,8 +228,18 @@ class SpecificationCoverageTests(unittest.TestCase):
             "Deterministic startup termination owned by R100",
             tasks["R58"]["explicit_exclusions"],
         )
-        self.assertEqual(["R58"], tasks["R15"]["depends_on"])
-        self.assertTrue(tasks["R15"]["requires_replan"])
+        expected = (
+            ("R103", "R58", 71),
+            ("R104", "R103", 72),
+            ("R105", "R104", 73),
+            ("R106", "R105", 74),
+            ("R107", "R106", 75),
+        )
+        for task_id, dependency, criterion in expected:
+            self.assertEqual([dependency], tasks[task_id]["depends_on"])
+            self.assertEqual([criterion, criterion], tasks[task_id]["criteria_range"])
+        self.assertEqual(["R107"], tasks["R16"]["depends_on"])
+        self.assertNotIn("R15", tasks)
 
     def test_endpoint_security_phase_has_bounded_task_shapes(self):
         tasks = {
@@ -260,6 +270,28 @@ class SpecificationCoverageTests(unittest.TestCase):
             self.assertLessEqual(task["budget"]["max_changed_files"], 4)
             self.assertLessEqual(task["budget"]["max_diff_lines"], 500)
             self.assertLessEqual(len(task["allowed_paths"]), 4)
+
+    def test_startup_continuation_has_bounded_task_shapes(self):
+        plan = _load_json("ralph/tasks.json")
+        tasks = {task["id"]: task for task in plan["tasks"]}
+
+        self.assertEqual(72, len(tasks))
+        for task_id in ("R103", "R104", "R105", "R106", "R107"):
+            task = tasks[task_id]
+            self.assertTrue(task["ownership_boundary"].strip())
+            self.assertTrue(task["explicit_exclusions"])
+            self.assertTrue(task["failure_mode_checklist"])
+            start, end = task["criteria_range"]
+            self.assertEqual(start, end)
+            self.assertLessEqual(task["budget"]["max_changed_files"], 4)
+            self.assertLessEqual(task["budget"]["max_diff_lines"], 500)
+            self.assertLessEqual(len(task["allowed_paths"]), 4)
+            self.assertFalse(task.get("requires_replan", False))
+        self.assertIn(
+            "Readiness latch, post-warmup transition, zero-warmup, and "
+            "topology-reset semantics owned by R35-R36",
+            tasks["R106"]["explicit_exclusions"],
+        )
 
 
 class PromptAndReviewContractTests(unittest.TestCase):

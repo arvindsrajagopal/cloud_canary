@@ -245,10 +245,16 @@ class PlanAndPromptTests(unittest.TestCase):
         with self.assertRaises(ralph.HumanIntervention):
             ralph._select_task(plan, state, "R02")
 
-    def test_next_broad_phase_is_an_explicit_replan_gate(self):
+    def test_startup_continuation_is_fixed_without_a_replan_gate(self):
         plan = ralph._load_plan()
-        task = next(task for task in plan["tasks"] if task["id"] == "R15")
-        self.assertTrue(task["requires_replan"])
+        index = plan["execution_order"].index("R58") + 1
+
+        self.assertEqual(
+            ["R103", "R104", "R105", "R106", "R107"],
+            plan["execution_order"][index:index + 5],
+        )
+        self.assertEqual(72, len(plan["tasks"]))
+        self.assertFalse(any(task.get("requires_replan") for task in plan["tasks"]))
 
     def test_r13_migration_selects_r53_after_completed_prefix(self):
         plan = ralph._load_plan()
@@ -275,10 +281,10 @@ class PlanAndPromptTests(unittest.TestCase):
             "working_tree_fingerprint": "clean",
             "attempts": {},
             "feedback": {},
-            "plan_schema_version": 45,
+            "plan_schema_version": 46,
         }
 
-        self.assertEqual(45, plan["schema_version"])
+        self.assertEqual(46, plan["schema_version"])
         ralph._validate_state(plan, state)
         self.assertEqual("R56", state["completed_tasks"][-1])
         self.assertEqual("R102", ralph._select_task(plan, state, None)["id"])
