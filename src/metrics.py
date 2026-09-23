@@ -140,6 +140,12 @@ FAILURES_TOTAL = Counter(
     ["host", "phase", "category", "recoverability"],
 )
 
+HTTP_OVERLOAD_TOTAL = Counter(
+    "canary_http_overload_total",
+    "HTTP requests rejected because the bounded worker queue was saturated.",
+    ["host"],
+)
+
 # Aggregate health gauges. State children are maintained only for the three
 # bounded states; the remaining gauges have no variable label beyond host.
 PARTITIONS_BY_STATE = Gauge(
@@ -592,6 +598,18 @@ def start_metrics_server(
 
     def configure_bounded_execution(server):
         """Attach fixed-pool request execution to a concrete HTTP server."""
+        overload_body = (
+            b'{"status":"unavailable","message":"HTTP service overloaded"}'
+        )
+        overload_response = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: "
+            + str(len(overload_body)).encode("ascii")
+            + b"\r\n\r\n"
+            + overload_body
+        )
         server._request_slots = threading.BoundedSemaphore(
             max_workers + request_queue_size
         )
@@ -605,6 +623,13 @@ def start_metrics_server(
             # accepted request either owns one active/waiting slot or is
             # rejected without entering the executor's internal queue.
             if not server._request_slots.acquire(blocking=False):
+                HTTP_OVERLOAD_TOTAL.labels(host=HOST).inc()
+                try:
+                    request.sendall(overload_response)
+                except Exception:
+                    # The peer may already be gone; saturation must remain
+                    # isolated from handlers and dependency health state.
+                    pass
                 server.shutdown_request(request)
                 return
 
