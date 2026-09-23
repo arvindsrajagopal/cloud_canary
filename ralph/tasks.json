@@ -1,13 +1,13 @@
 {
-  "schema_version": 34,
+  "schema_version": 35,
   "execution_status": "active",
   "pause_reason": "",
   "specification": "SPEC.md",
   "development_reference": "ralph/confluent-development-reference.md",
   "decision_ledger": "ralph/decisions.json",
   "completion_criteria_count": 119,
-  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R96", "R97", "R93", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
-  "default_max_iterations": 43,
+  "execution_order": ["R01", "R02", "R03", "R25", "R04", "R05", "R26", "R06", "R27", "R31", "R32", "R29", "R30", "R33", "R34", "R07", "R85", "R86", "R87", "R88", "R28", "R35", "R36", "R37", "R38", "R39", "R40", "R41", "R89", "R42", "R43", "R90", "R44", "R45", "R46", "R91", "R92", "R94", "R95", "R96", "R97", "R98", "R93", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24"],
+  "default_max_iterations": 44,
   "default_max_attempts_per_task": 2,
   "review_policy": {
     "max_review_cycles_per_task": 2,
@@ -596,7 +596,7 @@
         "Consumer replacement behavior remains partition-local and continues to use the bounded R95 completion path."
       ],
       "ownership_boundary": "Extraction and direct integration testing of existing runtime completion recording, without selecting or executing centralized recovery actions.",
-      "explicit_exclusions": ["Failure classification and propagation owned by R96", "Recovery-action dispatch owned by R93", "Health-state internals", "Startup retry timing", "HTTP concurrency", "Worker-pool redesign"],
+      "explicit_exclusions": ["Failure classification and propagation owned by R96", "Recovery-action dispatch owned by R98 and R93", "Health-state internals", "Startup retry timing", "HTTP concurrency", "Worker-pool redesign"],
       "failure_mode_checklist": ["Production lifecycle invokes the tested handlers", "Schema Registry failure is recorded without success", "Kafka failure is partition-local and generation-fenced", "Metrics use bounded labels", "Logs and state exclude raw exception content", "Consumer replacement semantics remain unchanged"],
       "budget": {"max_changed_files": 2, "max_diff_lines": 220},
       "spec_sections": ["8.1", "8.3"],
@@ -606,18 +606,40 @@
       "milestone": false
     },
     {
-      "id": "R93",
+      "id": "R98",
       "depends_on": ["R97"],
-      "title": "Runtime recovery-action execution",
+      "title": "Schema Registry runtime recovery execution",
       "criteria_range": null,
       "acceptance_conditions": [
-        "The runtime invokes the centralized recovery policy instead of independently deciding every CanaryError outcome.",
+        "The Schema Registry completion handler invokes the centralized recovery policy with the runtime context for every bounded failure descriptor.",
+        "Deterministic Schema Registry security and configuration failures mark only that component unhealthy immediately while the runtime continues bounded probes.",
+        "Transient Schema Registry dependency failures remain unsuccessful, record the bounded failure, and continue the configured probe cadence.",
+        "Internal-fatal and terminate-process decisions request the existing bounded fatal-shutdown lifecycle without retaining or logging raw exception content.",
+        "Integration tests directly exercise the production Schema Registry completion handler for continuing and terminating recovery actions."
+      ],
+      "ownership_boundary": "Execution of centralized recovery decisions in the Schema Registry runtime completion handler only.",
+      "explicit_exclusions": ["Kafka runtime recovery execution owned by R93", "Failure classification and descriptor propagation", "Health-state internals", "Startup retry timing", "HTTP concurrency", "Worker-pool redesign"],
+      "failure_mode_checklist": ["Policy receives the runtime context", "Deterministic unhealthy state is component-local", "Transient failures cannot be reported as success", "Fatal action reaches existing bounded shutdown lifecycle", "Logs and state exclude raw exception content"],
+      "budget": {"max_changed_files": 2, "max_diff_lines": 180},
+      "spec_sections": ["8.2", "8.3"],
+      "development_reference_sections": ["3", "4", "7"],
+      "test_files": ["tests/integration/test_schema_registry_recovery_integration.py"],
+      "allowed_paths": ["src/main.py", "tests/integration/test_schema_registry_recovery_integration.py"],
+      "milestone": false
+    },
+    {
+      "id": "R93",
+      "depends_on": ["R98"],
+      "title": "Kafka runtime recovery-action execution",
+      "criteria_range": null,
+      "acceptance_conditions": [
+        "The Kafka completion handler invokes the centralized recovery policy with the runtime context for every bounded failure descriptor.",
         "Deterministic runtime security and configuration failures call the R94 partition-local unhealthy transition and continue bounded probes.",
         "Serialization and unknown internal failures terminate through bounded fatal cleanup, consumer-state failures replace only the affected worker-owned consumer, and transient external failures record and continue.",
         "Integration tests exercise real runtime call sites rather than only the pure mapping function."
       ],
-      "ownership_boundary": "Execution of centralized recovery decisions after R96 has propagated bounded runtime descriptors.",
-      "explicit_exclusions": ["Failure descriptor propagation owned by R96", "Recovery classification tables", "Health-state internals owned by R94", "Consumer failure propagation owned by R95", "Startup retry timing", "HTTP concurrency", "Broad consumer-pool redesign"],
+      "ownership_boundary": "Execution of centralized recovery decisions in the Kafka runtime completion handler after bounded descriptor propagation.",
+      "explicit_exclusions": ["Schema Registry runtime recovery execution owned by R98", "Failure descriptor propagation owned by R96", "Recovery classification tables", "Health-state internals owned by R94", "Consumer failure propagation owned by R95", "Startup retry timing", "HTTP concurrency", "Broad consumer-pool redesign"],
       "failure_mode_checklist": ["Fatal action reaches existing bounded shutdown lifecycle", "Deterministic unhealthy state is partition-local", "Replacement is partition-local", "Transient failures cannot be reported as success", "Production action call sites are directly tested"],
       "budget": {"max_changed_files": 2, "max_diff_lines": 300},
       "spec_sections": ["8.2", "8.3"],
