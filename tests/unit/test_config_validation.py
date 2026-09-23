@@ -51,6 +51,32 @@ class ConfigValidationTests(unittest.TestCase):
                     str(raised.exception),
                 )
 
+    def test_accepts_each_http_timeout_setting_independently(self):
+        for setting in (
+            "http.socket.timeout.seconds",
+            "http.shutdown.timeout.seconds",
+        ):
+            for value in ("0.001", "5", "1000000.5"):
+                with self.subTest(setting=setting, value=value):
+                    validate_config(_config(**{setting: value}))
+
+    def test_rejects_invalid_http_socket_timeout_with_sanitized_error(self):
+        self._assert_invalid_http_timeout("http.socket.timeout.seconds")
+
+    def test_rejects_invalid_http_shutdown_timeout_with_sanitized_error(self):
+        self._assert_invalid_http_timeout("http.shutdown.timeout.seconds")
+
+    def _assert_invalid_http_timeout(self, setting):
+        for value in ("0", "-1", "not-a-number", "nan", "inf", "-inf"):
+            with self.subTest(setting=setting, value=value):
+                with self.assertRaises(ValueError) as raised:
+                    validate_config(_config(**{setting: value}))
+
+                self.assertEqual(
+                    f"[app].{setting} must be a positive finite number",
+                    str(raised.exception),
+                )
+
     def test_accepts_valid_health_boundary_combinations(self):
         validate_config(
             _config(

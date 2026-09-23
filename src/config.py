@@ -196,6 +196,17 @@ def validate_config(config: dict) -> None:
             raise ValueError(f"[app].{key} must be a finite number")
         return value
 
+    def positive_finite_number(key: str, default: str) -> float:
+        try:
+            value = finite_number(key, default)
+        except ValueError as exc:
+            raise ValueError(
+                f"[app].{key} must be a positive finite number"
+            ) from exc
+        if value <= 0:
+            raise ValueError(f"[app].{key} must be a positive finite number")
+        return value
+
     window_checks = positive_integer("health.failure.window.checks", "20")
     minimum_checks = positive_integer("health.failure.minimum.checks", "4")
     if minimum_checks > window_checks:
@@ -212,6 +223,8 @@ def validate_config(config: dict) -> None:
     positive_integer("health.max.diagnostic.components", "20")
     http_positive_integer("http.max.workers", "4")
     http_positive_integer("http.request.queue.size", "16")
+    positive_finite_number("http.socket.timeout.seconds", "5")
+    positive_finite_number("http.shutdown.timeout.seconds", "10")
 
     kafka_degraded = finite_number("health.kafka.degraded.after.seconds", "60")
     kafka_unhealthy = finite_number("health.kafka.unhealthy.after.seconds", "300")

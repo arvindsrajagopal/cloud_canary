@@ -71,6 +71,8 @@ metrics.ssl.enabled=false
 # HTTP serving limits (independent of Kafka partition-check workers)
 http.max.workers=4
 http.request.queue.size=16
+http.socket.timeout.seconds=5
+http.shutdown.timeout.seconds=10
 
 # max.workers controls the maximum number of concurrent threads for partition checks
 # Default: 20 (good for most deployments)
