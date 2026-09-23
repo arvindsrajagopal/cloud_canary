@@ -241,7 +241,15 @@ def _delete_and_recreate(
         metadata = _get_metadata(admin)
         if topic not in metadata.topics:
             break            # deletion has propagated — safe to recreate
-        if len(metadata.topics[topic].partitions) == num_brokers:
+        observed_brokers, observed_partitions = _inspect_startup_metadata(
+            metadata, topic
+        )
+        if observed_brokers != num_brokers:
+            raise RuntimeError(
+                f"Topic recreation verification failed for '{topic}': broker "
+                f"count changed from {num_brokers} to {observed_brokers}"
+            )
+        if observed_partitions == observed_brokers:
             # Topic is back with the correct partition count — another instance
             # completed the delete-and-recreate cycle ahead of us.
             log.info(
@@ -262,14 +270,7 @@ def _delete_and_recreate(
     _create_topic(admin, topic, num_brokers)
 
     metadata = _get_metadata(admin)
-    if topic not in metadata.topics:
-        raise RuntimeError(f"Topic recreation verification failed for '{topic}': topic is absent")
-    actual = len(metadata.topics[topic].partitions)
-    if actual != num_brokers:
-        raise RuntimeError(
-            f"Topic recreation verification failed for '{topic}': "
-            f"expected {num_brokers} partitions, observed {actual}"
-        )
+    _verify_reconciled_topology(metadata, topic, num_brokers, "recreation")
 
 
 def ensure_log_topic(kafka_config: dict, topic: str, retention_ms: int, admin: AdminClient | None = None) -> None:
@@ -483,6 +484,28 @@ def _inspect_startup_metadata(metadata, topic: str) -> tuple[int, int | None]:
     return num_brokers, num_partitions
 
 
+def _verify_reconciled_topology(
+    metadata, topic: str, expected_broker_count: int, operation: str
+) -> tuple[int, int]:
+    """Validate one metadata snapshot against the reconciliation target."""
+    broker_count, partition_count = _inspect_startup_metadata(metadata, topic)
+    if broker_count != expected_broker_count:
+        raise RuntimeError(
+            f"Topic {operation} verification failed for '{topic}': broker count "
+            f"changed from {expected_broker_count} to {broker_count}"
+        )
+    if partition_count is None:
+        raise RuntimeError(
+            f"Topic {operation} verification failed for '{topic}': topic is absent"
+        )
+    if partition_count != broker_count:
+        raise RuntimeError(
+            f"Topic {operation} verification failed for '{topic}': expected "
+            f"{broker_count} partitions, observed {partition_count}"
+        )
+    return broker_count, partition_count
+
+
 def sync_topic_partitions(
     kafka_config: dict,
     topic: str,
@@ -555,10 +578,11 @@ def sync_topic_partitions(
             log.error(f"Partition sync skipped — could not fetch cluster metadata: {exc}")
             return None
 
+        num_brokers, current_partitions = _inspect_startup_metadata(
+            metadata, topic
+        )
+
         if management_mode == "observe":
-            num_brokers, current_partitions = _inspect_startup_metadata(
-                metadata, topic
-            )
             if current_partitions is None:
                 return ReconciliationResult(
                     num_brokers, 0, topology_matches=False
@@ -569,12 +593,9 @@ def sync_topic_partitions(
                 topology_matches=current_partitions == num_brokers,
             )
 
-        if topic not in metadata.topics:
+        if current_partitions is None:
             log.warning(f"Partition sync skipped — topic '{topic}' not found in metadata.")
             return None
-
-        num_brokers = len(metadata.brokers)
-        current_partitions = len(metadata.topics[topic].partitions)
 
         # No change — broker count matches partition count.
         if num_brokers == current_partitions:
@@ -610,30 +631,22 @@ def sync_topic_partitions(
                 # increased the partition count while this call was in flight.
                 try:
                     refreshed = _get_metadata(admin)
-                    actual = len(refreshed.topics[topic_name].partitions) if topic_name in refreshed.topics else current_partitions
-                    if actual == num_brokers:
-                        log.info(
-                            f"Topic '{topic_name}' already has {num_brokers} partition(s) "
-                            "(updated by another instance) — skipping."
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Topic expansion failed for '{topic_name}'; observed {actual} partitions"
-                        ) from exc
+                    _verify_reconciled_topology(
+                        refreshed, topic_name, num_brokers, "expansion"
+                    )
+                    log.info(
+                        f"Topic '{topic_name}' already has {num_brokers} partition(s) "
+                        "(updated by another instance) — skipping."
+                    )
                 except RuntimeError as verify_exc:
                     raise RuntimeError(
                         f"Topic expansion verification failed for '{topic_name}'"
                     ) from verify_exc
 
         verified = _get_metadata(admin)
-        if topic not in verified.topics:
-            raise RuntimeError(f"Topic verification failed for '{topic}': topic is absent")
-        final_partitions = len(verified.topics[topic].partitions)
-        if final_partitions != num_brokers:
-            raise RuntimeError(
-                f"Topic verification failed for '{topic}': expected {num_brokers} "
-                f"partitions, observed {final_partitions}"
-            )
+        _, final_partitions = _verify_reconciled_topology(
+            verified, topic, num_brokers, "expansion"
+        )
         log.info(f"Topic '{topic}' verified with {final_partitions} partition(s).")
         return ReconciliationResult(num_brokers, final_partitions)
     finally:
