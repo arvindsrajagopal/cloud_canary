@@ -1038,6 +1038,7 @@ def _record_kafka_completion(
         raise
     except (ConsumerFailure, CanaryError) as error:
         failure, failure_label, failure_fields = _bounded_completion_failure(error)
+        action = recovery_action(failure, RecoveryContext.RUNTIME)
         accepted = _record_failed_partition_attempt(
             health_store,
             partition,
@@ -1048,6 +1049,13 @@ def _record_kafka_completion(
             failure=failure_label,
             generation=generation,
         )
+        if accepted and action is RecoveryAction.MARK_COMPONENT_UNHEALTHY:
+            if failure.category is ErrorCategory.CAPACITY:
+                health_store.mark_scheduler_capacity_degraded()
+            else:
+                health_store.mark_partition_deterministic_failure(
+                    partition, failure=failure, generation=generation
+                )
         if accepted:
             message = (
                 "Consumer check failed after replacement"
@@ -1063,19 +1071,22 @@ def _record_kafka_completion(
                     **failure_fields,
                 },
             )
+        if action is RecoveryAction.TERMINATE_PROCESS:
+            _request_fatal_shutdown()
         return
     except Exception:
         # Unknown exception content is deliberately discarded at completion.
         bounded_error = CanaryError(_local_kafka_failure(
             Phase.UNKNOWN,
             ErrorCategory.UNKNOWN,
-            Recoverability.UNKNOWN,
+            Recoverability.INTERNAL_FATAL,
             "CANARY.UNEXPECTED_COMPLETION",
             FailureSummary.INTERNAL_FAILURE,
         ))
         failure, failure_label, failure_fields = _bounded_completion_failure(
             bounded_error
         )
+        action = recovery_action(failure, RecoveryContext.RUNTIME)
         accepted = _record_failed_partition_attempt(
             health_store,
             partition,
@@ -1096,6 +1107,8 @@ def _record_kafka_completion(
                     **failure_fields,
                 },
             )
+        if action is RecoveryAction.TERMINATE_PROCESS:
+            _request_fatal_shutdown()
 
 
 def _update_failure_metrics(

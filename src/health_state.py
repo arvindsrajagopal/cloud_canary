@@ -505,6 +505,17 @@ class HealthStateStore:
             self._validate_global_state()
 
     @_invariant_boundary
+    def mark_scheduler_capacity_degraded(self) -> None:
+        """Publish a bounded overload until the next capacity observation."""
+        with self._lock:
+            self._validate_global_state()
+            self._scheduler_oldest_overdue = max(
+                self._scheduler_oldest_overdue,
+                float(self._kafka_check_interval),
+            )
+            self._validate_global_state()
+
+    @_invariant_boundary
     def record_scheduler_heartbeat(self) -> None:
         """Publish scheduler progress using the injected monotonic clock."""
         now = self._monotonic()
