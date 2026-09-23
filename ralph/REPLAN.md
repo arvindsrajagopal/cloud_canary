@@ -167,3 +167,19 @@ recovery policy to runtime Kafka operation boundaries. Startup retry timing
 remains owned by R15. Major review findings now stop for human approval instead
 of automatically starting a correction attempt.
 Execution stops at R11 for the next broad-phase replan.
+
+## R11 activation
+
+R11 was replaced after R93 completed. Criteria 51–53 are assigned to the
+reviewed R93 implementation because its bounded Kafka recovery integration,
+consumer-replacement path, and sanitized completion handling already provide
+the required evidence. The active HTTP concurrency sequence is:
+
+1. R99 declares and validates the independent HTTP worker and waiting-queue
+   configuration bounds.
+2. R49 implements the fixed HTTP worker pool and bounded waiting queue and owns
+   criteria 54–55.
+
+Queue-saturation responses, socket deadlines, sanitized handler failures,
+owned shutdown, and dependency-worker separation remain in criteria 56–60.
+Execution stops at R12 so that phase is split before implementation.

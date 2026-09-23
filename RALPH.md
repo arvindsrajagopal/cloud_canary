@@ -53,9 +53,9 @@ python scripts/quality_gate.py --python python
 
 ## Starting a Loop
 
-The checked-in plan is active through the bounded failure-classification,
-recovery-policy, and checkpoint-correction phase. It uses invariant-sized tasks
-and stops deliberately at `R11`, which is marked as the next replan gate. The
+The checked-in plan is active through the bounded HTTP concurrency phase. It
+uses invariant-sized tasks and stops deliberately at `R12`, which is marked as
+the next replan gate. The
 remaining broad phases must be split and reviewed before they can execute. See
 `ralph/REPLAN.md`.
 
@@ -99,8 +99,9 @@ order. The normal loop and `--task` use the same selector; `--task` cannot skip
 ahead or reopen a completed task.
 
 The ordered stages cover core health and scheduling through R43,
-R44-R46 for failure classification and recovery, R91-R95 for checkpoint review
-integrity and recovery-boundary correction, R11-R12 for HTTP lifecycle, R13-R18 for secure
+R44-R46 for failure classification and recovery, R91-R98/R93 for checkpoint
+review integrity and recovery-boundary correction, R99/R49 for bounded HTTP
+concurrency, R12 for the next HTTP lifecycle replan, R13-R18 for secure
 operation, startup, portability, and secrets, and R19-R24 for supply-chain,
 multi-instance ownership, topology, observability, and resource containment.
 Each stage ends in a cumulative milestone review.
@@ -149,7 +150,7 @@ implementation attempt.
 
 The active phases use one invariant and ownership
 boundary per task, with at most four changed files and 500 diff lines.
-Execution stops at the `R11` replan gate before entering the remaining broad
+Execution stops at the `R12` replan gate before entering the remaining broad
 phases. Every Codex
 invocation is an ephemeral session. The runner
 injects the exact assigned criteria and targeted specification section numbers;
