@@ -1429,6 +1429,7 @@ def _run_lifecycle() -> None:
     _shutdown_timeout_seconds = float(
         app.get("http.shutdown.timeout.seconds", "10")
     )
+    http_socket_timeout = float(app.get("http.socket.timeout.seconds", "5"))
     metrics_port        = int(app.get("metrics.port",                          "8000"))
     metrics_bind_addr   = app.get("metrics.bind.address",                  "0.0.0.0")
     metrics_ssl_enabled = app.get("metrics.ssl.enabled", "false").lower() == "true"
@@ -1508,6 +1509,7 @@ def _run_lifecycle() -> None:
             ssl_key=metrics_ssl_key,
             max_workers=http_max_workers,
             request_queue_size=http_request_queue_size,
+            socket_timeout=http_socket_timeout,
         )
         protocol = "https" if metrics_ssl_enabled else "http"
         log.info(

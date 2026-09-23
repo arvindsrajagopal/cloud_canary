@@ -421,6 +421,7 @@ def start_metrics_server(
     ssl_key: str = None,
     max_workers: int = 4,
     request_queue_size: int = 16,
+    socket_timeout: float = 5.0,
 ) -> None:
     """
     Start the Prometheus HTTP(S) metrics server with health endpoints.
@@ -461,6 +462,10 @@ def start_metrics_server(
 
     request_queue_size : int
         Maximum number of admitted requests waiting for an HTTP worker.
+
+    socket_timeout : float
+        Timeout in seconds applied to each accepted connection. The same
+        socket is used for request reads and response writes.
 
     Raises
     ------
@@ -617,6 +622,18 @@ def start_metrics_server(
             max_workers=max_workers,
             thread_name_prefix="canary-http",
         )
+
+        # Apply the deadline immediately after accept, before the connection
+        # can be submitted to a handler. Socket timeouts cover both recv and
+        # send operations performed by BaseHTTPRequestHandler.
+        original_get_request = getattr(server, "get_request", None)
+        if original_get_request is not None:
+            def get_request():
+                request, client_address = original_get_request()
+                request.settimeout(socket_timeout)
+                return request, client_address
+
+            server.get_request = get_request
 
         def process_request(request, client_address):
             # The listening thread never waits for executor capacity. An
