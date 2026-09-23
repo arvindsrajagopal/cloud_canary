@@ -183,3 +183,21 @@ the required evidence. The active HTTP concurrency sequence is:
 Queue-saturation responses, socket deadlines, sanitized handler failures,
 owned shutdown, and dependency-worker separation remain in criteria 56–60.
 Execution stops at R12 so that phase is split before implementation.
+
+## R12 activation
+
+R12 was replaced after R49 completed. The active sequence separates configuration
+from runtime behavior and preserves the original milestone at the lifecycle
+boundary:
+
+1. R47 declares and validates HTTP socket and shutdown time limits.
+2. R50 owns criterion 56: bounded saturation rejection, overload accounting,
+   and Kafka/Schema Registry health-state isolation.
+3. R51 owns criteria 57–58: accepted-socket deadlines and sanitized handler
+   failures.
+4. R52 owns criteria 59–60: explicit HTTP resource ownership, bounded shutdown,
+   and isolation from Kafka workers and dependency calls. R52 is the milestone.
+
+Endpoint exposure, method policy, response redaction, TLS probing, and monitoring
+deployment policy remain outside this sequence. Execution stops at R13 so that
+security and enterprise-monitoring work is split before implementation.

@@ -35,7 +35,7 @@ class SpecificationCoverageTests(unittest.TestCase):
 
     def test_task_plan_covers_every_criterion_exactly_once(self):
         plan = _load_json("ralph/tasks.json")
-        self.assertEqual(58, len(plan["tasks"]))
+        self.assertEqual(61, len(plan["tasks"]))
         self.assertEqual("active", plan["execution_status"])
         self.assertEqual(2, plan["review_policy"]["max_review_cycles_per_task"])
         self.assertTrue(
@@ -202,8 +202,12 @@ class SpecificationCoverageTests(unittest.TestCase):
         self.assertEqual(["R98"], tasks["R93"]["depends_on"])
         self.assertEqual(["R93"], tasks["R99"]["depends_on"])
         self.assertEqual(["R99"], tasks["R49"]["depends_on"])
-        self.assertEqual(["R49"], tasks["R12"]["depends_on"])
-        self.assertTrue(tasks["R12"]["requires_replan"])
+        self.assertEqual(["R49"], tasks["R47"]["depends_on"])
+        self.assertEqual(["R47"], tasks["R50"]["depends_on"])
+        self.assertEqual(["R50"], tasks["R51"]["depends_on"])
+        self.assertEqual(["R51"], tasks["R52"]["depends_on"])
+        self.assertEqual(["R52"], tasks["R13"]["depends_on"])
+        self.assertTrue(tasks["R13"]["requires_replan"])
 
 
 class PromptAndReviewContractTests(unittest.TestCase):
