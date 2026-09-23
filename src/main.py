@@ -1452,7 +1452,7 @@ def _run_lifecycle_owned(http_owner) -> None:
     )
     http_socket_timeout = float(app.get("http.socket.timeout.seconds", "5"))
     metrics_port        = int(app.get("metrics.port",                          "8000"))
-    metrics_bind_addr   = app.get("metrics.bind.address",                  "0.0.0.0")
+    metrics_bind_addr   = app.get("metrics.bind.address",                "127.0.0.1")
     metrics_ssl_enabled = app.get("metrics.ssl.enabled", "false").lower() == "true"
     metrics_ssl_cert    = app.get("metrics.ssl.cert")
     metrics_ssl_key     = app.get("metrics.ssl.key")

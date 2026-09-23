@@ -31,7 +31,7 @@
 # CollectorRegistry on import.  Importing this module twice (which Python
 # prevents via the module cache) is safe.
 #
-# Metrics are served at http://0.0.0.0:{metrics.port}/metrics by
+# Metrics are served at http://127.0.0.1:{metrics.port}/metrics by default by
 # start_metrics_server(), which starts a background HTTP thread.
 #
 # Histogram bucket rationale
@@ -42,6 +42,7 @@
 #   Produce duration: 5 ms  (fast write) → 2.5 s  (degraded ack latency)
 # ---------------------------------------------------------------------------
 
+import ipaddress
 import logging
 import os
 import socket
@@ -477,7 +478,7 @@ class HTTPService:
 
 def start_metrics_server(
     port: int,
-    addr: str = "0.0.0.0",
+    addr: str = "127.0.0.1",
     ssl_enabled: bool = False,
     ssl_cert: str = None,
     ssl_key: str = None,
@@ -506,9 +507,9 @@ def start_metrics_server(
         distinct port.
 
     addr : str
-        Bind address for the HTTP server (default "0.0.0.0" for all interfaces).
-        Use "127.0.0.1" to bind to localhost only, or a specific IP address
-        to bind to a single interface.
+        Bind address for the HTTP server (default "127.0.0.1" for loopback
+        access only). Use a specific non-loopback address only when access is
+        restricted by deployment infrastructure.
 
     ssl_enabled : bool
         If True, enables HTTPS with TLS encryption. Requires ssl_cert and
@@ -545,6 +546,20 @@ def start_metrics_server(
         get_liveness_status,
         get_readiness_status,
     )
+
+    try:
+        loopback_bind = ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        loopback_bind = addr.rstrip(".").lower() == "localhost"
+
+    if not ssl_enabled and not loopback_bind:
+        log.warning(
+            "SECURITY WARNING: Metrics and probe endpoints are exposed over "
+            "plaintext HTTP on a non-loopback address. Restrict access using "
+            "an access-restricted private network, firewall, network policy, "
+            "reverse proxy, or service mesh; the application does not provide "
+            "authentication or authorization."
+        )
 
     class CanaryHTTPHandler(BaseHTTPRequestHandler):
         """

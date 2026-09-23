@@ -58,8 +58,9 @@ liveness.scheduler.max.staleness.seconds=10
 
 # Metrics HTTP server configuration
 metrics.port=8000
-# Bind address for metrics endpoint (0.0.0.0 = all interfaces, 127.0.0.1 = localhost only)
-metrics.bind.address=0.0.0.0
+# Private default: loopback only. Cross-process scraping requires an explicit
+# non-loopback address and infrastructure-enforced access restriction.
+metrics.bind.address=127.0.0.1
 # Enable HTTPS for metrics endpoint (requires cert and key files)
 metrics.ssl.enabled=false
 # Path to SSL certificate file (PEM format, required if ssl.enabled=true)
