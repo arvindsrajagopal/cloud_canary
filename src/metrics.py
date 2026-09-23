@@ -46,6 +46,7 @@ import logging
 import os
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 
@@ -412,6 +413,8 @@ def start_metrics_server(
     ssl_enabled: bool = False,
     ssl_cert: str = None,
     ssl_key: str = None,
+    max_workers: int = 4,
+    request_queue_size: int = 16,
 ) -> None:
     """
     Start the Prometheus HTTP(S) metrics server with health endpoints.
@@ -446,6 +449,12 @@ def start_metrics_server(
 
     ssl_key : str, optional
         Path to SSL private key file in PEM format. Required if ssl_enabled=True.
+
+    max_workers : int
+        Maximum number of concurrently executing HTTP handlers.
+
+    request_queue_size : int
+        Maximum number of admitted requests waiting for an HTTP worker.
 
     Raises
     ------
@@ -581,6 +590,47 @@ def start_metrics_server(
             if args[1].startswith(("4", "5")):
                 log.warning(f"{self.address_string()} - {format % args}")
 
+    def configure_bounded_execution(server):
+        """Attach fixed-pool request execution to a concrete HTTP server."""
+        server._request_slots = threading.BoundedSemaphore(
+            max_workers + request_queue_size
+        )
+        server._request_executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="canary-http",
+        )
+
+        def process_request(request, client_address):
+            # The listening thread never waits for executor capacity. An
+            # accepted request either owns one active/waiting slot or is
+            # rejected without entering the executor's internal queue.
+            if not server._request_slots.acquire(blocking=False):
+                server.shutdown_request(request)
+                return
+
+            try:
+                server._request_executor.submit(
+                    process_admitted_request, request, client_address
+                )
+            except BaseException:
+                server._request_slots.release()
+                server.shutdown_request(request)
+                raise
+
+        def process_admitted_request(request, client_address):
+            try:
+                try:
+                    server.finish_request(request, client_address)
+                except Exception:
+                    server.handle_error(request, client_address)
+                finally:
+                    server.shutdown_request(request)
+            finally:
+                server._request_slots.release()
+
+        server.process_request = process_request
+        return server
+
     # Validate SSL configuration
     if ssl_enabled:
         if not ssl_cert or not ssl_key:
@@ -597,7 +647,9 @@ def start_metrics_server(
             raise FileNotFoundError(f"SSL private key not found: {ssl_key}")
 
         # Create HTTPS server with SSL context
-        server = HTTPServer((addr, port), CanaryHTTPHandler)
+        server = configure_bounded_execution(
+            HTTPServer((addr, port), CanaryHTTPHandler)
+        )
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
         # Set secure defaults for TLS 1.2+ only (disable older protocols)
@@ -613,7 +665,9 @@ def start_metrics_server(
 
     else:
         # Standard HTTP server (no SSL)
-        server = HTTPServer((addr, port), CanaryHTTPHandler)
+        server = configure_bounded_execution(
+            HTTPServer((addr, port), CanaryHTTPHandler)
+        )
 
     # Start server in background thread
     thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -1434,6 +1434,8 @@ def _run_lifecycle() -> None:
     metrics_ssl_enabled = app.get("metrics.ssl.enabled", "false").lower() == "true"
     metrics_ssl_cert    = app.get("metrics.ssl.cert")
     metrics_ssl_key     = app.get("metrics.ssl.key")
+    http_max_workers    = int(app.get("http.max.workers", "4"))
+    http_request_queue_size = int(app.get("http.request.queue.size", "16"))
     log_topic_enabled   = app.get("log.topic.enabled", "false").lower() == "true"
     log_topic           = app.get("log.topic",                    "cloud-canary-logs")
     log_topic_retention_ms = int(app.get("log.topic.retention.ms",        "604800000"))
@@ -1504,6 +1506,8 @@ def _run_lifecycle() -> None:
             ssl_enabled=metrics_ssl_enabled,
             ssl_cert=metrics_ssl_cert,
             ssl_key=metrics_ssl_key,
+            max_workers=http_max_workers,
+            request_queue_size=http_request_queue_size,
         )
         protocol = "https" if metrics_ssl_enabled else "http"
         log.info(
