@@ -820,6 +820,35 @@ Cloud Canary exposes metrics using the pull model; it does not accept or require
 a Prometheus server URL and does not push metrics to either the bundled stack or
 an enterprise monitoring service. Configure the external scraper to retrieve the
 canary's `/metrics` endpoint, with appropriate transport and network controls.
+Attach one shared, bounded deployment or monitored-cluster label to its scrape
+targets; Prometheus supplies the `job` and `instance` target labels externally.
+The application exports exactly one `canary_instance_role` series, with either
+`role="manage"` or `role="observe"`, and does not add an instance-identity label.
+
+Count only running roles by joining the role series to `up` within that scope.
+For example, when `job` identifies the deployment:
+
+```promql
+# Running managers
+sum((canary_instance_role{role="manage",job="cloud-canary"} == 1)
+  and on(job, instance) (up{job="cloud-canary"} == 1)) or vector(0)
+
+# Running observers
+sum((canary_instance_role{role="observe",job="cloud-canary"} == 1)
+  and on(job, instance) (up{job="cloud-canary"} == 1)) or vector(0)
+
+# Total running canary instances
+sum((canary_instance_role{job="cloud-canary"} == 1)
+  and on(job, instance) (up{job="cloud-canary"} == 1)) or vector(0)
+
+# Configured canary scrape targets that are unreachable
+count(up{job="cloud-canary"} == 0) or vector(0)
+```
+
+Alert whenever that absent-safe result is not exactly one. This detects zero
+running managers (including an absent role series) and multiple running
+managers. Observer replica count remains deployment-platform and service-
+discovery configuration; Cloud Canary has no expected-observer-count setting.
 
 ### Stop the stack
 

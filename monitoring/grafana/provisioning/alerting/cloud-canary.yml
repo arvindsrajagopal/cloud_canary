@@ -1,0 +1,63 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: cloud-canary
+    folder: Cloud Canary
+    interval: 1m
+    rules:
+      - uid: cloud-canary-manager-count
+        title: Cloud Canary manager count is not one
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              datasource:
+                type: prometheus
+                uid: prometheus
+              editorMode: code
+              expr: '((sum((canary_instance_role{role="manage",job="cloud-canary"} == 1) and on(job, instance) (up{job="cloud-canary"} == 1)) or vector(0)) != bool 1)'
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: C
+              type: threshold
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          description: The running manager count is zero or greater than one.
+          summary: Cloud Canary requires exactly one running manager.
+        labels:
+          component: cloud-canary
+          severity: warning
+        isPaused: false

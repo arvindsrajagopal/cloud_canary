@@ -165,6 +165,12 @@ _STARTUP_WAITING_DEPENDENCIES = (
     "WAITING_FOR_SCHEMA_REGISTRY",
     "RECONCILING_TOPIC",
 )
+INSTANCE_ROLE_VALUES = frozenset({"manage", "observe"})
+INSTANCE_ROLE = metrics.Gauge(
+    "canary_instance_role",
+    "Configured static topic-management role for this canary instance.",
+    ["role"],
+)
 STARTUP_RETRY_ATTEMPTS = metrics.Gauge(
     "canary_startup_retry_attempts",
     "Retry attempts in the current initialization stage.",
@@ -189,6 +195,13 @@ for _dependency in _STARTUP_WAITING_DEPENDENCIES:
     STARTUP_WAITING_DEPENDENCY.labels(
         host=metrics.HOST, dependency=_dependency
     ).set(0)
+
+
+def set_instance_role(role: str) -> None:
+    """Expose exactly one bounded role without application instance identity."""
+    bounded_role = metrics.bounded_label(role, INSTANCE_ROLE_VALUES)
+    INSTANCE_ROLE.clear()
+    INSTANCE_ROLE.labels(role=bounded_role).set(1)
 
 # Logging will be configured in run() after loading config.
 # Initialize adapter at module level with placeholder context.
@@ -1644,6 +1657,7 @@ def _run_lifecycle_owned(http_owner, startup_owner=None) -> None:
 
     topic               = app.get("topic",                          "cloud-canary")
     topic_management_mode = app.get("topic.management.mode",              "manage")
+    set_instance_role(topic_management_mode)
     timeout             = float(app.get("consumer.timeout.seconds",              "5"))
     interval            = float(app.get("check.interval.seconds",               "15"))
     sync_interval       = float(app.get("partition.sync.interval.seconds",   "86400"))

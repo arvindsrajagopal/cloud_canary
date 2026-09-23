@@ -934,6 +934,90 @@
           "legendFormat": "Consecutive Failures"
         }
       ]
+    },
+
+    {
+      "type": "row",
+      "id": 105,
+      "title": "Deployment Roles",
+      "gridPos": { "x": 0, "y": 33, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 18,
+      "title": "Running Managers",
+      "description": "Running manager targets in the selected deployment.",
+      "gridPos": { "x": 0, "y": 34, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum((canary_instance_role{role=\"manage\",job=~\"$deployment\"} == 1) and on(job, instance) (up{job=~\"$deployment\"} == 1)) or vector(0)",
+        "refId": "A"
+      }]
+    },
+    {
+      "type": "stat",
+      "id": 19,
+      "title": "Running Observers",
+      "description": "Running observer targets in the selected deployment.",
+      "gridPos": { "x": 6, "y": 34, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum((canary_instance_role{role=\"observe\",job=~\"$deployment\"} == 1) and on(job, instance) (up{job=~\"$deployment\"} == 1)) or vector(0)",
+        "refId": "A"
+      }]
+    },
+    {
+      "type": "stat",
+      "id": 20,
+      "title": "Running Canary Instances",
+      "description": "All running role-bearing canary targets in the selected deployment.",
+      "gridPos": { "x": 12, "y": 34, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum((canary_instance_role{job=~\"$deployment\"} == 1) and on(job, instance) (up{job=~\"$deployment\"} == 1)) or vector(0)",
+        "refId": "A"
+      }]
+    },
+    {
+      "type": "stat",
+      "id": 21,
+      "title": "Unreachable Canary Targets",
+      "description": "Configured scrape targets that are down in the selected deployment.",
+      "gridPos": { "x": 18, "y": 34, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "count(up{job=~\"$deployment\"} == 0) or vector(0)",
+        "refId": "A"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "id": 22,
+      "title": "Manager Count Alert",
+      "description": "ALERT: the local cloud-canary deployment has zero or multiple running managers.",
+      "gridPos": { "x": 0, "y": 38, "w": 24, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "hidden" } },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "((sum((canary_instance_role{role=\"manage\",job=\"cloud-canary\"} == 1) and on(job, instance) (up{job=\"cloud-canary\"} == 1)) or vector(0)) != bool 1)",
+        "refId": "A"
+      }]
     }
 
   ],
@@ -954,6 +1038,25 @@
         "options": [],
         "query": {
           "query": "label_values(canary_uptime_seconds, host)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "cloud-canary", "value": "cloud-canary" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(up, job)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Deployment",
+        "multi": false,
+        "name": "deployment",
+        "options": [],
+        "query": {
+          "query": "label_values(up, job)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
