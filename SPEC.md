@@ -724,12 +724,16 @@ be retained.
 characters before it enters application state. HTTP serialization must not be
 the first or only truncation point.
 
-The shared check producer, optional log producer, and worker-owned consumers
-must use explicit, conservative finite native-client message and byte-buffer
-limits defined as documented application constants. The application must not
-add a Python retry buffer or shadow queue around a full native-client queue.
-Queue-full behavior must produce the applicable bounded check failure or
-best-effort log-publishing failure defined elsewhere in this specification.
+The shared check producer and optional log producer must use explicit,
+conservative finite native-client message-count and byte-buffer limits defined
+as documented application constants. librdkafka does not expose a hard maximum
+message-count setting for consumer fetch queues: `queued.min.messages` is a
+prefetch target. Worker-owned consumers must therefore use a one-message
+prefetch target and an explicit, conservative hard byte-buffer limit. The
+application must not add a Python retry buffer or shadow queue around a full
+native-client queue. Queue-full behavior must produce the applicable bounded
+check failure or best-effort log-publishing failure defined elsewhere in this
+specification.
 
 Automated tests must demonstrate that the invariants above remain true across
 thousands of completed checks, repeated failures and retries, and repeated
@@ -1591,8 +1595,10 @@ Regression coverage must include at least:
 118. Failure summaries are sanitized and truncated to 512 characters before
      storage, and snapshots contain no copies of rolling histories or retained
      prior snapshots.
-119. Kafka native-client queues use explicit finite message and byte limits;
-     queue saturation creates no Python retry or shadow queue.
+119. Kafka producer native-client queues use explicit finite message-count and
+     byte limits. Consumer native-client queues use a one-message prefetch
+     target and an explicit finite hard byte limit. Queue saturation creates no
+     Python retry or shadow queue.
 
 ## 15. Acceptance Criteria
 

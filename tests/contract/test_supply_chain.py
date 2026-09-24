@@ -84,6 +84,15 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertIn('importlib.import_module(name)', self.dockerfile)
         self.assertIn('"confluent_kafka", "fastavro", "cryptography"', self.dockerfile)
 
+    def test_release_interface_supports_scanning_and_build_attestations(self):
+        self.assertIn(
+            "trivy image --exit-code 1 --severity HIGH,CRITICAL", self.readme
+        )
+        self.assertIn("--sbom=true", self.readme)
+        self.assertIn("--provenance=mode=max", self.readme)
+        self.assertIn("external vulnerability", self.readme)
+        self.assertIn("does not embed a signing service", self.readme)
+
 
 if __name__ == "__main__":
     unittest.main()

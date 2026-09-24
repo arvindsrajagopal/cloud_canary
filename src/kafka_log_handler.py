@@ -161,6 +161,10 @@ class KafkaLogHandler(logging.Handler):
             "acks":             "1",            # leader ack only — logs don't need full ISR durability
             "linger.ms":        const.LOG_HANDLER_LINGER_MS,
             "compression.type": "lz4",          # text compresses well; lz4 is fast with good ratio
+            # Keep the optional native-client queue finite.  emit() drops and
+            # counts BufferError instead of creating a Python shadow queue.
+            "queue.buffering.max.messages": const.LOG_PRODUCER_QUEUE_MAX_MESSAGES,
+            "queue.buffering.max.kbytes": const.LOG_PRODUCER_QUEUE_MAX_KBYTES,
             "socket.nagle.disable": True,
             "client.dns.lookup": "use_all_dns_ips",
         })

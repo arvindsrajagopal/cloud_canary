@@ -236,10 +236,14 @@ def update_health_metrics(snapshot, consecutive_failures) -> None:
     staleness = []
     expected_partitions = set()
     for index, component in enumerate(snapshot.partitions):
+        component_name = getattr(component, "component", f"kafka:{index}")
+        if not component_name.startswith("kafka:"):
+            continue
+        partition = component_name.removeprefix("kafka:")
+        if not partition.isdigit():
+            continue
         state = bounded_label(component.status, STATE_VALUES)
         counts[state] += 1
-        component_name = getattr(component, "component", f"kafka:{index}")
-        partition = component_name.removeprefix("kafka:")
         expected_partitions.add(partition)
         with _partition_metric_lock:
             _set_partition_state(partition, state)

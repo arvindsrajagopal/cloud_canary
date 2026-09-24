@@ -101,8 +101,8 @@ def _get_producer_defaults() -> dict:
         "linger.ms": 0,                         # send immediately, no batching delay
         "batch.size": const.PRODUCER_BATCH_SIZE_BYTES,
         "compression.type": "none",             # no compression: single tiny message
-        "queue.buffering.max.messages": const.PRODUCER_QUEUE_MAX_MESSAGES,
-        "queue.buffering.max.kbytes": const.PRODUCER_QUEUE_MAX_KBYTES,
+        "queue.buffering.max.messages": const.CHECK_PRODUCER_QUEUE_MAX_MESSAGES,
+        "queue.buffering.max.kbytes": const.CHECK_PRODUCER_QUEUE_MAX_KBYTES,
 
         # ---- Connection / network reliability ----
         # Required by Confluent Cloud: resolve all IPs behind the DNS name and
@@ -159,6 +159,9 @@ def create_producer(kafka_config: dict, sr_client) -> tuple[Producer, AvroSerial
     producer = Producer({
         **_get_producer_defaults(),  # get defaults with current instance ID
         **kafka_config,               # auth/connection settings override defaults
+        # These application invariants are mandatory, not deployment-tunable.
+        "queue.buffering.max.messages": const.CHECK_PRODUCER_QUEUE_MAX_MESSAGES,
+        "queue.buffering.max.kbytes": const.CHECK_PRODUCER_QUEUE_MAX_KBYTES,
     })
     try:
         avro_serializer = AvroSerializer(

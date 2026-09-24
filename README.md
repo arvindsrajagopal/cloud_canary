@@ -444,6 +444,31 @@ currently claimed; each architecture must complete build, startup, native
 dependency import, and the configured liveness probe before it is documented or
 published as supported.
 
+Production release validation must also run an approved external vulnerability
+scanner against the exact image candidate and fail on the organization's
+prohibited severity threshold. For example, a pipeline using Trivy can run:
+
+```bash
+trivy image --exit-code 1 --severity HIGH,CRITICAL "cloud-canary:$VERSION"
+```
+
+Image publication must enable the build platform's SBOM and provenance
+attestations. A Docker Buildx publication stage can supply the existing build
+arguments and add:
+
+```bash
+docker buildx build \
+  --sbom=true \
+  --provenance=mode=max \
+  --push \
+  -t "${REGISTRY}/cloud-canary:$VERSION" .
+```
+
+The registry or enterprise release platform owns optional image signing and
+policy enforcement; the application does not embed a signing service or its
+credentials. Operators should adapt the scanner and registry commands to their
+approved enterprise tooling.
+
 **Docker Compose example:**
 
 ```yaml

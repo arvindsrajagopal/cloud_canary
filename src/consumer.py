@@ -103,6 +103,12 @@ def _get_consumer_defaults() -> dict:
         # a single known message.
         "fetch.wait.max.ms": const.CONSUMER_FETCH_WAIT_MAX_MS,
 
+        # queued.min.messages is a prefetch target, not a hard maximum. Keep
+        # it at one because each manually assigned worker awaits one canary
+        # record. queued.max.messages.kbytes is the enforced native queue cap.
+        "queued.min.messages": const.CONSUMER_QUEUE_MIN_MESSAGES,
+        "queued.max.messages.kbytes": const.CONSUMER_QUEUE_MAX_KBYTES,
+
         # ---- Connection / network reliability ----
         "client.dns.lookup": "use_all_dns_ips",         # required for Confluent Cloud
         "api.version.request.timeout.ms": const.API_VERSION_REQUEST_TIMEOUT_MS,
@@ -163,6 +169,9 @@ def create_partition_consumer(
         "group.id":           f"cloud-canary-{uuid.uuid4()}",
         "auto.offset.reset":  "latest",
         "enable.auto.commit": False,
+        # These bounds must not be replaceable through deployment config.
+        "queued.min.messages": const.CONSUMER_QUEUE_MIN_MESSAGES,
+        "queued.max.messages.kbytes": const.CONSUMER_QUEUE_MAX_KBYTES,
     })
     try:
         avro_deserializer = AvroDeserializer(

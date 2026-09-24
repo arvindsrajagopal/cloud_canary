@@ -39,9 +39,21 @@ MAX_IN_FLIGHT_REQUESTS = 5
 # burst periods without delaying individual messages.
 PRODUCER_BATCH_SIZE_BYTES = 65536
 
-# Producer queue buffer limits.
-PRODUCER_QUEUE_MAX_MESSAGES = 100000
-PRODUCER_QUEUE_MAX_KBYTES = 1048576  # 1 GB
+# Native-client queue bounds sized for each canary workload.  The check
+# producer normally has at most max.workers single-message checks outstanding;
+# the optional log producer allows a larger burst without retaining an
+# application-side retry queue.
+CHECK_PRODUCER_QUEUE_MAX_MESSAGES = 100
+CHECK_PRODUCER_QUEUE_MAX_KBYTES = 1024       # 1 MiB
+LOG_PRODUCER_QUEUE_MAX_MESSAGES = 1000
+LOG_PRODUCER_QUEUE_MAX_KBYTES = 8192         # 8 MiB
+
+# librdkafka exposes a consumer prefetch target, not a hard message-count cap.
+# Keep that target at one message. queued.max.messages.kbytes is the enforced
+# native fetch-queue bound; at the supported 200-worker maximum this permits at
+# most 200 MiB of aggregate consumer fetch queues.
+CONSUMER_QUEUE_MIN_MESSAGES = 1
+CONSUMER_QUEUE_MAX_KBYTES = 1024             # 1 MiB per worker consumer
 
 # API version negotiation timeout in milliseconds.
 # Increased from 10s default to accommodate Confluent Cloud cold-start latency.
