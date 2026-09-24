@@ -33,6 +33,3 @@ docker-compose.yml
 # Logs
 *.log
 nohup.out
-
-# Ralph runtime state and generated reports
-.ralph-state/

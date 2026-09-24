@@ -7,8 +7,8 @@ health reporting, readiness, topic reconciliation, metrics-cardinality, and
 Schema Registry transport-security defects in Cloud Canary.
 
 This document is the source of truth for the remediation work. Implementation
-tasks and Ralph-loop instructions must refer to this specification and must not
-silently change its requirements.
+tasks must refer to this specification and must not silently change its
+requirements.
 
 ## 2. Scope
 
@@ -482,7 +482,7 @@ Direct dependencies must remain human-reviewable, while production dependency
 installation must use a fully resolved lock file containing transitive versions
 and hashes. Production installation must use hash verification. Lock generation
 or refresh is explicit dependency-update work and must not occur silently during
-an unrelated Ralph iteration.
+unrelated work.
 
 OCI metadata must contain accurate values for source, version, revision, and
 creation time. Placeholder repository metadata is prohibited. Application and
@@ -1615,45 +1615,3 @@ The remediation is complete only when:
   or credential-bearing files.
 - No unresolved failure is hidden by a successful exit status or a healthy
   endpoint response.
-
-## 16. Ralph-Loop Constraints
-
-When this specification is implemented through a Ralph loop:
-
-- Define a maximum iteration count before starting.
-- Address one bounded task per iteration.
-- Assign no more than five Section 14 criteria to an implementation task and
-  inject those exact criteria plus targeted specification section identifiers
-  into a fresh ephemeral agent session. Do not require a whole-spec reread.
-- Inspect repository status and current file contents before editing.
-- Add or update the narrowest relevant regression test with each behavioral
-  change.
-- Run targeted validation before broader validation.
-- Record changed files, commands, results, assumptions, blockers, and the next
-  task after every iteration.
-- Require schema-validated implementation output. Preserve complete agent,
-  validation, and review logs locally, but forward only bounded feedback and
-  concrete blocking findings to subsequent attempts.
-- Bound each iteration to 12 changed files and 1,200 diff lines. Stop for a
-  human task split if either bound is exceeded.
-- Do not repeat an unchanged approach after the same validation failure.
-- Stop immediately when the acceptance criteria are met or when the configured
-  iteration or repeated-failure limit is reached.
-- Run the complete existing automated test and deterministic quality suite
-  before and after every implementation attempt accepted as progress.
-- After tests pass, run a separate read-only review covering consistency,
-  security, architecture, performance, best practices, and deviation from this
-  specification. A failed review category or high/critical finding blocks the
-  iteration.
-- Give the reviewer the isolated current-iteration patch, changed-file list,
-  exact assigned criteria, and bounded validation evidence. Do not make prior
-  accepted task diffs part of the review scope. Forward at most 20 blocking
-  findings and 8,000 feedback characters to the next implementation attempt.
-- Stop for human intervention rather than guessing when work requires an
-  unspecified architectural choice, secrets, network or dependency changes,
-  destructive action, expanded scope, or repeated failed attempts.
-- Map every regression criterion in Section 14 to exactly one bounded task and
-  require that task's declared executable tests before marking it complete.
-- Permit Git checkpoints only at declared logical milestones after the complete
-  test and review gates pass. Branch creation, commits, and pushes require
-  explicit human confirmation; force pushes are prohibited.
